@@ -1,0 +1,5 @@
+/.env
+/models/
+/.venv/
+/stats/
+/data/
