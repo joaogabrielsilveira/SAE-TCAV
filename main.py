@@ -8,6 +8,6 @@ from tabpfn_model import get_tabpfn_model
 if __name__ == '__main__':
     df = open_parquet(DB_PATH)
     df = create_outcome(df)
-    clf, train_embeddings, test_embeddings = get_tabpfn_model(df)
+    clf, train_embeddings, test_embeddings = get_tabpfn_model(df, get_embeddings=True)
     inputs = torch.from_numpy(train_embeddings).squeeze()
     model = train_sae_model(inputs)

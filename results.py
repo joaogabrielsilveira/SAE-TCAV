@@ -9,7 +9,9 @@ MODEL_RESULTS_CSV_PATH = 'stats/SAE.csv'
 
 
 def save_model_stats(original_input: torch.Tensor, encoded: torch.Tensor, decoded: torch.Tensor,
-                     stats: dict[str, float]):
+                     stats: dict[str, float]) -> None:
+    """" Salva os hiperparâmetros e métricas de desempenho do modelo treinado.
+         As métricas são similaridade cosseno em % e número de colunas nulas. """
     mean_mod_zeroes = encoded.shape[1] - torch.mean(torch.count_nonzero(encoded, dim=1).float())
     cos_sim = F.cosine_similarity(original_input, decoded, dim=1)
     mean_cos_sim = torch.mean(cos_sim)
@@ -28,7 +30,8 @@ def save_model_stats(original_input: torch.Tensor, encoded: torch.Tensor, decode
     
     print(output)
 
-def plot_losses(losses: list | np.ndarray | torch.Tensor):
+def plot_losses(losses: list | np.ndarray | torch.Tensor) -> None:
+    """" Traça um gráfico com a progressão da perda do modelo ao longo das epochs. """
     x = range(1, len(losses) + 1)
     y = losses
     
