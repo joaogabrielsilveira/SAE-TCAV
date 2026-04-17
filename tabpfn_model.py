@@ -9,11 +9,12 @@ import torch
 import os
 import numpy as np
 from database import get_data, impute_data, normalize_data
+import pandas as pd
 
 TRAINING_EMBEDDING_FILE = 'models/tabpfn_emb_train.npy'
 TEST_EMBEDDING_FILE = 'models/tabpfn_emb_test.npy'
 
-def get_tabpfn_model(df):
+def get_tabpfn_model(df: pd.DataFrame):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     # print(f'Device: {device}')
 

@@ -6,7 +6,7 @@ def print_tensor_data(tensor: torch.Tensor):
   print(f' >>>>>\n Value: {tensor}\n Shape: {tensor.shape}\n DataType: {tensor.dtype}\n Device: {tensor.device} \n <<<<<')
 
 class SAE(nn.Module):
-    def __init__(self, data_dimension=192, scaling_factor=1.5):
+    def __init__(self, data_dimension:int=192, scaling_factor:float=1.5):
         self.data_dimension = data_dimension
         self.scaling_factor = scaling_factor
         super(SAE, self).__init__()
@@ -18,12 +18,12 @@ class SAE(nn.Module):
             nn.Linear(int(self.data_dimension * self.scaling_factor), self.data_dimension)
         )
 
-    def forward(self, x):
+    def forward(self, x:torch.Tensor):
         h = self.encoder(x)
         z_hat = self.decoder(h)
         return h, z_hat
 
-def train_sae_model(inputs: torch.Tensor, epochs=10000, learning_rate=1e-3, weight_decay=0.0, alpha=5e-4):
+def train_sae_model(inputs: torch.Tensor, epochs:int=10000, learning_rate:float=1e-3, weight_decay:float=0.0, alpha:float=5e-4):
     model = SAE()
     optimizer = torch.optim.Adam(params=model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 

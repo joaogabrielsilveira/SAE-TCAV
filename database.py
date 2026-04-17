@@ -1,18 +1,20 @@
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
+import numpy as np
+import torch
 
 DB_PATH = r'data/banco_completo_REGISTRO_COVID_28_08_processado_cardiopatia_sociodemographic.parquet'
 ORIGINAL_OUTCOME = 'intercorrencia_3_5_6_13_16'
 COLUMNS_TO_DROP = ['intercorrencia___13', 'intercorrencia___3', 'intercorrencia___16', 'intercorrencia___6', 'intercorrencia___5', 'direto_cti', 'dataadm', 'onda']
 
-def open_parquet(filepath):
+def open_parquet(filepath: str):
     return pd.read_parquet(filepath)
 
-def get_vars(df):
+def get_vars(df: pd.DataFrame):
     return list(df.columns)
 
-def create_outcome(df):
+def create_outcome(df: pd.DataFrame):
     for outcome in COLUMNS_TO_DROP:
         if outcome in get_vars(df):
             df = df.drop(outcome, axis=1).copy()
@@ -24,12 +26,12 @@ def create_outcome(df):
 
     return df
 
-def get_data(df):
+def get_data(df: pd.DataFrame):
     y = df['outcome'].to_numpy()
     X = df.drop('outcome', axis=1).to_numpy()
     return X, y
 
-def impute_data(X):
+def impute_data(X: torch.Tensor | np.ndarray):
     # print(f"Criando imputador de dados (estratégia: mediana)")
     imputer = SimpleImputer(strategy='median')
 
@@ -42,7 +44,7 @@ def impute_data(X):
     return imputed_X
 
 
-def normalize_data(X):
+def normalize_data(X: torch.Tensor | np.ndarray):
     # print(f'X shape: {X.shape}')
     if X.shape[0] == 1:
         X = X.reshape(-1, 1)

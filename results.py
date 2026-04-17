@@ -1,5 +1,6 @@
 import matplotlib.pyplot as plt
 import torch
+import numpy as np
 import torch.nn.functional as F
 
 MODEL_RESULTS_PATH = 'stats/SAE.txt'
@@ -27,7 +28,7 @@ def save_model_stats(original_input: torch.Tensor, encoded: torch.Tensor, decode
     
     print(output)
 
-def plot_losses(losses: list[float]):
+def plot_losses(losses: list | np.ndarray | torch.Tensor):
     x = range(1, len(losses) + 1)
     y = losses
     
