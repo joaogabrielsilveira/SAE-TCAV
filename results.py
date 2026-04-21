@@ -6,8 +6,6 @@ import torch.nn.functional as F
 MODEL_RESULTS_PATH = 'stats/SAE.txt'
 MODEL_RESULTS_CSV_PATH = 'stats/SAE.csv'
 
-
-
 def save_model_stats(original_input: torch.Tensor, encoded: torch.Tensor, decoded: torch.Tensor,
                      stats: dict[str, float]) -> None:
     """" Salva os hiperparâmetros e métricas de desempenho do modelo treinado.
