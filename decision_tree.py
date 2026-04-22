@@ -1,8 +1,11 @@
 import numpy as np
 import torch
 from sklearn import tree
-from sklearn.metrics import accuracy_score, recall_score
-from sklearn.tree import DecisionTreeClassifier
+from sklearn.metrics import accuracy_score, recall_score, f1_score
+from sklearn.tree import DecisionTreeClassifier, export_text, export_graphviz
+from sklearn.model_selection import GridSearchCV
+
+MIN_POSITIVE_SAMPLES = 50
 
 def get_binary_targets(train_activations: torch.Tensor) -> list[tuple[int, float]]:
     bin_targets = []
@@ -14,14 +17,15 @@ def get_binary_targets(train_activations: torch.Tensor) -> list[tuple[int, float
 
         # threshold: ativação maior que 50% das positivas (mediana)
         cur_concept_positive = cur_concept[cur_concept > 0]
-        if cur_concept_positive.shape[0] > 0:
+        if cur_concept_positive.shape[0] >= MIN_POSITIVE_SAMPLES:
             threshold = np.median(cur_concept_positive)
             bin_targets.append((col, threshold))
 
     return bin_targets
 
 def train_binary_trees(train_activations: torch.Tensor, test_activations: torch.Tensor,
-                       model_data: dict[str, np.ndarray], feature_names: list[str], max_depth:int=2) -> list[tuple[int, DecisionTreeClassifier]]:
+                       model_data: dict[str, np.ndarray], feature_names: list[str], max_depth:int=5)\
+        -> list[tuple[int, DecisionTreeClassifier]]:
     train_activations = train_activations.cpu().detach()
     test_activations = test_activations.cpu().detach()
 
@@ -31,6 +35,12 @@ def train_binary_trees(train_activations: torch.Tensor, test_activations: torch.
     X_test = model_data['X_test']
 
     valid_trees = []
+    param_grid = {
+        'class_weight': ['balanced', None],
+        'criterion': ['gini', 'entropy', 'log_loss'],
+        'max_depth': list(range(5, 10)),
+        'splitter': ['best', 'random']
+    }
     for (idx, target) in bin_targets:
         cur_train_activations = train_activations[:, idx]
         cur_test_activations = test_activations[:, idx]
@@ -42,18 +52,29 @@ def train_binary_trees(train_activations: torch.Tensor, test_activations: torch.
             # print(f'Fator {idx}: conjunto vazio encontrado, pulando')
             continue
 
-        clf = tree.DecisionTreeClassifier(max_depth=max_depth, class_weight='balanced')
+        clf = tree.DecisionTreeClassifier(max_depth=max_depth, class_weight='balanced',
+                                          min_samples_leaf=50, max_leaf_nodes=8)
         clf.fit(X_train, train_target_mask)
+        sel = GridSearchCV(clf, param_grid, scoring='f1', n_jobs=8)
+        sel.fit(X_train, train_target_mask)
+        clf = sel.best_estimator_
 
         y_pred = clf.predict(X_test)
         acc = accuracy_score(test_target_mask, y_pred)
         rec = recall_score(test_target_mask, y_pred)
+        f1 = f1_score(test_target_mask, y_pred)
 
-        # print(f'Arvore do fator {idx}: accuracy={acc}, recall={rec}')
-        if acc >= 90 / 100 and rec >= 25 / 100:
-            # print(f'Arvore {idx} aprovada!!! boa boa boa')
+        print(f'Arvore do fator {idx}: f1={f1}, accuracy={acc}, recall={rec}')
+        if f1 >= 0.5:
+            print(f'Arvore {idx} aprovada!!! boa boa boa')
             valid_trees.append((idx, clf))
             tree.export_graphviz(clf, out_file=f'models/tree_factor_{idx}.dot', feature_names=feature_names)
+            text_rules = export_text(
+                clf,
+                feature_names=feature_names,
+                show_weights=True
+            )
+            print(text_rules)
 
     print(f'Arvores boas encontradas: {len(valid_trees)} {[idx for (idx, clf) in valid_trees]}')
     return valid_trees
