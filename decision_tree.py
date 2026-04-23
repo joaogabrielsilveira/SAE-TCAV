@@ -1,11 +1,16 @@
 import numpy as np
 import torch
-from sklearn import tree
+import os
 from sklearn.metrics import accuracy_score, recall_score, f1_score
 from sklearn.tree import DecisionTreeClassifier, export_text, export_graphviz
 from sklearn.model_selection import GridSearchCV
+from pickle import dump, load
+
+from typing_extensions import Any
 
 MIN_POSITIVE_SAMPLES = 50
+TREE_MODEL_PATH = 'models/trees/params'
+TREE_GRAPH_PATH = 'models/trees/graphs'
 
 def get_binary_targets(train_activations: torch.Tensor) -> list[tuple[int, float]]:
     bin_targets = []
@@ -25,7 +30,7 @@ def get_binary_targets(train_activations: torch.Tensor) -> list[tuple[int, float
 
 def train_binary_trees(train_activations: torch.Tensor, test_activations: torch.Tensor,
                        model_data: dict[str, np.ndarray], feature_names: list[str], max_depth:int=5)\
-        -> list[tuple[int, DecisionTreeClassifier]]:
+        -> list[dict[str, Any]]:
     train_activations = train_activations.cpu().detach()
     test_activations = test_activations.cpu().detach()
 
@@ -52,12 +57,19 @@ def train_binary_trees(train_activations: torch.Tensor, test_activations: torch.
             # print(f'Fator {idx}: conjunto vazio encontrado, pulando')
             continue
 
-        clf = tree.DecisionTreeClassifier(max_depth=max_depth, class_weight='balanced',
-                                          min_samples_leaf=50, max_leaf_nodes=8)
-        clf.fit(X_train, train_target_mask)
-        sel = GridSearchCV(clf, param_grid, scoring='f1', n_jobs=8)
-        sel.fit(X_train, train_target_mask)
-        clf = sel.best_estimator_
+        clf = DecisionTreeClassifier(max_depth=max_depth, class_weight='balanced',
+                                     min_samples_leaf=50, max_leaf_nodes=8)
+
+        if os.path.exists(f'{TREE_MODEL_PATH}/{idx}.pkl'):
+            with open(f'{TREE_MODEL_PATH}/{idx}.pkl', 'rb') as f:
+                clf = load(f)
+        else:
+            clf.fit(X_train, train_target_mask)
+            sel = GridSearchCV(clf, param_grid, scoring='f1', n_jobs=8)
+            sel.fit(X_train, train_target_mask)
+            clf = sel.best_estimator_
+            with open(f'{TREE_MODEL_PATH}/{idx}.pkl', 'wb') as f:
+                dump(clf, f, protocol=5)
 
         y_pred = clf.predict(X_test)
         acc = accuracy_score(test_target_mask, y_pred)
@@ -67,14 +79,14 @@ def train_binary_trees(train_activations: torch.Tensor, test_activations: torch.
         print(f'Arvore do fator {idx}: f1={f1}, accuracy={acc}, recall={rec}')
         if f1 >= 0.5:
             print(f'Arvore {idx} aprovada!!! boa boa boa')
-            valid_trees.append((idx, clf))
-            tree.export_graphviz(clf, out_file=f'models/tree_factor_{idx}.dot', feature_names=feature_names)
-            text_rules = export_text(
-                clf,
-                feature_names=feature_names,
-                show_weights=True
-            )
-            print(text_rules)
+            valid_trees.append({'model': clf, 'idx': idx, 'y_mask': train_target_mask})
+            export_graphviz(clf, out_file=f'{TREE_GRAPH_PATH}/{idx}.dot', feature_names=feature_names)
+            # text_rules = export_text(
+            #     clf,
+            #     feature_names=feature_names,
+            #     show_weights=True
+            # )
+            # print(text_rules)
 
-    print(f'Arvores boas encontradas: {len(valid_trees)} {[idx for (idx, clf) in valid_trees]}')
+    print(f'Arvores boas encontradas: {len(valid_trees)}')
     return valid_trees
