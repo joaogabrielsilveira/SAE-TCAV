@@ -2,9 +2,10 @@ import matplotlib.pyplot as plt
 import torch
 import numpy as np
 import torch.nn.functional as F
+from filepaths import get_env_path
 
-MODEL_RESULTS_PATH = 'stats/SAE.txt'
-MODEL_RESULTS_CSV_PATH = 'stats/SAE.csv'
+MODEL_RESULTS_PATH = get_env_path('stats/SAE.txt')
+MODEL_RESULTS_CSV_PATH = get_env_path('stats/SAE.csv')
 
 def save_model_stats(original_input: torch.Tensor, encoded: torch.Tensor, decoded: torch.Tensor,
                      stats: dict[str, float]) -> None:

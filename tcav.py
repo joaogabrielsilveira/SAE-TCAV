@@ -2,7 +2,7 @@ from sklearn.linear_model import LogisticRegression
 import torch
 from typing_extensions import Any
 
-def get_cavs(valid_trees: list[dict[str, Any]], embeddings: torch.Tensor) -> list[tuple[torch.Tensor, int]]:
+def get_cavs(valid_trees: list[dict[str, Any]], embeddings: torch.Tensor) -> list[tuple[int, torch.Tensor]]:
     embeddings = embeddings.cpu().detach()
     cavs = []
     for tree in valid_trees:
@@ -11,7 +11,7 @@ def get_cavs(valid_trees: list[dict[str, Any]], embeddings: torch.Tensor) -> lis
         model.fit(embeddings, y_mask)
         cav = model.coef_[0] # vetor com os coeficientes da fronteira de decisão,
                           # é normal ao hiperplano de separação
-        cavs.append((torch.Tensor(cav), idx))
+        cavs.append((idx, torch.Tensor(cav)))
 
     return cavs
 

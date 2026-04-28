@@ -7,14 +7,15 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 import numpy as np
 from sklearn.model_selection import train_test_split
+from filepaths import get_env_path
 
 TARGET_POS_LINES = 5000
 TARGET_NEG_LINES = 5000
 M_CANDIDATES = 500
 RNG_SEED = 42
 
-RENAL_DB_PATH = 'data/renal/tidy_event_data.feather'
-COVID_DB_PATH = 'data/covid/banco_completo_REGISTRO_COVID_28_08_processado_cardiopatia_sociodemographic.parquet'
+RENAL_DB_PATH = get_env_path('data/renal/tidy_event_data.feather')
+COVID_DB_PATH = get_env_path('data/covid/banco_completo_REGISTRO_COVID_28_08_processado_cardiopatia_sociodemographic.parquet')
 COVID_ORIGINAL_OUTCOME = 'intercorrencia_3_5_6_13_16'
 COVID_COLUMNS_TO_DROP = ['intercorrencia___13', 'intercorrencia___3', 'intercorrencia___16', 'intercorrencia___6',
                    'intercorrencia___5', 'direto_cti', 'dataadm', 'onda']

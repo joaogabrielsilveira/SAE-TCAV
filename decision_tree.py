@@ -5,12 +5,12 @@ from sklearn.metrics import accuracy_score, recall_score, f1_score
 from sklearn.tree import DecisionTreeClassifier, export_text, export_graphviz
 from sklearn.model_selection import GridSearchCV
 from pickle import dump, load
-
+from filepaths import get_env_path
 from typing_extensions import Any
 
 MIN_POSITIVE_SAMPLES = 50
-TREE_MODEL_PATH = 'models/trees/params'
-TREE_GRAPH_PATH = 'models/trees/graphs'
+TREE_MODEL_PATH = get_env_path('models/trees/params')
+TREE_GRAPH_PATH = get_env_path('models/trees/graphs')
 
 def get_binary_targets(train_activations: torch.Tensor) -> list[tuple[int, float]]:
     bin_targets = []

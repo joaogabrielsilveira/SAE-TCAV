@@ -5,11 +5,13 @@ import torch
 import os
 import numpy as np
 from database import impute_data, normalize_data
+from filepaths import get_env_path
+from pathlib import Path
 
-TRAINING_EMBEDDING_FILE = 'models/tabpfn/tabpfn_emb_train.npy'
-TEST_EMBEDDING_FILE = 'models/tabpfn/tabpfn_emb_test.npy'
-PRED_BIN_FILE = 'models/tabpfn/y_pred_bin.npy'
-PRED_PROB_FILE = 'models/tabpfn/y_pred_prob.npy'
+TRAINING_EMBEDDING_FILE = get_env_path('models/tabpfn/tabpfn_emb_train.npy')
+TEST_EMBEDDING_FILE = get_env_path('models/tabpfn/tabpfn_emb_test.npy')
+PRED_BIN_FILE = get_env_path('models/tabpfn/y_pred_bin.npy')
+PRED_PROB_FILE = get_env_path('models/tabpfn/y_pred_prob.npy')
 BATCH_SIZE = 512
 
 def get_tabpfn_model(arrays: dict[str, np.ndarray], get_embeddings=False, get_pred=False) -> (TabPFNClassifier |

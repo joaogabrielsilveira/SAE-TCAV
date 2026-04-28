@@ -4,8 +4,9 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from results import save_model_stats
+from filepaths import get_env_path
 
-SAE_MODEL_PATH = 'models/sae.pth'
+SAE_MODEL_PATH = get_env_path('models/sae.pth')
 
 def print_tensor_data(tensor: torch.Tensor) -> None:
     print(f' >>>>>\n Value: {tensor}\n Shape: {tensor.shape}\n DataType: {tensor.dtype}\n Device: {tensor.device} \n <<<<<')
