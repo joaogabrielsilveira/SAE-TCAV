@@ -4,8 +4,7 @@ from sklearn.model_selection import train_test_split
 import torch
 import os
 import numpy as np
-from covid_database import get_data, impute_data, normalize_data
-import pandas as pd
+from database import impute_data, normalize_data
 
 TRAINING_EMBEDDING_FILE = 'models/tabpfn/tabpfn_emb_train.npy'
 TEST_EMBEDDING_FILE = 'models/tabpfn/tabpfn_emb_test.npy'
@@ -13,7 +12,7 @@ PRED_BIN_FILE = 'models/tabpfn/y_pred_bin.npy'
 PRED_PROB_FILE = 'models/tabpfn/y_pred_prob.npy'
 BATCH_SIZE = 512
 
-def get_tabpfn_model(df: pd.DataFrame, get_embeddings=False, get_pred=False)-> (TabPFNClassifier |
+def get_tabpfn_model(arrays: dict[str, np.ndarray], get_embeddings=False, get_pred=False) -> (TabPFNClassifier |
                                                                 tuple[TabPFNClassifier, np.ndarray, np.ndarray,
                                                                 dict[str, np.ndarray]]):
     """ Cria um modelo tabpfn com os dados fornecidos.
@@ -22,10 +21,11 @@ def get_tabpfn_model(df: pd.DataFrame, get_embeddings=False, get_pred=False)-> (
         caso contrário são extraídos do próprio modelo. """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    X, y = get_data(df)
-
     # Separação dos dados de treino e teste
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    X_train = arrays['X_train']
+    y_train = arrays['y_train']
+    X_test = arrays['X_test']
+    y_test = arrays['y_test']
 
     # Imputação dos dados
     X_train_imputed, y_train_imputed = impute_data(X_train), y_train

@@ -16,7 +16,7 @@ def save_model_stats(original_input: torch.Tensor, encoded: torch.Tensor, decode
     mean_perc_loss = (1 - mean_cos_sim.item()) * 100
     
     output = f'##### RESULTADOS #####\n'\
-                f'Hiperparâmetros: epochs={stats['epochs']}, lr={stats['learning_rate']}, alpha={stats['alpha']}, weight_decay={stats['weight_decay']}\n'\
+                f'Hiperparâmetros: epochs={stats["epochs"]}, lr={stats["learning_rate"]}, alpha={stats["alpha"]}, weight_decay={stats["weight_decay"]}\n'\
                 f'Média de nulos nos embeddings modificados: {mean_mod_zeroes} / {encoded[0].shape[0]}\n'\
                 f'Diferença cosseno média(%): {mean_perc_loss}\n\n'
     
@@ -24,7 +24,7 @@ def save_model_stats(original_input: torch.Tensor, encoded: torch.Tensor, decode
       out_file.write(output)
     
     with open(MODEL_RESULTS_CSV_PATH, 'a+') as csv_out:
-      csv_out.write(f'{stats['epochs']},{stats['learning_rate']},{stats['alpha']},{stats['weight_decay']},{mean_mod_zeroes},{mean_perc_loss}\n')
+      csv_out.write(f'{stats["epochs"]},{stats["learning_rate"]},{stats["alpha"]},{stats["weight_decay"]},{mean_mod_zeroes},{mean_perc_loss}\n')
     
     print(output)
 
