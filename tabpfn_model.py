@@ -51,6 +51,7 @@ def get_tabpfn_model(arrays: dict[str, np.ndarray], get_embeddings=False, get_pr
         else:
             y_pred_list = []
             for i in range(0, X_train_normalized.shape[0], BATCH_SIZE):
+                print(f'Batch {i // BATCH_SIZE}: {i}-{i + BATCH_SIZE}')
                 y_pred_list.append(clf.predict(X_train_normalized[i:i + BATCH_SIZE, :]))
 
             y_pred_bin = np.concatenate(y_pred_list, axis=0)
@@ -63,6 +64,7 @@ def get_tabpfn_model(arrays: dict[str, np.ndarray], get_embeddings=False, get_pr
         else:
             y_pred_list = []
             for i in range(0, X_train_normalized.shape[0], BATCH_SIZE):
+                print(f'Batch {i // BATCH_SIZE}: {i}-{i + BATCH_SIZE}')
                 y_pred_list.append(clf.predict_proba(X_train_normalized[i:i + BATCH_SIZE, :])[:, 1])
 
             y_pred_prob = np.concatenate(y_pred_list, axis=0)
@@ -81,6 +83,7 @@ def get_tabpfn_model(arrays: dict[str, np.ndarray], get_embeddings=False, get_pr
             if not os.path.exists(TRAINING_EMBEDDING_FILE):
                 train_emb_list = []
                 for i in range(0, X_train_normalized.shape[0], BATCH_SIZE):
+                    print(f'Batch {i // BATCH_SIZE}: {i}-{i+BATCH_SIZE}')
                     train_embeddings = embedding_extractor.get_embeddings(X_train_normalized, y_train_normalized,
                                                                           X_train_normalized[i:i + BATCH_SIZE, :],
                                                                           data_source='train')
@@ -95,6 +98,7 @@ def get_tabpfn_model(arrays: dict[str, np.ndarray], get_embeddings=False, get_pr
             if not os.path.exists(TEST_EMBEDDING_FILE):
                 test_emb_list = []
                 for i in range(0, X_test_normalized.shape[0], BATCH_SIZE):
+                    print(f'Batch {i // BATCH_SIZE}: {i}-{i + BATCH_SIZE}')
                     test_embeddings = embedding_extractor.get_embeddings(X_train_normalized, y_train_normalized,
                                                                          X_test_normalized[i:i + BATCH_SIZE, :],
                                                                          data_source='test')

@@ -10,7 +10,7 @@ def get_env_path(path):
       IN_COLAB = False
 
     if IN_COLAB:
-        BASE_DIR = '/content/drive/MyDrive/IC/SAE-TCAV'
+        BASE_DIR = 'drive/MyDrive/IC/SAE-TCAV'
     else:
         BASE_DIR = ''
 
