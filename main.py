@@ -2,30 +2,28 @@ from dotenv import load_dotenv
 
 load_dotenv()
 import torch
-from database import open_parquet, open_feather, create_outcome, get_vars, COVID_DB_PATH, RENAL_DB_PATH, prepare_database, get_tabpfn_arrays
+from database import open_feather, get_vars, RENAL_DB_PATH, prepare_database, get_tabpfn_arrays
 from sae import train_sae_model
 from tabpfn_model import get_tabpfn_model
 from decision_tree import train_binary_trees
 from tcav import get_cavs, get_tcav_scores
+from filepaths import get_env_path
+from pickle import dump, load
+import os
+
+PREPARED_DB_PATH = get_env_path('data/renal/prep.pkl')
 
 if __name__ == '__main__':
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     df = open_feather(RENAL_DB_PATH)
-    prep_out = prepare_database(df=df)
-
-    train_rows = prep_out["train_rows"]
-    test_rows = prep_out["test_rows"]
-    top_k_events = prep_out["top_k_events"]
-    train_years = prep_out["train_years"]
-    test_years = prep_out["test_years"]
-
-    # print("train_rows:", train_rows.shape)
-    # print("test_rows :", test_rows.shape)
-    # print("n top_k_events:", len(top_k_events))
-    # print("train_years:", train_years)
-    # print("test_years :", test_years)
-
-    tabpfn_arrays = get_tabpfn_arrays(prep_out)
+    if not os.path.exists(PREPARED_DB_PATH):
+        prep_out = prepare_database(df=df)
+        tabpfn_arrays = get_tabpfn_arrays(prep_out)
+        with open(PREPARED_DB_PATH, 'wb') as f:
+            dump(tabpfn_arrays, f)
+    else:
+        with open(PREPARED_DB_PATH, 'rb') as f:
+            tabpfn_arrays = load(f)
 
     clf, train_embeddings, test_embeddings, data = get_tabpfn_model(tabpfn_arrays, get_embeddings=True, get_pred=True)
     train_inputs = torch.from_numpy(train_embeddings).squeeze().to(device)
