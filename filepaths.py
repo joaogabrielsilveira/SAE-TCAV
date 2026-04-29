@@ -3,12 +3,14 @@ import sys
 from pathlib import Path
 
 def get_env_path(path):
-    IN_COLAB = 'google.colab' in sys.modules
+    try:
+      import google.colab
+      IN_COLAB = True
+    except:
+      IN_COLAB = False
 
     if IN_COLAB:
-        from google.colab import drive
-        drive.mount('content/drive')
-        BASE_DIR = 'content/drive/SAE-TCAV'
+        BASE_DIR = '/content/drive/MyDrive/IC/SAE-TCAV'
     else:
         BASE_DIR = ''
 
