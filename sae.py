@@ -43,7 +43,7 @@ class SAE(nn.Module):
         return h, z_hat
 
 def train_sae_model(inputs: torch.Tensor, epochs:int=10000, learning_rate:float=1e-3, weight_decay:float=0.0,
-                    alpha:float=5e-4, save_data=True) -> SAE:
+                    alpha:float=5e-3, save_data=True) -> SAE:
     """" Treina o Sparse AutoEncoder usando a entrada e os hiperparâmetros passados.
          O parâmetro alpha é a constante que controla a penalização por dados densos. """
     model = SAE()

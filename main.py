@@ -26,11 +26,17 @@ if __name__ == '__main__':
             tabpfn_arrays = load(f)
 
     clf, train_embeddings, test_embeddings, data = get_tabpfn_model(tabpfn_arrays, get_embeddings=True, get_pred=True)
-    train_inputs = torch.from_numpy(train_embeddings).squeeze().to(device)
+
+    train_inputs = torch.from_numpy(train_embeddings).to(device)
     test_inputs = torch.from_numpy(test_embeddings).squeeze().to(device)
     model = train_sae_model(train_inputs)
+
+    encoded_train = model.encode(train_inputs).cpu().detach().numpy()
+    encoded_test = model.encode(test_inputs).cpu().detach().numpy()
+
     feature_names = get_vars(df)
-    feature_names.remove('outcome')
-    trees = train_binary_trees(model.encode(train_inputs), model.encode(test_inputs), data, feature_names)
-    cavs = get_cavs(trees, train_inputs)
-    tcav_scores = get_tcav_scores(cavs, data['X_train_normalized'], data['y_pred_bin'])
+    trees = train_binary_trees(encoded_train, encoded_test, data, feature_names)
+
+    cavs = get_cavs(trees, encoded_train)
+    tcav_scores_bin = get_tcav_scores(cavs, data['X_train_normalized'], data['y_pred_bin'])
+    tcav_scores_prob = get_tcav_scores(cavs, data['X_train_normalized'], data['y_pred_prob'])

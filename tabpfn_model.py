@@ -1,12 +1,10 @@
 from tabpfn import TabPFNClassifier
 from tabpfn_extensions import TabPFNEmbedding
-from sklearn.model_selection import train_test_split
 import torch
 import os
 import numpy as np
 from database import impute_data, normalize_data
 from filepaths import get_env_path
-from pathlib import Path
 
 TRAINING_EMBEDDING_FILE = get_env_path('models/tabpfn/tabpfn_emb_train.npy')
 TEST_EMBEDDING_FILE = get_env_path('models/tabpfn/tabpfn_emb_test.npy')
@@ -14,12 +12,12 @@ PRED_BIN_FILE = get_env_path('models/tabpfn/y_pred_bin.npy')
 PRED_PROB_FILE = get_env_path('models/tabpfn/y_pred_prob.npy')
 BATCH_SIZE = 512
 
-
 def get_tabpfn_model(arrays: dict[str, np.ndarray], get_embeddings=False, get_pred=False) -> (TabPFNClassifier |
                                                                                               tuple[
                                                                                                   TabPFNClassifier, np.ndarray, np.ndarray,
                                                                                                   dict[
-                                                                                                      str, np.ndarray]]):
+                                                                                                      str, np.ndarray]
+                                                                                              ]):
     """ Cria um modelo tabpfn com os dados fornecidos.
         Se get_embeddings for verdadeiro, retorna uma tupla com o modelo e os embeddings de
         treino e teste, repectivamente. Se possível, os embeddings são extraídos de um arquivo salvo,
@@ -109,6 +107,9 @@ def get_tabpfn_model(arrays: dict[str, np.ndarray], get_embeddings=False, get_pr
                     np.save(test_emb, test_embeddings)
             else:
                 test_embeddings = np.load(TEST_EMBEDDING_FILE)
+
+        train_embeddings = np.mean(train_embeddings, axis=0)
+        test_embeddings = np.mean(test_embeddings, axis=0)
 
         return clf, train_embeddings, test_embeddings, {
             'X_train': X_train, 'X_test': X_test,

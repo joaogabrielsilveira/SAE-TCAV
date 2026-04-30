@@ -1,5 +1,4 @@
 import numpy as np
-import torch
 import os
 from sklearn.metrics import accuracy_score, recall_score, f1_score
 from sklearn.tree import DecisionTreeClassifier, export_text, export_graphviz
@@ -12,9 +11,8 @@ MIN_POSITIVE_SAMPLES = 50
 TREE_MODEL_PATH = get_env_path('models/trees/params')
 TREE_GRAPH_PATH = get_env_path('models/trees/graphs')
 
-def get_binary_targets(train_activations: torch.Tensor) -> list[tuple[int, float]]:
+def get_binary_targets(train_activations: np.ndarray) -> list[tuple[int, float]]:
     bin_targets = []
-    train_activations = train_activations.cpu().detach()
 
     for col in range(train_activations.shape[1]):
         # lista com todas as ativações para o embedding atual
@@ -28,11 +26,9 @@ def get_binary_targets(train_activations: torch.Tensor) -> list[tuple[int, float
 
     return bin_targets
 
-def train_binary_trees(train_activations: torch.Tensor, test_activations: torch.Tensor,
+def train_binary_trees(train_activations: np.ndarray, test_activations: np.ndarray,
                        model_data: dict[str, np.ndarray], feature_names: list[str], max_depth:int=5)\
         -> list[dict[str, Any]]:
-    train_activations = train_activations.cpu().detach()
-    test_activations = test_activations.cpu().detach()
 
     bin_targets = get_binary_targets(train_activations)
 
@@ -50,10 +46,10 @@ def train_binary_trees(train_activations: torch.Tensor, test_activations: torch.
         cur_train_activations = train_activations[:, idx]
         cur_test_activations = test_activations[:, idx]
 
-        train_target_mask = torch.Tensor([int(act > target) for act in cur_train_activations]) ## y
-        test_target_mask = torch.Tensor([int(act > target) for act in cur_test_activations])
+        train_target_mask = np.array([int(act > target) for act in cur_train_activations], dtype=np.bool)## y
+        test_target_mask = np.array([int(act > target) for act in cur_test_activations], dtype=np.bool)
 
-        if torch.count_nonzero(train_target_mask) == 0 or torch.count_nonzero(test_target_mask) == 0:
+        if np.count_nonzero(train_target_mask) == 0 or np.count_nonzero(test_target_mask) == 0:
             # print(f'Fator {idx}: conjunto vazio encontrado, pulando')
             continue
 
