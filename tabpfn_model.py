@@ -48,9 +48,9 @@ def get_tabpfn_model(arrays: dict[str, np.ndarray], get_embeddings=False, get_pr
             y_pred_bin = np.load(PRED_BIN_FILE)
         else:
             y_pred_list = []
-            for i in range(0, X_train_normalized.shape[0], BATCH_SIZE):
+            for i in range(0, X_test_normalized.shape[0], BATCH_SIZE):
                 print(f'Batch {i // BATCH_SIZE}: {i}-{i + BATCH_SIZE}')
-                y_pred_list.append(clf.predict(X_train_normalized[i:i + BATCH_SIZE, :]))
+                y_pred_list.append(clf.predict(X_test_normalized[i:i + BATCH_SIZE, :]))
 
             y_pred_bin = np.concatenate(y_pred_list, axis=0)
 
@@ -61,9 +61,9 @@ def get_tabpfn_model(arrays: dict[str, np.ndarray], get_embeddings=False, get_pr
             y_pred_prob = np.load(PRED_PROB_FILE)
         else:
             y_pred_list = []
-            for i in range(0, X_train_normalized.shape[0], BATCH_SIZE):
+            for i in range(0, X_test_normalized.shape[0], BATCH_SIZE):
                 print(f'Batch {i // BATCH_SIZE}: {i}-{i + BATCH_SIZE}')
-                y_pred_list.append(clf.predict_proba(X_train_normalized[i:i + BATCH_SIZE, :])[:, 1])
+                y_pred_list.append(clf.predict_proba(X_test_normalized[i:i + BATCH_SIZE, :])[:, 1])
 
             y_pred_prob = np.concatenate(y_pred_list, axis=0)
 
