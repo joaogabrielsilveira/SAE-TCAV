@@ -93,9 +93,9 @@ def get_tabpfn_model(arrays: dict[str, np.ndarray], get_embeddings=False, get_pr
                     train_embeddings = embedding_extractor.get_embeddings(X_train_normalized, y_train_normalized,
                                                                           X_train_normalized[i:i + BATCH_SIZE, :],
                                                                           data_source='train')
-                    train_emb_list.append(train_embeddings)
                     if train_embeddings.ndim == 3:
                         train_embeddings = np.mean(train_embeddings, axis=0)
+                    train_emb_list.append(train_embeddings)
                 train_embeddings = np.concatenate(train_emb_list, axis=0)
 
                 with open(TRAINING_EMBEDDING_FILE, 'wb') as train_emb:
