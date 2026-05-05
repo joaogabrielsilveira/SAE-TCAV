@@ -430,5 +430,27 @@ def get_tabpfn_arrays(p: dict[str, object]):
         'years_train': years_train_np,
         'X_test': X_test_np,
         'y_test': y_test_np,
-        'years_test': years_test_np
+        'years_test': years_test_np,
+        'test_rows': test_rows,
+        'top_k_events': top_k_events,
     }
+
+def scale_df_data(train_rows: pd.DataFrame, test_rows:pd.DataFrame, feature_cols: list[str]):
+    X_train_df = train_rows[feature_cols].copy()
+    X_test_df = test_rows[feature_cols].copy()
+
+    scaler = StandardScaler()
+    scaler.fit(X_train_df)
+    X_train_norm = pd.DataFrame(
+        scaler.transform(X_train_df),
+        columns=X_train_df.columns,
+        index=X_train_df.index
+    )
+
+    X_test_norm = pd.DataFrame(
+        scaler.transform(X_test_df),
+        columns=X_test_df.columns,
+        index=X_test_df.index
+    )
+
+    return scaler, X_train_norm, X_test_norm
