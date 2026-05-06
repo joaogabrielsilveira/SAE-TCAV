@@ -17,25 +17,23 @@ class SAE(nn.Module):
         equilibrando acurácia na reconstrução dos dados originais e esparsidade da representação expandida. """
 
     def __init__(self, data_dimension:int=192, scaling_factor:float=1.5):
-        super(SAE, self).__init__()
+        super().__init__()
 
         self.data_dimension = data_dimension
         self.scaling_factor = scaling_factor
 
-        self.encoder_matrix = nn.Parameter(torch.zeros(int(self.data_dimension * self.scaling_factor), self.data_dimension))
-        nn.init.kaiming_uniform_(self.encoder_matrix)
+        self.encoder = nn.Linear(data_dimension, int(scaling_factor * data_dimension), bias=True)
 
-        self.encoder_bias = nn.Parameter(torch.zeros(int(self.data_dimension * self.scaling_factor)))
-
-        self.decoder_bias = nn.Parameter(torch.zeros(int(self.data_dimension)))
+        # self.decoder_bias = nn.Parameter(torch.zeros(int(self.data_dimension)))
+        self.decoder_bias = None
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """ Cria uma representação expandida e esparsa do vetor original """
-        return F.relu(F.linear(x, self.encoder_matrix, self.encoder_bias))
+        return F.relu(self.encoder(x))
 
     def decode(self, h: torch.Tensor) -> torch.Tensor:
         """ Reconstrói um vetor a partir de sua representação expandida. """
-        return F.linear(h, self.encoder_matrix.t(), self.decoder_bias)
+        return F.linear(h, self.encoder.weight.t(), self.decoder_bias)
 
     def forward(self, x:torch.Tensor):
         h = self.encode(x)
@@ -43,20 +41,20 @@ class SAE(nn.Module):
         return h, z_hat
 
 def train_sae_model(inputs: torch.Tensor, epochs:int=10000, learning_rate:float=1e-3, weight_decay:float=0.0,
-                    alpha:float=5e-3, save_data=True) -> SAE:
+                    alpha:float=1e-4, save_data=True) -> SAE:
     """" Treina o Sparse AutoEncoder usando a entrada e os hiperparâmetros passados.
          O parâmetro alpha é a constante que controla a penalização por dados densos. """
     model = SAE()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model.to(device)
 
-    if os.path.exists(SAE_MODEL_PATH):
-        print(f'Carregando SAE do arquivo salvo')
-        model.load_state_dict(torch.load(f=SAE_MODEL_PATH))
-        return model
+    # if os.path.exists(SAE_MODEL_PATH):
+    #     print(f'Carregando SAE do arquivo salvo')
+    #     model.load_state_dict(torch.load(f=SAE_MODEL_PATH))
+    #     return model
 
     optimizer = torch.optim.Adam(params=model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    inputs = inputs.to(device)
+    inputs = inputs.to(device, dtype=torch.float32)
     losses = []
 
     for epoch in range(1, epochs + 1):
@@ -65,9 +63,9 @@ def train_sae_model(inputs: torch.Tensor, epochs:int=10000, learning_rate:float=
         h, reconstruction = model(inputs)
 
         # Construção da função de perda: Erro de reconstrução e penalidade de esparsidade
-        reconstruction_loss = ((torch.norm(reconstruction - inputs, p=2)) ** 2) / inputs.shape[1]
-        l1_loss = alpha * torch.norm(h, p=1)
-        loss = reconstruction_loss + l1_loss
+        mse = F.mse_loss(reconstruction, inputs)
+        l1 = alpha * h.abs().mean()
+        loss = mse + l1
 
         # Backprop
         optimizer.zero_grad()
@@ -81,7 +79,9 @@ def train_sae_model(inputs: torch.Tensor, epochs:int=10000, learning_rate:float=
             cos_sim = torch.nn.functional.cosine_similarity(reconstruction, inputs, dim=1)
             mean_cos_sim = torch.mean(cos_sim)
             mean_perc_loss = (1 - mean_cos_sim.item()) * 100
-            print(f"Epoch {epoch}: loss={loss.item()}, cosine_diff={mean_perc_loss}%")
+            with torch.no_grad():
+                sparsity = float((h <= 1e-5).float().mean().detach().cpu().item())
+            print(f"Epoch {epoch}: loss={loss.item()}, sparsity={sparsity*100}%")
 
     if save_data:
         save_model_stats(inputs, model.encode(inputs), model.decode(model.encode(inputs)), {'epochs': epochs, 'learning_rate': learning_rate,

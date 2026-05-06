@@ -1,10 +1,11 @@
+import numpy as np
 from dotenv import load_dotenv
 load_dotenv()
 import torch
 from database import open_feather, get_vars, RENAL_DB_PATH, prepare_database, get_tabpfn_arrays, scale_df_data
 from sae import train_sae_model
 from tabpfn_model import fit_dr_tabpfn, walkforward_evaluate_tabpfn, TabPFNEvalConfig, load_or_extract_embeddings, \
-    EmbeddingExtractConfig, scale_embeddings, temporal_test_subsplits
+    EmbeddingExtractConfig, scale_embeddings, temporal_test_subsplits, TRAINING_EMBEDDING_FILE, TEST_EMBEDDING_FILE
 from decision_tree import train_binary_trees
 from tcav import get_cavs, get_tcav_scores
 from filepaths import get_env_path
@@ -39,64 +40,80 @@ if __name__ == '__main__':
     y_test_np = tabpfn_arrays['y_test']
     years_test_np = tabpfn_arrays['years_test']
 
-    eval_cfg = TabPFNEvalConfig()
-    fit_out = fit_dr_tabpfn(X_train_np, y_train_np, years_train_np, eval_cfg)
+    print("train_rows:", train_rows.shape)
+    print("test_rows :", test_rows.shape)
+    print("n top_k_events:", len(top_k_events))
+    print("train_years:", np.unique(years_train_np))
+    print("test_years :", np.unique(years_test_np))
 
-    drift_model = fit_out["model"]
-    model_add_x_device = fit_out["model_add_x_device"]
-    example_add_shape = fit_out["example_add_shape"]
+    print("X_train_np:", X_train_np.shape)
+    print("y_train_np:", y_train_np.shape, "| pos_ratio:", y_train_np.mean())
 
-    print(f"Fit time: {fit_out['fit_time_sec']:.2f}s")
-    print("additional_x device:", model_add_x_device)
-    print("example_add_shape:", example_add_shape)
+    # eval_cfg = TabPFNEvalConfig()
+    # fit_out = fit_dr_tabpfn(X_train_np, y_train_np, years_train_np, eval_cfg)
+    #
+    # drift_model = fit_out["model"]
+    # model_add_x_device = fit_out["model_add_x_device"]
+    # example_add_shape = fit_out["example_add_shape"]
+    #
+    # print(f"Fit time: {fit_out['fit_time_sec']:.2f}s")
+    # print("additional_x device:", model_add_x_device)
+    # print("example_add_shape:", example_add_shape)
+    #
+    # wf = walkforward_evaluate_tabpfn(
+    #     drift_model=drift_model,
+    #     test_rows=test_rows,
+    #     top_k_events=top_k_events,
+    #     train_years=years_train_np,
+    #     model_add_x_device=model_add_x_device,
+    #     batch_size_predict=512,
+    #     example_add_shape=example_add_shape,
+    # )
+    #
+    # results_per_year = wf["results_per_year"]
+    # year_to_domain_combined = wf["year_to_domain_combined"]
+    # test_rows_checked = wf["test_rows_checked"]
+    #
+    # results_df = pd.DataFrame(results_per_year).sort_values("year").reset_index(drop=True)
+    #
+    # feature_cols = list(top_k_events)
+    # X_train_df = train_rows[feature_cols].copy()
+    # X_test_df = test_rows_checked[feature_cols].copy()
+    #
+    # scaler, X_train_df, X_test_df = scale_df_data(
+    #     X_train_df, X_test_df, feature_cols
+    # )
+    #
+    # print(results_df)
+    #
+    # emb_cfg = EmbeddingExtractConfig()
+    #
+    # emb_out = load_or_extract_embeddings(
+    #     drift_model,
+    #     X_train_np,
+    #     X_test_np,
+    #     years_train_np,
+    #     years_test_np,
+    #     year_to_domain_combined,
+    #     "",
+    #     emb_cfg,
+    #     model_add_x_device,
+    #     example_add_shape,
+    # )
+    #
+    # train_emb = emb_out['train_emb_flat']
+    # test_emb = emb_out['test_emb_flat']
+    #
+    with open(TRAINING_EMBEDDING_FILE, 'rb') as f:
+        train_emb = np.load(f)
+    with open(TEST_EMBEDDING_FILE, 'rb') as f:
+        test_emb = np.load(f)
 
-    wf = walkforward_evaluate_tabpfn(
-        drift_model=drift_model,
-        test_rows=test_rows,
-        top_k_events=top_k_events,
-        train_years=years_train_np,
-        model_add_x_device=model_add_x_device,
-        batch_size_predict=512,
-        example_add_shape=example_add_shape,
-    )
-
-    results_per_year = wf["results_per_year"]
-    year_to_domain_combined = wf["year_to_domain_combined"]
-    test_rows_checked = wf["test_rows_checked"]
-
-    results_df = pd.DataFrame(results_per_year).sort_values("year").reset_index(drop=True)
-
-    feature_cols = list(top_k_events)
-    X_train_df = train_rows[feature_cols].copy()
-    X_test_df = test_rows_checked[feature_cols].copy()
-
-    scaler, X_train_df, X_test_df = scale_df_data(
-        X_train_df, X_test_df, feature_cols
-    )
-
-    print(results_df)
-
-    emb_cfg = EmbeddingExtractConfig()
-
-    emb_out = load_or_extract_embeddings(
-        drift_model,
-        X_train_np,
-        X_test_np,
-        years_train_np,
-        years_test_np,
-        year_to_domain_combined,
-        "",
-        emb_cfg,
-        model_add_x_device,
-        example_add_shape,
-    )
-
-    train_emb = emb_out['train_emb_flat']
-    test_emb = emb_out['test_emb_flat']
+    print(train_emb.shape, test_emb.shape)
 
     train_emb_scaled, test_emb_scaled = scale_embeddings(train_emb, test_emb)
 
-    y_test = (test_rows_checked["DEATH"] > 0).astype(int).to_numpy(copy=True)
+    y_test = (test_rows["DEATH"] > 0).astype(int).to_numpy(copy=True)
     split_idx = temporal_test_subsplits(
         y_test,
         42

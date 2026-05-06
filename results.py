@@ -18,10 +18,22 @@ def save_model_stats(original_input: torch.Tensor, encoded: torch.Tensor, decode
         for feat1 in range(encoded.shape[1]):
             for feat2 in range(encoded.shape[1]):
                 if feat1 != feat2:
-                    pairwise_cos_sim += F.cosine_similarity(encoded[:, feat1], encoded[:, feat2], dim=0)
+                    if encoded[:, feat1].sum() == 0 and encoded[:, feat2].sum()== 0:
+                        pairwise_cos_sim += F.cosine_similarity(encoded[:, feat1], encoded[:, feat2], dim=0)
+                        # print(encoded[:, feat1].nonzero(), encoded[:, feat2].nonzero(), pairwise_cos_sim)
+                        # input()
 
         pairwise_cos_sim /= (encoded.shape[1] * (encoded.shape[1] - 1))
+        zero = 0
+        encoded = encoded.detach().cpu().numpy()
 
+        sparsity = (encoded <= 1e-5).mean()
+        for feat in range(encoded.shape[1]):
+            if np.count_nonzero(encoded[:, feat] > 1e-5) == 0:
+                zero += 1
+        sparsity /= (encoded.shape[1] - zero)
+        print(f'Final sparsity: {sparsity}')
+        print(f'Nulos: {zero}/{encoded.shape[1]}')
         mean_cos_sim = torch.mean(cos_sim)
         mean_perc_loss = (1 - mean_cos_sim.item()) * 100
 
