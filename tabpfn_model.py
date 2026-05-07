@@ -1,16 +1,13 @@
 import time
 from typing import Optional, Tuple, Any
-
 import tabpfn
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from tabpfn import TabPFNClassifier
 from tabpfn.best_models import get_best_tabpfn, TabPFNModelPathsConfig
 import torch
-import os
 import numpy as np
 import pandas as pd
-from database import impute_data, normalize_data
 from filepaths import get_env_path
 from importlib import resources
 from sklearn.metrics import f1_score
@@ -488,6 +485,7 @@ def scale_embeddings(emb_train: np.ndarray, emb_test: np.ndarray) -> tuple[np.nd
     scaler = StandardScaler()
     scaler.fit(emb_train)
     emb_train_new = scaler.transform(emb_train)
+    # scaler.fit(emb_test)
     emb_test_new = scaler.transform(emb_test)
 
     return emb_train_new, emb_test_new

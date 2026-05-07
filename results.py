@@ -8,17 +8,17 @@ MODEL_RESULTS_PATH = get_env_path('stats/SAE.txt')
 MODEL_RESULTS_CSV_PATH = get_env_path('stats/SAE.csv')
 
 def save_model_stats(original_input: torch.Tensor, encoded: torch.Tensor, decoded: torch.Tensor,
-                     stats: dict[str, float]) -> None:
+                     stats: dict[str, float], data_source: str) -> None:
     """" Salva os hiperparâmetros e métricas de desempenho do modelo treinado.
          As métricas são: similaridade cosseno em % e número de colunas nulas. """
-    with torch.no_grad():
+    with (torch.no_grad()):
         mean_mod_zeroes = encoded.shape[1] - torch.mean(torch.count_nonzero(encoded, dim=1).float())
         cos_sim = F.cosine_similarity(original_input, decoded, dim=1)
         pairwise_cos_sim = 0.0
         for feat1 in range(encoded.shape[1]):
             for feat2 in range(encoded.shape[1]):
                 if feat1 != feat2:
-                    if encoded[:, feat1].sum() == 0 and encoded[:, feat2].sum()== 0:
+                    if encoded[:, feat1].sum() != 0 and encoded[:, feat2].sum() != 0:
                         pairwise_cos_sim += F.cosine_similarity(encoded[:, feat1], encoded[:, feat2], dim=0)
                         # print(encoded[:, feat1].nonzero(), encoded[:, feat2].nonzero(), pairwise_cos_sim)
                         # input()
@@ -27,27 +27,32 @@ def save_model_stats(original_input: torch.Tensor, encoded: torch.Tensor, decode
         zero = 0
         encoded = encoded.detach().cpu().numpy()
 
-        sparsity = (encoded <= 1e-5).mean()
+        real_sparsity = 0.0
         for feat in range(encoded.shape[1]):
             if np.count_nonzero(encoded[:, feat] > 1e-5) == 0:
                 zero += 1
-        sparsity /= (encoded.shape[1] - zero)
-        print(f'Final sparsity: {sparsity}')
+            else:
+                real_sparsity += (encoded[:, feat] <= 1e-5).mean()
+                # print(np.count_nonzero(encoded[:, feat] <= 1e-5))
+
+        real_sparsity /= (encoded.shape[1])
+        print(f'Final sparsity: {real_sparsity}')
         print(f'Nulos: {zero}/{encoded.shape[1]}')
         mean_cos_sim = torch.mean(cos_sim)
-        mean_perc_loss = (1 - mean_cos_sim.item()) * 100
+        # mean_perc_loss = (1 - mean_cos_sim.item()) * 100
 
-        output = f'##### RESULTADOS #####\n'\
-                    f'Hiperparâmetros: epochs={stats["epochs"]}, lr={stats["learning_rate"]}, alpha={stats["alpha"]}, weight_decay={stats["weight_decay"]}\n'\
-                    f'Média de nulos nos embeddings modificados: {mean_mod_zeroes} / {encoded[0].shape[0]}\n'\
-                    f'Semelhança cosseno entre pares média: {pairwise_cos_sim}\n'\
-                    f'Diferença cosseno média(%): {mean_perc_loss}\n\n'
+        output = f'##### RESULTADOS ({data_source}) #####\n'\
+                    f'Hiperparâmetros: epochs={stats["epochs"]}, lr={stats["learning_rate"]}, alpha={stats["alpha"]}\n'\
+                    f'Média de sparsity nos embeddings modificados (não nulos): {real_sparsity*100:.3f}%\n'\
+                    f'Semelhança cosseno média entre pares: {pairwise_cos_sim}\n'\
+                    f'Semelhança cosseno média entre orginal e encodado: {mean_cos_sim}\n'\
+                    f'Vetores nulos: {zero} / {encoded.shape[1]}\n\n'
 
         with open(MODEL_RESULTS_PATH, 'a+') as out_file:
           out_file.write(output)
 
-        with open(MODEL_RESULTS_CSV_PATH, 'a+') as csv_out:
-          csv_out.write(f'{stats["epochs"]},{stats["learning_rate"]},{stats["alpha"]},{stats["weight_decay"]},{mean_mod_zeroes},{mean_perc_loss}\n')
+        # with open(MODEL_RESULTS_CSV_PATH, 'a+') as csv_out:
+          # csv_out.write(f'{stats["epochs"]},{stats["learning_rate"]},{stats["alpha"]},{stats["weight_decay"]},{mean_mod_zeroes},{mean_perc_loss}\n')
 
         print(output)
 

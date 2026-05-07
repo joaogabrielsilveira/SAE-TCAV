@@ -40,20 +40,22 @@ class SAE(nn.Module):
         z_hat = self.decode(h)
         return h, z_hat
 
-def train_sae_model(inputs: torch.Tensor, epochs:int=10000, learning_rate:float=1e-3, weight_decay:float=0.0,
-                    alpha:float=1e-4, save_data=True) -> SAE:
+def train_sae_model(inputs: torch.Tensor, epochs:int=2000, learning_rate:float=1e-3, weight_decay:float=0.0,
+                    alpha:float=1e-4, save_data=True, data_source:str = 'training') -> SAE:
     """" Treina o Sparse AutoEncoder usando a entrada e os hiperparâmetros passados.
          O parâmetro alpha é a constante que controla a penalização por dados densos. """
     model = SAE()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model.to(device)
 
-    # if os.path.exists(SAE_MODEL_PATH):
-    #     print(f'Carregando SAE do arquivo salvo')
-    #     model.load_state_dict(torch.load(f=SAE_MODEL_PATH))
-    #     return model
+    if os.path.exists(SAE_MODEL_PATH):
+        print(f'Carregando SAE do arquivo salvo')
+        model.load_state_dict(torch.load(f=SAE_MODEL_PATH))
+        return model
 
     optimizer = torch.optim.Adam(params=model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    # original_sparsity = float((inputs <= 1e-5).float().mean().detach().cpu().item())
+    # print(f'Original sparsity: {original_sparsity*100}%')
     inputs = inputs.to(device, dtype=torch.float32)
     losses = []
 
@@ -64,7 +66,7 @@ def train_sae_model(inputs: torch.Tensor, epochs:int=10000, learning_rate:float=
 
         # Construção da função de perda: Erro de reconstrução e penalidade de esparsidade
         mse = F.mse_loss(reconstruction, inputs)
-        l1 = alpha * h.abs().mean()
+        l1 = alpha * h.abs().sum(dim=-1).mean()
         loss = mse + l1
 
         # Backprop
@@ -76,15 +78,15 @@ def train_sae_model(inputs: torch.Tensor, epochs:int=10000, learning_rate:float=
         model.eval()
         losses.append(loss.item())
         if epoch % 100 == 0:
-            cos_sim = torch.nn.functional.cosine_similarity(reconstruction, inputs, dim=1)
-            mean_cos_sim = torch.mean(cos_sim)
-            mean_perc_loss = (1 - mean_cos_sim.item()) * 100
             with torch.no_grad():
+                # cos_sim = torch.nn.functional.cosine_similarity(reconstruction, inputs, dim=1)
+                # mean_cos_sim = torch.mean(cos_sim)
+                # mean_perc_loss = (1 - mean_cos_sim.item()) * 100
                 sparsity = float((h <= 1e-5).float().mean().detach().cpu().item())
-            print(f"Epoch {epoch}: loss={loss.item()}, sparsity={sparsity*100}%")
+                print(f"Epoch {epoch}: loss={loss.item()}, sparsity={sparsity*100:.2f}%")
 
     if save_data:
         save_model_stats(inputs, model.encode(inputs), model.decode(model.encode(inputs)), {'epochs': epochs, 'learning_rate': learning_rate,
-                                                                  'alpha': alpha, 'weight_decay': weight_decay})
+                                                                  'alpha': alpha, 'weight_decay': weight_decay}, data_source)
     torch.save(obj=model.state_dict(), f=SAE_MODEL_PATH)
     return model
