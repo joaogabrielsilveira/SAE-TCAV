@@ -261,6 +261,7 @@ def walkforward_evaluate_tabpfn(drift_model: TabPFNClassifier, test_rows: pd.Dat
     t_infer_total = 0.0
 
     for eval_year in sorted(test_rows['year'].unique().astype(int)):
+        print(f'Inferencias do ano {eval_year}')
         # eventos do ano de teste
         df_year = test_rows[test_rows['year'] == eval_year].reset_index(drop=True)
         if df_year.shape[0] == 0:
@@ -280,6 +281,7 @@ def walkforward_evaluate_tabpfn(drift_model: TabPFNClassifier, test_rows: pd.Dat
 
         for start in range(0, n_samples, batch_size_predict):
             end = min(start+batch_size_predict, n_samples)
+            print(f'Batch {start}-{end}')
 
             # entradas e domínios temporais para o batch atual
             Xb_np = df_year[top_k_events].iloc[start:end].values.astype(np.float32)
@@ -350,6 +352,7 @@ def batch_get_embeddings(model: TabPFNClassifier, X_all: np.ndarray, dist_full: 
 
     for start in range(0, n, batch_size):
         end = min(start + batch_size, n)
+        print(f'Batch {start}-{end}')
         xb = X_all[start:end].astype(np.float32)
         dist_b = dist_full[start:end].astype(np.int64)
 
