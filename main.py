@@ -33,6 +33,8 @@ if __name__ == '__main__':
     top_k_events = prep_out['top_k_events']
 
     X_train_np = tabpfn_arrays['X_train']
+    #print(X_train_np.columns)
+    #input()
     y_train_np = tabpfn_arrays['y_train']
     years_train_np = tabpfn_arrays['years_train']
 
@@ -73,21 +75,18 @@ if __name__ == '__main__':
     results_per_year = wf["results_per_year"]
     year_to_domain_combined = wf["year_to_domain_combined"]
     test_rows_checked = wf["test_rows_checked"]
-
     results_df = pd.DataFrame(results_per_year).sort_values("year").reset_index(drop=True)
+    print(results_df)
 
     feature_cols = list(top_k_events)
     X_train_df = train_rows[feature_cols].copy()
-    X_test_df = test_rows_checked[feature_cols].copy()
+    X_test_df = test_rows[feature_cols].copy()
 
     scaler, X_train_df, X_test_df = scale_df_data(
         X_train_df, X_test_df, feature_cols
     )
 
-    print(results_df)
-
     emb_cfg = EmbeddingExtractConfig()
-
     emb_out = load_or_extract_embeddings(
         drift_model,
         X_train_np,
@@ -103,11 +102,6 @@ if __name__ == '__main__':
 
     train_emb = emb_out['train_emb_flat']
     test_emb = emb_out['test_emb_flat']
-
-    # with open(TRAINING_EMBEDDING_FILE, 'rb') as f:
-    #     train_emb = np.load(f)
-    # with open(TEST_EMBEDDING_FILE, 'rb') as f:
-    #     test_emb = np.load(f)
 
     print(train_emb.shape, test_emb.shape)
 

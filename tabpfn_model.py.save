@@ -13,7 +13,6 @@ from importlib import resources
 from sklearn.metrics import f1_score
 from pathlib import Path
 import os
-from pickle import dump, load
 
 BATCH_SIZE = 512
 
@@ -28,8 +27,8 @@ class EmbeddingExtractConfig:
     max_extract: Optional[int] = None
     use_cache: bool = True
 
-TRAINING_EMBEDDING_FILE = get_env_path('models/tabpfn/dr_tabpfn_train_emb.npy')
-TEST_EMBEDDING_FILE = get_env_path('models/tabpfn/dr_tabpfn_test_emb.npy')
+TRAINING_EMBEDDING_FILE = get_env_path('models/tabpfn/tabpfn_emb_train.npy')
+TEST_EMBEDDING_FILE = get_env_path('models/tabpfn/tabpfn_emb_test.npy')
 PRED_BIN_FILE = get_env_path('models/tabpfn/y_pred_bin.npy')
 PRED_PROB_FILE = get_env_path('models/tabpfn/y_pred_prob_')
 
@@ -178,7 +177,7 @@ def fit_dr_tabpfn(X_train: np.ndarray, y_train: np.ndarray, train_years: np.ndar
 
     train_years = np.asarray(train_years).astype(int)
     # um index (dominio) por ano
-    year_to_domain_train = {y: i for i, y in enumerate(sorted(set(train_years)))}
+    year_to_domain_train = {y: i for i, y in sorted(set(enumerate(train_years)))}
     dist_shift_domain_train_np = np.ascontiguousarray(
         np.array([year_to_domain_train[int(y)] for y in train_years], dtype=np.int64)
     )
@@ -260,7 +259,6 @@ def walkforward_evaluate_tabpfn(drift_model: TabPFNClassifier, test_rows: pd.Dat
     year_to_domain_combined = {y: i for i, y in enumerate(combined_years)}
 
     results_per_year: list[dict[str, Any]] = []
-    preds_per_year = []
     t_infer_total = 0.0
 
     for eval_year in sorted(test_rows['year'].unique().astype(int)):
@@ -273,7 +271,7 @@ def walkforward_evaluate_tabpfn(drift_model: TabPFNClassifier, test_rows: pd.Dat
 
         n_samples = df_year.shape[0]
         y_true = (df_year['DEATH'] > 0).astype(int).values
-        year_file = PRED_PROB_FILE + str(eval_year) + '.pkl'
+
         # label de domínio temporal para todas linhas
         dist_dom_all = np.array(
             [year_to_domain_combined[int(y)] for y in df_year['year'].astype(int).tolist()],
@@ -282,12 +280,10 @@ def walkforward_evaluate_tabpfn(drift_model: TabPFNClassifier, test_rows: pd.Dat
 
         preds_list = []
         t0_year = time.perf_counter()
-        if os.path.exists(year_file):
+        if os.path.exists(PRED_PROB_FILE + str(eval_year) + '.npy'):
             print('Carregando resultados do arquivo salvo')
-            with open(year_file, 'rb') as f:
-                results = load(f)
-                preds_per_year.append((eval_year, results.pop('y_pred')))
-                results_per_year.append(results)
+            results = np.load(PRED_PROB_FILE + str(eval_year) + '.npy', allow_pickle=True)
+            results_per_year.append(results)
             continue
 
         for start in range(0, n_samples, batch_size_predict):
@@ -330,6 +326,7 @@ def walkforward_evaluate_tabpfn(drift_model: TabPFNClassifier, test_rows: pd.Dat
 
         preds_proba = np.vstack(preds_list)
         y_pred = np.argmax(preds_proba, axis=1)
+        #np.save(PRED_PROB_FILE + str(eval_year) + '.npy', y_pred)
 
         f1_macro = f1_score(y_true, y_pred, average='macro') if len(np.unique(y_true)) > 1 else float('nan')
         f1_pos = f1_score(y_true, y_pred) if len(np.unique(y_true)) > 1 else float('nan')
@@ -342,12 +339,9 @@ def walkforward_evaluate_tabpfn(drift_model: TabPFNClassifier, test_rows: pd.Dat
                 'f1_pos': float(f1_pos) if not np.isnan(f1_pos) else float('nan'),
                 'infer_time_sec': float(t_infer_year)
             }
-        print(f'Positivos: {np.mean(y_pred) * 100}%')
-        with open(year_file, 'wb') as f:
-            dump(results, f)
-        print(f'f1_macro: {results["f1_macro"]}, f1_pos: {results["f1_pos"]}')
+        print(f'Pos %: {ny_pred}'
+        np.save(PRED_PROB_FILE + str(eval_year) + '.npy', results)
         print(f'Resultados de {eval_year} salvos em {PRED_PROB_FILE + str(eval_year) + ".npy"}')
-        preds_per_year.append((eval_year, results.pop('y_pred')))
         results_per_year.append(results)
     return {
         'results_per_year': results_per_year,
@@ -451,12 +445,12 @@ def load_or_extract_embeddings(model: TabPFNClassifier, X_train_np: np.ndarray, 
                                ) -> dict[str, np.ndarray]:
     embeddings_dir = get_env_path(embeddings_dir)
 
-    p_train = TRAINING_EMBEDDING_FILE
-    p_test = TEST_EMBEDDING_FILE
+    p_train = embeddings_dir / "dr_tabpfn_train_emb.npy"
+    p_test = embeddings_dir / "dr_tabpfn_test_emb.npy"
     # p_train_flat = embeddings_dir / "dr_tabpfn_train_emb_flat.npy"
     # p_test_flat = embeddings_dir / "dr_tabpfn_test_emb_flat.npy"
-    print(p_train, p_test)
-    if cfg.use_cache and os.path.exists(p_train):
+
+    if cfg.use_cache and p_train.exists():
         train_emb = np.load(p_train)
     else:
         train_emb = extract_embeddings_robust(
@@ -471,7 +465,7 @@ def load_or_extract_embeddings(model: TabPFNClassifier, X_train_np: np.ndarray, 
             example_add_shape=example_add_shape
         )
 
-    if cfg.use_cache and os.path.exists(p_test):
+    if cfg.use_cache and p_train.exists():
         test_emb = np.load(p_test)
     else:
         test_emb = extract_embeddings_robust(

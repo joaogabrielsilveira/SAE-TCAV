@@ -3,3 +3,5 @@
 /.venv/
 /stats/
 /data/
+/__pycache__/
+
