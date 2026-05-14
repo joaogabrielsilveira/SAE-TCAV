@@ -416,6 +416,11 @@ def get_tabpfn_arrays(p: dict[str, object]):
     test_rows = p["test_rows"]
     top_k_events = p["top_k_events"]
 
+    for event in sorted(top_k_events):
+        if event in test_rows:
+            pass
+            #print(f'Parametro {event}: Média {test_rows[event].mean()} Max {test_rows[event].max()} Min {test_rows[event].min()}')
+
     X_train_np = train_rows[top_k_events].to_numpy(dtype=np.float32, copy=True)
     y_train_np = (train_rows['DEATH'] > 0).astype(int).to_numpy(copy=True)
     years_train_np = train_rows['year'].astype(int).to_numpy(copy=True)

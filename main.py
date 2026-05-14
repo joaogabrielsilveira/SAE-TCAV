@@ -194,7 +194,7 @@ if __name__ == '__main__':
                 rule = sktree.export_text(tree['model'], feature_names=feature_cols)
                 true_text = 'PREVENÇÃO' if score < 0.4 else 'RISCO'
                 false_text = 'RISCO' if score < 0.4 else 'PREVENÇÃO'
-                rules = extrair_regras_positivas(tree['model'], feature_cols)
+                rules = extrair_regras_positivas(tree['model'], feature_cols, scaler)
                 for i, rule in enumerate(rules):
                     print(f'Rule {i}: {rule}')
     

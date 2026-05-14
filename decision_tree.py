@@ -10,13 +10,14 @@ import warnings
 from sklearn.exceptions import UndefinedMetricWarning
 from imblearn.under_sampling import RandomUnderSampler
 from imblearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 MIN_POSITIVE_SAMPLES = 50
 TREE_MODEL_PATH = get_env_path('models/trees/params')
 TREE_GRAPH_PATH = get_env_path('models/trees/graphs')
 
 # função gerada pelo google gemini, apenas para verificar regras, não é a função final
-def extrair_regras_positivas(modelo_arvore, nomes_das_features):
+def extrair_regras_positivas(modelo_arvore, nomes_das_features, scaler: StandardScaler=None):
     """
     Navega pela árvore de decisão e retorna uma lista de strings legíveis
     contendo apenas as regras que levam à previsão da classe positiva (1).
@@ -36,6 +37,13 @@ def extrair_regras_positivas(modelo_arvore, nomes_das_features):
         if tree_.feature[node] != -2:
             nome_feature = feature_names[node]
             limiar = tree_.threshold[node]
+            feature_idx = tree_.feature[node]
+
+            if scaler is not None:
+                mean = scaler.mean_[feature_idx]
+                stdev = scaler.scale_[feature_idx]
+
+                limiar = (limiar * stdev) + mean  
             
             # 1. Desce para a esquerda (regra: <= limiar)
             regra_esquerda = f"{nome_feature} <= {limiar:.3f}"
