@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from results import save_model_stats
 from filepaths import get_env_path
 
-SAE_MODEL_PATH = get_env_path('models/sae.pth')
+SAE_MODEL_PATH = get_env_path('models')
 
 def print_tensor_data(tensor: torch.Tensor) -> None:
     print(f' >>>>>\n Value: {tensor}\n Shape: {tensor.shape}\n DataType: {tensor.dtype}\n Device: {tensor.device} \n <<<<<')
@@ -41,16 +41,16 @@ class SAE(nn.Module):
         return h, z_hat
 
 def train_sae_model(inputs: torch.Tensor, epochs:int=2000, learning_rate:float=1e-3, weight_decay:float=0.0,
-                    alpha:float=1e-4, save_data=True, data_source:str = 'training') -> SAE:
+                    alpha:float=8e-4, save_data=True, data_source:str = 'training') -> SAE:
     """" Treina o Sparse AutoEncoder usando a entrada e os hiperparâmetros passados.
          O parâmetro alpha é a constante que controla a penalização por dados densos. """
     model = SAE()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model.to(device)
 
-    if os.path.exists(SAE_MODEL_PATH):
+    if os.path.exists(SAE_MODEL_PATH + f'/{data_source}_sae.pth'):
         print(f'Carregando SAE do arquivo salvo')
-        model.load_state_dict(torch.load(f=SAE_MODEL_PATH))
+        model.load_state_dict(torch.load(f=SAE_MODEL_PATH + f'/{data_source}_sae.pth'))
         return model
 
     optimizer = torch.optim.Adam(params=model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -88,5 +88,5 @@ def train_sae_model(inputs: torch.Tensor, epochs:int=2000, learning_rate:float=1
     if save_data:
         save_model_stats(inputs, model.encode(inputs), model.decode(model.encode(inputs)), {'epochs': epochs, 'learning_rate': learning_rate,
                                                                   'alpha': alpha, 'weight_decay': weight_decay}, data_source)
-    torch.save(obj=model.state_dict(), f=SAE_MODEL_PATH)
+    torch.save(obj=model.state_dict(), f=SAE_MODEL_PATH + f'/{data_source}_sae.pth')
     return model

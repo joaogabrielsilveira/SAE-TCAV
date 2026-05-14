@@ -33,123 +33,6 @@ TEST_EMBEDDING_FILE = get_env_path('models/tabpfn/dr_tabpfn_test_emb.npy')
 PRED_BIN_FILE = get_env_path('models/tabpfn/y_pred_bin.npy')
 PRED_PROB_FILE = get_env_path('models/tabpfn/y_pred_prob_')
 
-# função antiga que recupera os embeddings do tabpfn vanilla
-# def get_tabpfn_model(arrays: dict[str, np.ndarray], get_embeddings=False, get_pred=False) -> (TabPFNClassifier |
-#                                                                                               tuple[
-#                                                                                                   TabPFNClassifier, np.ndarray, np.ndarray,
-#                                                                                                   dict[
-#                                                                                                       str, np.ndarray]
-#                                                                                               ]):
-#     """ Cria um modelo tabpfn com os dados fornecidos.
-#         Se get_embeddings for verdadeiro, retorna uma tupla com o modelo e os embeddings de
-#         treino e teste, repectivamente. Se possível, os embeddings são extraídos de um arquivo salvo,
-#         caso contrário são extraídos do próprio modelo. """
-#     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-#
-#     # Separação dos dados de treino e teste
-#     X_train = arrays['X_train']
-#     y_train = arrays['y_train']
-#     X_test = arrays['X_test']
-#     y_test = arrays['y_test']
-#
-#     # Imputação dos dados
-#     X_train_imputed, y_train_imputed = impute_data(X_train), y_train
-#     X_test_imputed, y_test_imputed = impute_data(X_test), y_test
-#
-#     # Normalização dos dados
-#     X_train_normalized, y_train_normalized = normalize_data(X_train_imputed), y_train_imputed.astype(np.float64)
-#     X_test_normalized, y_test_normalized = normalize_data(X_test_imputed), y_test_imputed.astype(np.float64)
-#
-#     clf = TabPFNClassifier(device=device, n_estimators=1)
-#     clf.fit(X_train_normalized, y_train_normalized)
-#     y_pred_bin = None
-#     y_pred_prob = None
-#
-#     if get_pred:
-#         if os.path.exists(PRED_BIN_FILE):
-#             y_pred_bin = np.load(PRED_BIN_FILE)
-#         else:
-#             y_pred_list = []
-#             for i in range(0, X_test_normalized.shape[0], BATCH_SIZE):
-#                 print(f'Batch {i // BATCH_SIZE}: {i}-{i + BATCH_SIZE}')
-#                 y_pred_list.append(clf.predict(X_test_normalized[i:i + BATCH_SIZE, :]))
-#
-#             y_pred_bin = np.concatenate(y_pred_list, axis=0)
-#
-#             with open(PRED_BIN_FILE, 'wb') as pred:
-#                 np.save(pred, y_pred_bin)
-#
-#         if os.path.exists(PRED_PROB_FILE):
-#             y_pred_prob = np.load(PRED_PROB_FILE)
-#         else:
-#             y_pred_list = []
-#             for i in range(0, X_test_normalized.shape[0], BATCH_SIZE):
-#                 print(f'Batch {i // BATCH_SIZE}: {i}-{i + BATCH_SIZE}')
-#                 y_pred_list.append(clf.predict_proba(X_test_normalized[i:i + BATCH_SIZE, :])[:, 1])
-#
-#             y_pred_prob = np.concatenate(y_pred_list, axis=0)
-#
-#             with open(PRED_PROB_FILE, 'wb') as pred:
-#                 np.save(pred, y_pred_prob)
-#
-#     if get_embeddings:
-#         if os.path.exists(TRAINING_EMBEDDING_FILE) and os.path.exists(TEST_EMBEDDING_FILE):
-#             print("Extraindo embeddings do arquivo")
-#             train_embeddings = np.load(TRAINING_EMBEDDING_FILE)
-#             test_embeddings = np.load(TEST_EMBEDDING_FILE)
-#         else:
-#             print("Extraindo embeddings do modelo")
-#             embedding_extractor = TabPFNEmbedding(tabpfn_clf=clf, n_fold=10)
-#             if not os.path.exists(TRAINING_EMBEDDING_FILE):
-#                 train_emb_list = []
-#                 for i in range(0, X_train_normalized.shape[0], BATCH_SIZE):
-#                     print(f'Batch {i // BATCH_SIZE}: {i}-{i+BATCH_SIZE}')
-#                     train_embeddings = embedding_extractor.get_embeddings(X_train_normalized, y_train_normalized,
-#                                                                           X_train_normalized[i:i + BATCH_SIZE, :],
-#                                                                           data_source='train')
-#                     if train_embeddings.ndim == 3:
-#                         train_embeddings = np.mean(train_embeddings, axis=0)
-#                     train_emb_list.append(train_embeddings)
-#                 train_embeddings = np.concatenate(train_emb_list, axis=0)
-#
-#                 with open(TRAINING_EMBEDDING_FILE, 'wb') as train_emb:
-#                     np.save(train_emb, train_embeddings)
-#             else:
-#                 train_embeddings = np.load(TRAINING_EMBEDDING_FILE)
-#
-#             if not os.path.exists(TEST_EMBEDDING_FILE):
-#                 test_emb_list = []
-#                 for i in range(0, X_test_normalized.shape[0], BATCH_SIZE):
-#                     print(f'Batch {i // BATCH_SIZE}: {i}-{i + BATCH_SIZE}')
-#                     test_embeddings = embedding_extractor.get_embeddings(X_train_normalized, y_train_normalized,
-#                                                                          X_test_normalized[i:i + BATCH_SIZE, :],
-#                                                                          data_source='test')
-#                     if test_embeddings.ndim == 3:
-#                         test_embeddings = np.mean(test_embeddings, axis=0)
-#                     test_emb_list.append(test_embeddings)
-#                 test_embeddings = np.concatenate(test_emb_list, axis=0)
-#
-#                 with open(TEST_EMBEDDING_FILE, 'wb') as test_emb:
-#                     np.save(test_emb, test_embeddings)
-#             else:
-#                 test_embeddings = np.load(TEST_EMBEDDING_FILE)
-#
-#         return clf, train_embeddings, test_embeddings, {
-#             'X_train': X_train, 'X_test': X_test,
-#             'y_train': y_train, 'y_test': y_test,
-#             'X_train_imputed': X_train_imputed,
-#             'X_test_imputed': X_test_imputed,
-#             'y_train_imputed': y_train_imputed,
-#             'y_test_imputed': y_test_imputed,
-#             'X_train_normalized': X_train_normalized,
-#             'X_test_normalized': X_test_normalized,
-#             'y_train_normalized': y_train_normalized,
-#             'y_test_normalized': y_test_normalized,
-#             'y_pred_bin': y_pred_bin,
-#             'y_pred_prob': y_pred_prob
-#         }
-#
-#     return clf
 
 def infer_model_additional_x_info(model):
     device = torch.device('cpu')
@@ -286,7 +169,8 @@ def walkforward_evaluate_tabpfn(drift_model: TabPFNClassifier, test_rows: pd.Dat
             print('Carregando resultados do arquivo salvo')
             with open(year_file, 'rb') as f:
                 results = load(f)
-                preds_per_year.append((eval_year, results.pop('y_pred')))
+                preds_per_year.append((eval_year, results.pop('y_pred_proba')))
+                results.pop('y_pred_bin', None)
                 results_per_year.append(results)
             continue
 
@@ -334,7 +218,8 @@ def walkforward_evaluate_tabpfn(drift_model: TabPFNClassifier, test_rows: pd.Dat
         f1_macro = f1_score(y_true, y_pred, average='macro') if len(np.unique(y_true)) > 1 else float('nan')
         f1_pos = f1_score(y_true, y_pred) if len(np.unique(y_true)) > 1 else float('nan')
         results = {
-                'y_pred': y_pred,
+                'y_pred_bin': y_pred,
+                'y_pred_proba': preds_proba[:, 1],
                 'year': int(eval_year),
                 'n_samples': int(n_samples),
                 'n_deaths': int(y_true.sum()),
@@ -345,9 +230,11 @@ def walkforward_evaluate_tabpfn(drift_model: TabPFNClassifier, test_rows: pd.Dat
         print(f'Positivos: {np.mean(y_pred) * 100}%')
         with open(year_file, 'wb') as f:
             dump(results, f)
+            for i in range(min(5, len(preds_proba))):
+                print(results['y_pred_proba'][i], preds_proba[i], y_pred[i])
         print(f'f1_macro: {results["f1_macro"]}, f1_pos: {results["f1_pos"]}')
         print(f'Resultados de {eval_year} salvos em {PRED_PROB_FILE + str(eval_year) + ".npy"}')
-        preds_per_year.append((eval_year, results.pop('y_pred')))
+        preds_per_year.append((eval_year, results.pop('y_pred_proba')))
         results_per_year.append(results)
     return {
         'results_per_year': results_per_year,
@@ -395,8 +282,14 @@ def batch_get_embeddings(model: TabPFNClassifier, X_all: np.ndarray, dist_full: 
 
     return np.vstack(out_list), tensors_list
 
-def scale_data(train_rows: pd.DataFrame):
-    pass
+def scale_embeddings_l2(train_emb: np.ndarray, test_emb: np.ndarray):
+    t_train = torch.tensor(train_emb, dtype=torch.float32)
+    t_test  = torch.tensor(test_emb,  dtype=torch.float32)
+
+    train_norm = torch.nn.functional.normalize(t_train, p=2, dim=1).numpy()
+    test_norm  = torch.nn.functional.normalize(t_test,  p=2, dim=1).numpy()
+
+    return train_norm, test_norm
 
 def extract_embeddings_robust(model: TabPFNClassifier, X: np.ndarray, years: np.ndarray,
                                year_to_domain_map: dict[int, int], cfg: EmbeddingExtractConfig = EmbeddingExtractConfig(),
@@ -503,7 +396,7 @@ def scale_embeddings(emb_train: np.ndarray, emb_test: np.ndarray) -> tuple[np.nd
     scaler = StandardScaler()
     scaler.fit(emb_train)
     emb_train_new = scaler.transform(emb_train)
-    # scaler.fit(emb_test)
+    scaler.fit(emb_test)
     emb_test_new = scaler.transform(emb_test)
 
     return emb_train_new, emb_test_new
