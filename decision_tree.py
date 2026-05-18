@@ -11,13 +11,15 @@ from sklearn.exceptions import UndefinedMetricWarning
 from imblearn.under_sampling import RandomUnderSampler
 from imblearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from results import translate_event_name
+import re
 
 MIN_POSITIVE_SAMPLES = 50
 TREE_MODEL_PATH = get_env_path('models/trees/params')
 TREE_GRAPH_PATH = get_env_path('models/trees/graphs')
 
 # função gerada pelo google gemini, apenas para verificar regras, não é a função final
-def extrair_regras_positivas(modelo_arvore, nomes_das_features, scaler: StandardScaler=None):
+def extrair_regras_positivas(modelo_arvore, nomes_das_features, scaler: StandardScaler=None, cid_dict=None):
     """
     Navega pela árvore de decisão e retorna uma lista de strings legíveis
     contendo apenas as regras que levam à previsão da classe positiva (1).
@@ -36,6 +38,7 @@ def extrair_regras_positivas(modelo_arvore, nomes_das_features, scaler: Standard
         # Se NÃO for uma folha (ou seja, é um nó de divisão)
         if tree_.feature[node] != -2:
             nome_feature = feature_names[node]
+            nome_feature += f' ({translate_event_name(feature_names[node], cid_dict)})'
             limiar = tree_.threshold[node]
             feature_idx = tree_.feature[node]
 
@@ -76,6 +79,92 @@ def extrair_regras_positivas(modelo_arvore, nomes_das_features, scaler: Standard
     # Inicia a busca a partir da raiz (nó 0) com um caminho vazio
     percorrer_arvore(0, [])
     
+    return regras_positivas
+
+# igualmente à função anterior; será revisitada
+def extrair_regras_resumidas(modelo_arvore, nomes_das_features, scaler=None, dicionario=None):
+    tree_ = modelo_arvore.tree_
+    feature_names = [nomes_das_features[i] if i != -2 else "undefined!" for i in tree_.feature]
+    regras_positivas = []
+
+    # MÁGICA 1: Função que "olha para o futuro" para ver se pode resumir
+    def sub_arvore_pura_positiva(node):
+        if tree_.feature[node] == -2: # É uma folha
+            valores = tree_.value[node][0]
+            return np.argmax(valores) == 1 # Retorna True se prever classe 1
+        
+        # Olha para os dois filhos
+        esq_positivo = sub_arvore_pura_positiva(tree_.children_left[node])
+        dir_positivo = sub_arvore_pura_positiva(tree_.children_right[node])
+        
+        # Só resume se TODOS os caminhos abaixo levarem à classe 1
+        return esq_positivo and dir_positivo
+
+    # Tradutor embutido
+    def traduzir(nome):
+        if not dicionario: return nome
+        if nome.lower() in dicionario:
+            return f"[{dicionario[nome.lower()]}]".capitalize()
+        match = re.search(r"DIAGN_([A-Z0-9]+)", nome)
+
+        if match and match.group(1).lower() in dicionario:
+            return f"[{dicionario[match.group(1).lower()]}]".capitalize()
+        return nome
+
+    def percorrer_arvore(node, limites_atuais):
+        
+        # Se este galho inteiro só leva para a Classe 1, podemos resumir agora!
+        if sub_arvore_pura_positiva(node):
+            valores = tree_.value[node][0]
+            confianca = valores[1] / np.sum(valores) # Confiança média ponderada
+            casos = tree_.n_node_samples[node]       # Soma total de casos das folhas filhas
+            
+            condicoes = []
+            for feat, bounds in limites_atuais.items():
+                nome_traduzido = traduzir(feat)
+                b_min = bounds['min']
+                b_max = bounds['max']
+                
+                # Monta a regra de forma inteligente (X > min, X <= max, ou min < X <= max)
+                if b_min != -np.inf and b_max != np.inf:
+                    condicoes.append(f"{b_min:.2f} < {nome_traduzido} ({feat}) <= {b_max:.2f}")
+                elif b_min != -np.inf:
+                    condicoes.append(f"{nome_traduzido} ({feat}) > {b_min:.2f}")
+                elif b_max != np.inf:
+                    condicoes.append(f"{nome_traduzido} ({feat}) <= {b_max:.2f}")
+            
+            regra_str = " E ".join(condicoes) if condicoes else "TODOS OS CASOS"
+            regras_positivas.append(f"SE ( {regra_str}) ENTÃO Conceito Ativo [Confiança Média: {confianca:.0%} | Casos Totais: {casos}]")
+            
+            return # Interrompe a descida (Resume a árvore)
+
+        # Se a árvore for "mista" (tem positivos e negativos), continua descendo
+        if tree_.feature[node] != -2:
+            feature_idx = tree_.feature[node]
+            nome_feature = feature_names[node]
+            limiar_escalado = tree_.threshold[node]
+            
+            if scaler is not None:
+                limiar = (limiar_escalado * scaler.scale_[feature_idx]) + scaler.mean_[feature_idx]
+            else:
+                limiar = limiar_escalado
+
+            # MÁGICA 2: Gravar Mínimos e Máximos em vez de empilhar strings
+            
+            # Caminho da Esquerda (<= limiar)
+            limites_esq = {k: dict(v) for k, v in limites_atuais.items()}
+            if nome_feature not in limites_esq: limites_esq[nome_feature] = {'min': -np.inf, 'max': np.inf}
+            limites_esq[nome_feature]['max'] = min(limites_esq[nome_feature]['max'], limiar)
+            percorrer_arvore(tree_.children_left[node], limites_esq)
+            
+            # Caminho da Direita (> limiar)
+            limites_dir = {k: dict(v) for k, v in limites_atuais.items()}
+            if nome_feature not in limites_dir: limites_dir[nome_feature] = {'min': -np.inf, 'max': np.inf}
+            limites_dir[nome_feature]['min'] = max(limites_dir[nome_feature]['min'], limiar)
+            percorrer_arvore(tree_.children_right[node], limites_dir)
+
+    # Começa a busca na raiz (nó 0) com limites vazios
+    percorrer_arvore(0, {})
     return regras_positivas
 
 def select_best_tree(cv_results):

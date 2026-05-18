@@ -6,7 +6,7 @@ from database import open_feather, get_vars, RENAL_DB_PATH, prepare_database, ge
 from sae import train_sae_model
 from tabpfn_model import fit_dr_tabpfn, walkforward_evaluate_tabpfn, TabPFNEvalConfig, load_or_extract_embeddings, \
     EmbeddingExtractConfig, scale_embeddings, scale_embeddings_l2, temporal_test_subsplits, TRAINING_EMBEDDING_FILE, TEST_EMBEDDING_FILE, PRED_PROB_FILE
-from decision_tree import train_binary_trees, get_binary_targets
+from decision_tree import train_binary_trees, get_binary_targets, extrair_regras_resumidas
 from tcav import get_cavs, get_tcav_scores
 from filepaths import get_env_path
 from pickle import dump, load
@@ -15,6 +15,7 @@ import pandas as pd
 from tabpfn import TabPFNClassifier
 from sklearn import tree as sktree
 from decision_tree import extrair_regras_positivas
+from results import cid10_dict, translate_event_name, events_dict
 
 PREPARED_DB_PATH = get_env_path('data/renal/prep.pkl')
 
@@ -34,6 +35,7 @@ if __name__ == '__main__':
     train_rows = prep_out['train_rows']
     test_rows = prep_out['test_rows']
     top_k_events = prep_out['top_k_events']
+    cid = cid10_dict()
 
     X_train_np = tabpfn_arrays['X_train']
     #print(X_train_np.columns)
@@ -187,15 +189,20 @@ if __name__ == '__main__':
         else:
             significant_factors.append((idx, score))
 
+    full_events_dict = cid | events_dict
     for idx, score in significant_factors:
-        print(f'Factor {idx}: TCAV score = {score} ({"PREVENÇÃO" if score < 0.4 else "RISCO"})')
+        print(f'Fator {idx}: TCAV score = {score:.2f} ({"PREVENÇÃO" if score < 0.4 else "RISCO"})')
         for tree in trees:
             if tree['idx'] == idx:
                 rule = sktree.export_text(tree['model'], feature_names=feature_cols)
                 true_text = 'PREVENÇÃO' if score < 0.4 else 'RISCO'
                 false_text = 'RISCO' if score < 0.4 else 'PREVENÇÃO'
-                rules = extrair_regras_positivas(tree['model'], feature_cols, scaler)
-                for i, rule in enumerate(rules):
-                    print(f'Rule {i}: {rule}')
+                rules = extrair_regras_resumidas(tree['model'], feature_cols, scaler, dicionario=full_events_dict)
+                metrics = tree['metrics']
+                print(f'Árvore do fator {tree["idx"]}: Precisão={metrics["acc"]:.2f}, Recall={metrics["rec"]:.2f}, F1={metrics["f1"]:.2f}')
+                for i, rule in enumerate(rules):                
+                    print(f'Regra {i}: {rule}')
+
+                input()
     
     print(f'Total de fatores significativos encontrados: {len(significant_factors)}')

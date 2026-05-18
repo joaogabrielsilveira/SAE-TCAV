@@ -3,9 +3,11 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 from filepaths import get_env_path
+import csv
 
 MODEL_RESULTS_PATH = get_env_path('stats/SAE.txt')
 MODEL_RESULTS_CSV_PATH = get_env_path('stats/SAE.csv')
+CID10_PATH = get_env_path('data/CID-10-SUBCATEGORIAS.CSV')
 
 def save_model_stats(original_input: torch.Tensor, encoded: torch.Tensor, decoded: torch.Tensor,
                      stats: dict[str, float], data_source: str) -> None:
@@ -71,3 +73,72 @@ def plot_losses(losses: list | np.ndarray | torch.Tensor) -> None:
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.show()
+
+def cid10_dict():
+    with open(CID10_PATH, 'r', encoding='latin1') as in_file:
+        out = {}
+        reader = csv.reader(in_file, delimiter=';')
+        next(reader, None)
+        for row in reader:
+            code = row[0].lower()
+            name = row[4].lower()
+
+            while len(code) < 4:
+                code += '0'
+            
+            if row[7]:
+                for alt_code in row[7].split(sep=','):
+                    while len(alt_code) < 4:
+                        alt_code += '0'
+                    out[alt_code.lower()] = name
+            
+            out[code] = name
+    
+    return out
+
+events_dict = {
+    # Categoria 1: Tratamentos Filtrantes (Diálise)
+    "event_c1dialise_hd": "Sessões de Hemodiálise",
+    "event_c1dialise_dp": "Sessões de Diálise Peritoneal",
+
+    # Categoria 2: Medicamentos
+    "event_c2med_aza": "Uso de Azatioprina (Imunossupressor)",
+    "event_c2med_csa": "Uso de Ciclosporina (Imunossupressor)",
+    "event_c2med_tacro": "Uso de Tacrolimo (Imunossupressor)",
+    "event_c2med_micof": "Uso de Micofenolato (Imunossupressor)",
+    "event_c2med_sevel": "Uso de Sevelamer (Controle de Fósforo)",
+    "event_c2med_calci": "Uso de Calcitriol/Cálcio",
+    "event_c2med_eritro": "Uso de Eritropoietina",
+    "event_c2med_hidfe": "Uso de Ferro Endovenoso",
+    "event_c2med_antiane": "Uso de Antianêmicos",
+
+    # Categoria 3: Acessos Vasculares
+    "event_c3acesso_ct": "Uso de Cateter Temporário (Acesso de Emergência)",
+    "event_c3acesso_ctk": "Uso de Cateter Tunelizado (Permcath)",
+    "event_c3acesso_fv": "Uso de Fístula Arteriovenosa",
+
+    # Categoria 5: Cirurgias e Transplantes
+    "event_c5tx_tx": "Transplante Renal (Ativo)",
+    "event_c5tx_extx": "Perda do Transplante (Retorno à Diálise)",
+
+    # Categoria 6: Ambiente / Hospitalização
+    "event_c6interna_inter": "Internações"
+}
+
+def translate_event_name(event: str, cid_dict: dict[str, str]):
+    event = event.lower().strip()
+    
+    if 'diagn' in event:
+        event = event.replace("diagn_", "")
+        while len(event) < 4:
+            event += '0'
+        name = cid_dict.get(event, None)
+    
+    else:
+        name = events_dict.get(event, None)
+    
+    if name is not None:
+        return name.capitalize()
+    
+    else:
+        return 'EVENTO INVÁLIDO'
