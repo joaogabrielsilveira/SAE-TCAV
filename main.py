@@ -1,3 +1,5 @@
+import pickle
+
 import numpy as np
 from dotenv import load_dotenv
 load_dotenv()
@@ -16,10 +18,25 @@ from tabpfn import TabPFNClassifier
 from sklearn import tree as sktree
 from decision_tree import extrair_regras_positivas
 from results import cid10_dict, translate_event_name, events_dict
+# from TCAV.renal_framework.src.tabpfn_pipeline.evaluation import walkforward_evaluate_tabpfn
 
 PREPARED_DB_PATH = get_env_path('data/renal/prep.pkl')
 
 if __name__ == '__main__':
+    # my_train_emb = np.load(TRAINING_EMBEDDING_FILE).squeeze().astype(np.float32)
+    # my_test_emb = np.load(TEST_EMBEDDING_FILE).squeeze().astype(np.float32)
+
+    # nb_train_emb = np.load('TCAV/renal_framework/results/demo_tabpfn/embeddings/train_emb_flat.npy').astype(np.float32)
+    # nb_test_emb = np.load('TCAV/renal_framework/results/demo_tabpfn/embeddings/test_emb_flat.npy').astype(np.float32)
+
+    # print(f'My train emb shape: {my_train_emb.shape}, mean: {my_train_emb.mean()}, var: {my_train_emb.var()}')
+    # print(f'My test emb shape: {my_test_emb.shape}, mean: {my_test_emb.mean()}, var: {my_test_emb.var()}')
+    # print(f'NB train emb shape: {nb_train_emb.shape}, mean: {nb_train_emb.mean()}, var: {nb_train_emb.var()}')
+    # print(f'NB test emb shape: {nb_test_emb.shape}, mean: {nb_test_emb.mean()}, var: {nb_test_emb.var()}')
+
+    # print(np.count_nonzero(my_train_emb != nb_train_emb))
+    # print(np.count_nonzero(my_test_emb != nb_test_emb))
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     df = open_feather(RENAL_DB_PATH)
     if not os.path.exists(PREPARED_DB_PATH):
@@ -38,14 +55,15 @@ if __name__ == '__main__':
     cid = cid10_dict()
 
     X_train_np = tabpfn_arrays['X_train']
-    #print(X_train_np.columns)
-    #input()
     y_train_np = tabpfn_arrays['y_train']
     years_train_np = tabpfn_arrays['years_train']
 
     X_test_np = tabpfn_arrays['X_test']
     y_test_np = tabpfn_arrays['y_test']
     years_test_np = tabpfn_arrays['years_test']
+
+    # print(f'years_train: {years_train_np.shape}')
+    # print(f'years_test: {years_test_np.shape}')
 
     #print("train_rows:", train_rows.shape)
     #print("test_rows :", test_rows.shape)
@@ -63,9 +81,9 @@ if __name__ == '__main__':
     model_add_x_device = fit_out["model_add_x_device"]
     example_add_shape = fit_out["example_add_shape"]
 
-    #print(f"Fit time: {fit_out['fit_time_sec']:.2f}s")
-    #print("additional_x device:", model_add_x_device)
-    #print("example_add_shape:", example_add_shape)
+    # print(f"Fit time: {fit_out['fit_time_sec']:.2f}s")
+    # print("additional_x device:", model_add_x_device)
+    # print("example_add_shape:", example_add_shape)
 
     wf = walkforward_evaluate_tabpfn(
         drift_model=drift_model,
@@ -80,39 +98,47 @@ if __name__ == '__main__':
     results_per_year = wf["results_per_year"]
     year_to_domain_combined = wf["year_to_domain_combined"]
     test_rows_checked = wf["test_rows_checked"]
+
     results_df = pd.DataFrame(results_per_year).sort_values("year").reset_index(drop=True)
-    #print(results_df)
+    # print(results_df)
 
     feature_cols = list(top_k_events)
     X_train_df = train_rows[feature_cols].copy()
     X_test_df = test_rows[feature_cols].copy()
 
+    # print(f'X_train_df: {X_train_df.shape}')
+    # print(f'X_test_df : {X_test_df.shape}')
+
     scaler, X_train_df, X_test_df = scale_df_data(
         X_train_df, X_test_df, feature_cols
     )
 
+    # print(f'X_train_df_norm: {X_train_df.shape})
+    # print(f'X_test_df_norm : {X_test_df.shape}')
+
     emb_cfg = EmbeddingExtractConfig()
     emb_out = load_or_extract_embeddings(
-        drift_model,
-        X_train_np,
-        X_test_np,
-        years_train_np,
-        years_test_np,
-        year_to_domain_combined,
-        "",
-        emb_cfg,
-        model_add_x_device,
-        example_add_shape,
+        model=drift_model,
+        X_train_np=X_train_np,
+        X_test_np=X_test_np,
+        years_train=years_train_np,
+        years_test=years_test_np,
+        year_to_domain_map=year_to_domain_combined,
+        embeddings_dir="",
+        cfg=emb_cfg,
+        device=model_add_x_device,
+        example_add_shape=example_add_shape,
     )
 
-    train_emb = emb_out['train_emb_flat'].astype(np.float64)
-    test_emb = emb_out['test_emb_flat'].astype(np.float64)
+    train_emb = emb_out['train_emb_flat'].astype(np.float32)
+    test_emb = emb_out['test_emb_flat'].astype(np.float32)
 
     #print(np.mean(train_emb), np.mean(test_emb))
 
     #train_emb_scaled, test_emb_scaled = scale_embeddings_l2(train_emb, test_emb)
     train_emb_scaled, test_emb_scaled = scale_embeddings(train_emb, test_emb)
-    #print(test_emb_scaled.var(), train_emb_scaled.var())
+    # print(train_emb_scaled.dtype, train_emb_scaled.mean(), train_emb_scaled.var())
+    # print(test_emb_scaled.mean(), test_emb_scaled.var())
 
     y_test = (test_rows["DEATH"] > 0).astype(int).to_numpy(copy=True)
     split_idx = temporal_test_subsplits(
@@ -141,11 +167,11 @@ if __name__ == '__main__':
     years_test_held_out = years_test_np[idx_test_held_out]
 
     embeddings_discovery = test_emb_scaled[idx_test_discover]
-    # print(embeddings_discovery.var())
 
-    model_train = train_sae_model(torch.tensor(train_emb_scaled), data_source='training')
-    # model_disc = train_sae_model(torch.tensor(embeddings_discovery), data_source='discovery')
-
+    # model_train = train_sae_model(torch.tensor(train_emb_scaled), data_source='training')
+    model_disc = train_sae_model(torch.tensor(embeddings_discovery), data_source='discovery', use_decoder_bias=False)
+    print(f'Nulos no meu modelo: {(model_disc.encode(torch.tensor(embeddings_discovery)) <= 1e-5).all(dim=0).sum().item()}')
+    exit()
     rng = np.random.default_rng(42)
     model_device = next(model_train.parameters()).device
     n_cav = len(idx_test_cav_train)

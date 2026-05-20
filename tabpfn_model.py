@@ -61,7 +61,7 @@ def fit_dr_tabpfn(X_train: np.ndarray, y_train: np.ndarray, train_years: np.ndar
 
     train_years = np.asarray(train_years).astype(int)
     # um index (dominio) por ano
-    year_to_domain_train = {y: i for i, y in enumerate(sorted(set(train_years)))}
+    year_to_domain_train = {y: i for i, y in enumerate(sorted(set(train_years.tolist())))}
     dist_shift_domain_train_np = np.ascontiguousarray(
         np.array([year_to_domain_train[int(y)] for y in train_years], dtype=np.int64)
     )
@@ -87,9 +87,11 @@ def fit_dr_tabpfn(X_train: np.ndarray, y_train: np.ndarray, train_years: np.ndar
             drift_model.show_progress = False
         if hasattr(drift_model, "seed"):
             drift_model.seed = eval_cfg.rng_seed
+            print(f'Seed: {eval_cfg.rng_seed}')
 
     except Exception:
         drift_model = TabPFNClassifier(device='auto')
+        print('sujo fi')
 
     t0 = time.perf_counter()
     drift_model = drift_model.fit(
@@ -136,17 +138,27 @@ def make_dist_tensor(dist_dom_np, model_add_x_device, example_add_shape):
 def walkforward_evaluate_tabpfn(drift_model: TabPFNClassifier, test_rows: pd.DataFrame,
                                 top_k_events: list[str], model_add_x_device: torch.device | str,
                                 train_years: list[int], batch_size_predict:int = 512,
-                                example_add_shape = Optional[Tuple[int, ...]],) -> dict[str, Any]:
+                                example_add_shape: Optional[Tuple[int, ...]] = None
+                                ) -> dict[str, Any]:
     test_rows = ensure_test_feature_columns(test_rows, top_k_events)
+    inputs = {}
+    inputs['drift_model'] = drift_model
+    inputs['test_rows'] = test_rows
+    inputs['top_k_events'] = top_k_events
+    inputs['train_years'] = train_years
+    inputs['model_add_x_device'] = model_add_x_device
+    inputs['batch_size_predict'] = batch_size_predict
+    inputs['example_add_shape'] = example_add_shape
+    with open('inputs_mycode.pkl', 'wb') as p:
+        dump(inputs, p)
 
-    combined_years = sorted(set(train_years).union(set(test_rows['year'].unique().astype(int).tolist())))
+    combined_years = sorted(set(train_years).union(set(test_rows['year'].astype(int).unique().tolist())))
     year_to_domain_combined = {y: i for i, y in enumerate(combined_years)}
-
     results_per_year: list[dict[str, Any]] = []
     preds_per_year = []
     t_infer_total = 0.0
 
-    for eval_year in sorted(test_rows['year'].unique().astype(int)):
+    for eval_year in sorted(test_rows['year'].astype(int).unique()):
         print(f'Inferencias do ano {eval_year}')
         # eventos do ano de teste
         df_year = test_rows[test_rows['year'] == eval_year].reset_index(drop=True)
@@ -159,7 +171,7 @@ def walkforward_evaluate_tabpfn(drift_model: TabPFNClassifier, test_rows: pd.Dat
         year_file = PRED_PROB_FILE + str(eval_year) + '.pkl'
         # label de domínio temporal para todas linhas
         dist_dom_all = np.array(
-            [year_to_domain_combined[int(y)] for y in df_year['year'].astype(int).tolist()],
+            [year_to_domain_combined[int(y)] for y in df_year['year'].astype(int)],
             dtype=np.int64
         )
 
@@ -183,9 +195,9 @@ def walkforward_evaluate_tabpfn(drift_model: TabPFNClassifier, test_rows: pd.Dat
             dist_dom_np = dist_dom_all[start:end]
 
             dist_dom_t = make_dist_tensor(
-                dist_dom_np,
-                model_add_x_device,
-                example_add_shape,
+                dist_dom_np=dist_dom_np,
+                model_add_x_device=model_add_x_device,
+                example_add_shape=example_add_shape,
             )
 
             # predições para o batch
@@ -233,7 +245,7 @@ def walkforward_evaluate_tabpfn(drift_model: TabPFNClassifier, test_rows: pd.Dat
             for i in range(min(5, len(preds_proba))):
                 print(results['y_pred_proba'][i], preds_proba[i], y_pred[i])
         print(f'f1_macro: {results["f1_macro"]}, f1_pos: {results["f1_pos"]}')
-        print(f'Resultados de {eval_year} salvos em {PRED_PROB_FILE + str(eval_year) + ".npy"}')
+        print(f'Resultados de {eval_year} salvos em {year_file}')
         preds_per_year.append((eval_year, results.pop('y_pred_proba')))
         results_per_year.append(results)
     return {
@@ -348,7 +360,7 @@ def load_or_extract_embeddings(model: TabPFNClassifier, X_train_np: np.ndarray, 
     p_test = TEST_EMBEDDING_FILE
     # p_train_flat = embeddings_dir / "dr_tabpfn_train_emb_flat.npy"
     # p_test_flat = embeddings_dir / "dr_tabpfn_test_emb_flat.npy"
-    print(p_train, p_test)
+    # print(p_train, p_test)
     if cfg.use_cache and os.path.exists(p_train):
         train_emb = np.load(p_train)
     else:
@@ -396,7 +408,7 @@ def scale_embeddings(emb_train: np.ndarray, emb_test: np.ndarray) -> tuple[np.nd
     scaler = StandardScaler()
     scaler.fit(emb_train)
     emb_train_new = scaler.transform(emb_train)
-    scaler.fit(emb_test)
+    # scaler.fit(emb_test)
     emb_test_new = scaler.transform(emb_test)
 
     return emb_train_new, emb_test_new

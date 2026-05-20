@@ -252,7 +252,7 @@ def select_top_events_lgbm(df:pd.DataFrame, selected_train_patients: Sequence[st
 
     availbale_candidate_events = [c for c in candidate_events if c in pivot_candidate.columns]
     X_lgb = pivot_candidate[availbale_candidate_events].astype(np.float32)
-    print([col for col in X_lgb.columns])
+    # print([col for col in X_lgb.columns])
     y_lgb = (pivot_candidate['DEATH'] > 0).astype(int).values
 
     pos = y_lgb.sum()
@@ -335,6 +335,8 @@ def prepare_tabpfn_rows(df: pd.DataFrame, cfg: TabPFNPrepConfig, lgbm_params: di
     # separação dos anos
     train_years, test_years = infer_train_test_years(years_all=years_all, forced_start=cfg.forced_train_year_start,
                                                      forced_end=cfg.forced_test_year_start)
+    # print(f'year_tr: {train_years}, year_ts: {test_years}')
+    # input()
     all_patients = np.asarray(df['patient_id'].unique(), dtype=str)
     # separação dos pacientes
     train_patients, test_patients = split_patients(all_patients, test_size=0.1, random_state=cfg.rng_seed)
@@ -396,6 +398,12 @@ def prepare_tabpfn_rows(df: pd.DataFrame, cfg: TabPFNPrepConfig, lgbm_params: di
 
 def prepare_database(df: pd.DataFrame):
     df = canonicalize_event_df(df)
+    print(f'Rows: {df.shape[0]:,}')
+    print(f'Patients: {len(df["patient_id"].unique()):,}')
+    print(f'Years: {df["year"].min()} - {df["year"].max()}')
+    print(f'Distinct events: {df["event"].nunique():,}')
+    print(df.head())
+    
     cfg = TabPFNPrepConfig()
     lgb_params = {
         "objective": "binary",
@@ -409,7 +417,15 @@ def prepare_database(df: pd.DataFrame):
         "max_depth": -1,
     }
 
-    return prepare_tabpfn_rows(df, cfg, lgb_params)
+    out = prepare_tabpfn_rows(df, cfg, lgb_params)
+    print(f'Train rows: {out["train_rows"].shape}')
+    print(f'Test rows: {out["test_rows"].shape}')
+    print(f'top_k_events: {out["top_k_events"][:]}')
+    print(f'n_top_k_events: {len(out["top_k_events"])}')
+    print(f'Train years: {out["train_years"]}')
+    print(f'Test years: {out["test_years"]}')
+
+    return out
 
 def get_tabpfn_arrays(p: dict[str, object]):
     train_rows = p["train_rows"]
@@ -424,6 +440,8 @@ def get_tabpfn_arrays(p: dict[str, object]):
     X_train_np = train_rows[top_k_events].to_numpy(dtype=np.float32, copy=True)
     y_train_np = (train_rows['DEATH'] > 0).astype(int).to_numpy(copy=True)
     years_train_np = train_rows['year'].astype(int).to_numpy(copy=True)
+    # print(f'X_train_np: {X_train_np.shape}')
+    # print(f'y_train_np: {y_train_np.shape} | pos: {y_train_np.mean()}')
 
     X_test_np = test_rows[top_k_events].to_numpy(dtype=np.float32, copy=True)
     y_test_np = (test_rows['DEATH'] > 0).astype(int).to_numpy(copy=True)

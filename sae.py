@@ -16,7 +16,7 @@ class SAE(nn.Module):
         O objetivo do modelo é criar uma representação expandida e esparsa de embeddings de outros modelos,
         equilibrando acurácia na reconstrução dos dados originais e esparsidade da representação expandida. """
 
-    def __init__(self, data_dimension:int=192, scaling_factor:float=1.5):
+    def __init__(self, data_dimension:int=192, scaling_factor:float=1.5, use_decoder_bias: bool = False):
         super().__init__()
 
         self.data_dimension = data_dimension
@@ -24,8 +24,10 @@ class SAE(nn.Module):
 
         self.encoder = nn.Linear(data_dimension, int(scaling_factor * data_dimension), bias=True)
 
-        # self.decoder_bias = nn.Parameter(torch.zeros(int(self.data_dimension)))
-        self.decoder_bias = None
+        if use_decoder_bias:
+            self.decoder_bias = nn.Parameter(torch.zeros(int(self.data_dimension)))
+        else:
+            self.decoder_bias = None
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """ Cria uma representação expandida e esparsa do vetor original """
@@ -40,12 +42,14 @@ class SAE(nn.Module):
         z_hat = self.decode(h)
         return h, z_hat
 
-def train_sae_model(inputs: torch.Tensor, epochs:int=2000, learning_rate:float=1e-3, weight_decay:float=0.0,
-                    alpha:float=8e-4, save_data=True, data_source:str = 'training') -> SAE:
+def train_sae_model(inputs: torch.Tensor, epochs:int=1000, learning_rate:float=1e-3, weight_decay:float=0.0,
+                    alpha:float=1e-1, save_data=True, data_source:str = 'training', use_decoder_bias: bool = False) -> SAE:
     """" Treina o Sparse AutoEncoder usando a entrada e os hiperparâmetros passados.
          O parâmetro alpha é a constante que controla a penalização por dados densos. """
-    model = SAE()
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    torch.manual_seed(42)
+    model = SAE(use_decoder_bias=use_decoder_bias)
+    # device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = 'cpu'
     model.to(device)
 
     if os.path.exists(SAE_MODEL_PATH + f'/{data_source}_sae.pth'):
@@ -66,7 +70,9 @@ def train_sae_model(inputs: torch.Tensor, epochs:int=2000, learning_rate:float=1
 
         # Construção da função de perda: Erro de reconstrução e penalidade de esparsidade
         mse = F.mse_loss(reconstruction, inputs)
-        l1 = alpha * h.abs().sum(dim=-1).mean()
+        l1 = alpha * h.abs().mean()
+        # mse = (torch.linalg.vector_norm(inputs - reconstruction, ord=2)) ** 2 / inputs.numel()
+        # l1 = alpha * (torch.linalg.vector_norm(h, ord=1)) / h.numel()
         loss = mse + l1
 
         # Backprop
@@ -77,13 +83,13 @@ def train_sae_model(inputs: torch.Tensor, epochs:int=2000, learning_rate:float=1
         # Avaliação do modelo
         model.eval()
         losses.append(loss.item())
-        if epoch % 100 == 0:
+        if epoch % 50 == 0:
             with torch.no_grad():
                 # cos_sim = torch.nn.functional.cosine_similarity(reconstruction, inputs, dim=1)
                 # mean_cos_sim = torch.mean(cos_sim)
                 # mean_perc_loss = (1 - mean_cos_sim.item()) * 100
                 sparsity = float((h <= 1e-5).float().mean().detach().cpu().item())
-                print(f"Epoch {epoch}: loss={loss.item()}, sparsity={sparsity*100:.2f}%")
+                print(f"Epoch {epoch}: mse_loss={mse.item():.6f}, l1_loss={l1.item():.6f}, sparsity={sparsity*100:.2f}%")
 
     if save_data:
         save_model_stats(inputs, model.encode(inputs), model.decode(model.encode(inputs)), {'epochs': epochs, 'learning_rate': learning_rate,
