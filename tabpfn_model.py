@@ -141,19 +141,10 @@ def walkforward_evaluate_tabpfn(drift_model: TabPFNClassifier, test_rows: pd.Dat
                                 example_add_shape: Optional[Tuple[int, ...]] = None
                                 ) -> dict[str, Any]:
     test_rows = ensure_test_feature_columns(test_rows, top_k_events)
-    inputs = {}
-    inputs['drift_model'] = drift_model
-    inputs['test_rows'] = test_rows
-    inputs['top_k_events'] = top_k_events
-    inputs['train_years'] = train_years
-    inputs['model_add_x_device'] = model_add_x_device
-    inputs['batch_size_predict'] = batch_size_predict
-    inputs['example_add_shape'] = example_add_shape
-    with open('inputs_mycode.pkl', 'wb') as p:
-        dump(inputs, p)
 
     combined_years = sorted(set(train_years).union(set(test_rows['year'].astype(int).unique().tolist())))
     year_to_domain_combined = {y: i for i, y in enumerate(combined_years)}
+    
     results_per_year: list[dict[str, Any]] = []
     preds_per_year = []
     t_infer_total = 0.0

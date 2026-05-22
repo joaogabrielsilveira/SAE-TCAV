@@ -9,7 +9,7 @@ from sae import train_sae_model
 from tabpfn_model import fit_dr_tabpfn, walkforward_evaluate_tabpfn, TabPFNEvalConfig, load_or_extract_embeddings, \
     EmbeddingExtractConfig, scale_embeddings, scale_embeddings_l2, temporal_test_subsplits, TRAINING_EMBEDDING_FILE, TEST_EMBEDDING_FILE, PRED_PROB_FILE
 from decision_tree import train_binary_trees, get_binary_targets, extrair_regras_resumidas
-from tcav import get_cavs, get_tcav_scores
+# from tcav import get_cavs, get_tcav_scores
 from filepaths import get_env_path
 from pickle import dump, load
 import os
@@ -166,69 +166,82 @@ if __name__ == '__main__':
     years_test_tcav_eval = years_test_np[idx_test_tcav_eval]
     years_test_held_out = years_test_np[idx_test_held_out]
 
-    embeddings_discovery = test_emb_scaled[idx_test_discover]
+    emb_tcav_eval = test_emb_scaled[idx_test_tcav_eval]
+    emb_discovery = test_emb_scaled[idx_test_discover]
 
-    # model_train = train_sae_model(torch.tensor(train_emb_scaled), data_source='training')
-    model_disc = train_sae_model(torch.tensor(embeddings_discovery), data_source='discovery', use_decoder_bias=False)
-    print(f'Nulos no meu modelo: {(model_disc.encode(torch.tensor(embeddings_discovery)) <= 1e-5).all(dim=0).sum().item()}')
-    exit()
+    sae = train_sae_model(torch.tensor(emb_discovery), data_source='discovery', save_data=False, use_decoder_bias=False)
+    sae.eval()
+    sae_codes_train = sae.encode(torch.tensor(emb_discovery)).cpu().detach().numpy()
+    sae_codes_test = sae.encode(torch.tensor(test_emb_scaled[idx_test_cav_train])).cpu().detach().numpy()
+
+    sparsity_level = (sae_codes_train <= 1e-5).mean()
+    active_per_sample = (sae_codes_train > 1e-5).sum(axis=1).mean()
+
+    print(f'SAE codes (discovery): {sae_codes_train.shape}')
+    print(f"SAE near-zero activations: {sparsity_level:.2%}")
+    print(f"SAE active neurons/sample: {active_per_sample:.2f} / {sae_codes_train.shape[1]}")
+    print(f"SAE mean abs activation: {np.abs(sae_codes_train).mean():.4f}")
+    print(f"SAE max activation: {sae_codes_train.max():.4f}")
+    print(f'SAE dead neurons: {np.all(sae_codes_train <= 1e-5, axis=0).sum().item()}')
+
     rng = np.random.default_rng(42)
-    model_device = next(model_train.parameters()).device
+    model_device = next(sae.parameters()).device
     n_cav = len(idx_test_cav_train)
     idx_local = np.arange(n_cav)
     idx_tree_train = rng.choice(idx_local, size=int(n_cav * 0.5), replace=False)
     idx_cav_final_train = np.setdiff1d(idx_local, idx_tree_train)
 
-    # embeddings usados para treinar a árvore de decisão são encodados pelo modelo
-    embeddings_dt =  model_train.encode(torch.tensor(train_emb_scaled, dtype=torch.float32).to(model_device)).cpu().detach().numpy()
-    #thresh = get_binary_targets(embeddings_dt)
-
-    # entradas relativas aos embeddings usados pra treinar a árvore
-    # X_cav_train_df = test_rows_checked.iloc[idx_test_cav_train][feature_cols].reset_index(drop=True)
-    # X_feat_tree_train = X_cav_train_df.iloc[idx_tree_train].copy().to_numpy()
-    X_feat_tree_train = X_train_df[feature_cols].reset_index(drop=True).copy().to_numpy()
     
-    trees = train_binary_trees(embeddings_dt, X_feat_tree_train, feature_cols)
-    for tree in trees:
-        metrics = tree['metrics']
-        # print(f'Tree {tree["idx"]}: {tree["model"]}')
-        # print(f'Fator {tree["idx"]}: f1={metrics["f1"]:.2f}, precision={metrics["acc"]:.2f}, recall={metrics["rec"]:.2f}')
+    embeddings_dt = sae_codes_test[idx_tree_train]
+    X_cav_train_df = test_rows_checked.iloc[idx_test_cav_train][feature_cols].reset_index(drop=True)
+    X_feat_tree_train = X_cav_train_df.iloc[idx_tree_train].copy().to_numpy()
+
+    print("X_feat_dt_train:", X_feat_tree_train.shape)
+    print("codes_dt_train:", embeddings_dt.shape)
+
+    with open('X_dt.pkl', 'rb') as f:
+        X_dt_nb = load(f)
+    with open('codes_dt.pkl', 'rb') as f:
+        codes_dt = load(f)
+
+    print(f'Codes diferentes? {np.count_nonzero(np.count_nonzero(codes_dt != embeddings_dt, axis=0))}')
+    print(f'X diferentes? {np.count_nonzero(X_feat_tree_train != X_dt_nb)}')
     
-    y_pred_all = []
-    for year in np.unique(years_test_np):
-        with open(f'{PRED_PROB_FILE}{year}.pkl', 'rb') as f:
-            y_pred_year = load(f)['y_pred_bin']
-        y_pred_all.append(y_pred_year)
-    y_pred_all = np.concatenate(y_pred_all, axis=0)
+    tree_rules = train_binary_trees(embeddings_dt, X_feat_tree_train, feature_cols)
+    best_p = max(tree_rules.keys(), key=lambda p: len(tree_rules[p]))
+    rules_df = pd.DataFrame(tree_rules[best_p])
 
-    embeddings_cav = train_emb
-    cavs = get_cavs(trees, embeddings_cav)
+    embeddings_cav = test_emb_scaled[idx_test_cav_train]
+    embeddings_cav_training = test_emb[idx_cav_final_train]
+    y_cav_training = y_test_cav_train[idx_cav_final_train]
 
-    X_test_tcav_score = X_test_np[idx_test_tcav_eval]
-    dist = np.asarray([year_to_domain_combined[int(y)] for y in years_test_np[idx_test_tcav_eval]], dtype=np.int64)
-    tcav_scores = get_tcav_scores(cavs=cavs, model=drift_model, x=X_test_tcav_score, dist_vec=dist)
-    significant_factors = []
-    for idx, score in tcav_scores:
-        if 0.4 <= score <= 0.6:
-            # regra fraca
-            pass
-        else:
-            significant_factors.append((idx, score))
+    # cavs = get_cavs(trees, embeddings_cav)
 
-    full_events_dict = cid | events_dict
-    for idx, score in significant_factors:
-        print(f'Fator {idx}: TCAV score = {score:.2f} ({"PREVENÇÃO" if score < 0.4 else "RISCO"})')
-        for tree in trees:
-            if tree['idx'] == idx:
-                rule = sktree.export_text(tree['model'], feature_names=feature_cols)
-                true_text = 'PREVENÇÃO' if score < 0.4 else 'RISCO'
-                false_text = 'RISCO' if score < 0.4 else 'PREVENÇÃO'
-                rules = extrair_regras_resumidas(tree['model'], feature_cols, scaler, dicionario=full_events_dict)
-                metrics = tree['metrics']
-                print(f'Árvore do fator {tree["idx"]}: Precisão={metrics["acc"]:.2f}, Recall={metrics["rec"]:.2f}, F1={metrics["f1"]:.2f}')
-                for i, rule in enumerate(rules):                
-                    print(f'Regra {i}: {rule}')
+    # X_test_tcav_score = X_test_np[idx_test_tcav_eval]
+    # dist = np.asarray([year_to_domain_combined[int(y)] for y in years_test_np[idx_test_tcav_eval]], dtype=np.int64)
+    # tcav_scores = get_tcav_scores(cavs=cavs, model=drift_model, x=X_test_tcav_score, dist_vec=dist)
+    # significant_factors = []
+    # for idx, score in tcav_scores:
+    #     if 0.4 <= score <= 0.6:
+    #         # regra fraca
+    #         pass
+    #     else:
+    #         significant_factors.append((idx, score))
 
-                input()
+    # full_events_dict = cid | events_dict
+    # for idx, score in significant_factors:
+    #     print(f'Fator {idx}: TCAV score = {score:.2f} ({"PREVENÇÃO" if score < 0.4 else "RISCO"})')
+    #     for tree in trees:
+    #         if tree['idx'] == idx:
+    #             rule = sktree.export_text(tree['model'], feature_names=feature_cols)
+    #             true_text = 'PREVENÇÃO' if score < 0.4 else 'RISCO'
+    #             false_text = 'RISCO' if score < 0.4 else 'PREVENÇÃO'
+    #             rules = extrair_regras_resumidas(tree['model'], feature_cols, scaler, dicionario=full_events_dict)
+    #             metrics = tree['metrics']
+    #             print(f'Árvore do fator {tree["idx"]}: Precisão={metrics["acc"]:.2f}, Recall={metrics["rec"]:.2f}, F1={metrics["f1"]:.2f}')
+    #             for i, rule in enumerate(rules):                
+    #                 print(f'Regra {i}: {rule}')
+
+    #             input()
     
-    print(f'Total de fatores significativos encontrados: {len(significant_factors)}')
+    # print(f'Total de fatores significativos encontrados: {len(significant_factors)}')

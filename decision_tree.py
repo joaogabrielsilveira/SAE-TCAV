@@ -13,6 +13,7 @@ from imblearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from results import translate_event_name
 import re
+import pandas as pd
 
 MIN_POSITIVE_SAMPLES = 50
 TREE_MODEL_PATH = get_env_path('models/trees/params')
@@ -167,23 +168,7 @@ def extrair_regras_resumidas(modelo_arvore, nomes_das_features, scaler=None, dic
     percorrer_arvore(0, {})
     return regras_positivas
 
-def select_best_tree(cv_results):
-    prec = cv_results['mean_test_precision']
-    rec = cv_results['mean_test_recall']
-
-    valid_indices = np.where((prec > 0.75) & (rec > 0.20))[0]
-    if len(valid_indices) > 0:
-        best = valid_indices[np.argmax(prec[valid_indices])]
-        return best
-    else:
-        valid_indices = np.where(rec >= 0.1)[0]
-        if len(valid_indices) > 0:
-            best = valid_indices[np.argmax(prec[valid_indices])]
-            return best
-    
-    return np.argmax(prec)
-
-def get_binary_targets(train_activations: np.ndarray) -> list[tuple[int, float]]:
+def get_binary_targets(train_activations: np.ndarray, perc=50) -> list[tuple[int, float]]:
     bin_targets = []
 
     for col in range(train_activations.shape[1]):
@@ -192,75 +177,136 @@ def get_binary_targets(train_activations: np.ndarray) -> list[tuple[int, float]]
 
         # threshold: ativação maior que 50% das positivas (mediana)
         cur_concept_positive = cur_concept[cur_concept > 0]
-        if cur_concept_positive.shape[0] >= MIN_POSITIVE_SAMPLES:
-            threshold = np.median(cur_concept_positive)
+        if cur_concept_positive.shape[0] > 0:
+            threshold = np.percentile(cur_concept_positive, perc)
             bin_targets.append((col, threshold))
             #print(f'Fator {col}: target={threshold}')
 
     return bin_targets
 
+def mask_from_rule(rule: str, X: np.ndarray, feature_names: list[str]) -> np.ndarray:
+    rule_parts = rule.split(' AND ')
+
+    mask = np.ones(X.shape[0], dtype=bool)
+
+    for condition in rule_parts:
+        condition = condition.strip()
+        if not condition:
+            continue
+    
+        if '<=' in condition:
+            feature, threshold = condition.split(' <= ')
+            threshold = float(threshold)
+            if feature not in feature_names:
+                continue
+            feature_idx = feature_names.index(feature)
+            mask = mask & (X[:, feature_idx] <= threshold)
+        
+        elif '>' in condition:
+            feature, threshold = condition.split(' > ')
+            threshold = float(threshold)
+            if feature not in feature_names:
+                continue
+            feature_idx = feature_names.index(feature)
+            mask = mask & (X[:, feature_idx] > threshold)
+    
+    return mask
+
 def train_binary_trees(train_activations: np.ndarray, X: np.ndarray,
-                       feature_names: list[str], max_depth:int=5)\
+                       feature_names: list[str], max_depth:int=15)\
         -> list[dict[str, Any]]:
     warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
-    bin_targets = get_binary_targets(train_activations)
-    valid_trees = []
-    rus = RandomUnderSampler(sampling_strategy=1, random_state=42)
-    param_grid = {
-        'tree__class_weight': ['balanced', {0: 1, 1: 2}, {0: 1, 1: 5}, {0: 1, 1: 10}],
-        'tree__criterion': ['gini', 'entropy', 'log_loss'],
-        #'tree__max_depth': [5, 7, 10, None],
-        'tree__max_depth': [max_depth],
-        'tree__splitter': ['best'],
-        'tree__min_samples_leaf': [10, 25, 50],
-        'tree__max_leaf_nodes': [8, 16, 32, None]
-    }
-    for (idx, target) in bin_targets:
-        cur_train_activations = train_activations[:, idx]
 
-        train_target_mask = cur_train_activations > target # y 
+    percentiles = [90, 80, 70, 60, 50]
+    valid_rules = {p: [] for p in percentiles}
 
-        if np.count_nonzero(train_target_mask) <= MIN_POSITIVE_SAMPLES:
-            #print(f'Fator {idx}: conjunto vazio encontrado, pulando')
-            continue
+    for perc in percentiles:
+        bin_targets = get_binary_targets(train_activations, perc)
+        for (idx, target) in bin_targets:
+            cur_train_activations = train_activations[:, idx]
+            n_positives = (cur_train_activations > 0).sum()
 
-        pipeline = Pipeline([('undersampler', rus), ("tree", DecisionTreeClassifier())])
+            train_target_mask = (cur_train_activations >= target) # y
+            n_high = train_target_mask.sum()
+            # print(f"Extracting rules for factor {idx} with {n_positives} non-zero activations...")
 
-        if os.path.exists(f'{TREE_MODEL_PATH}/{idx}.pkl'):
-            with open(f'{TREE_MODEL_PATH}/{idx}.pkl', 'rb') as f:
-                pipeline = load(f)
-        else:
-            pipeline.fit(X, train_target_mask)
-            sel = GridSearchCV(pipeline, param_grid, scoring={'precision': make_scorer(precision_score, zero_division=0),
-                                                         'recall': make_scorer(recall_score, zero_division=0)},
-                                                           n_jobs=-1, refit=select_best_tree)
-            sel.fit(X, train_target_mask)
-            pipeline = sel.best_estimator_
-            with open(f'{TREE_MODEL_PATH}/{idx}.pkl', 'wb') as f:
-                dump(pipeline, f, protocol=5)
+            if n_high < MIN_POSITIVE_SAMPLES:
+                train_target_mask = (cur_train_activations > 0)
+                n_high = train_target_mask.sum()
+                if train_target_mask.sum() < MIN_POSITIVE_SAMPLES:
+                    continue
 
-        y_pred = pipeline.predict(X)
-        acc = precision_score(train_target_mask, y_pred)
-        rec = recall_score(train_target_mask, y_pred)
-        f1 = f1_score(train_target_mask, y_pred)
+            clf = DecisionTreeClassifier(
+                max_depth=max_depth,
+                min_samples_leaf=0.01,
+                random_state=42
+            )
 
-        metrics = {
-            'acc': acc,
-            'rec': rec,
-            'f1': f1
-        }
+            clf.fit(X, train_target_mask)
 
-        # print(f'Arvore do fator {idx}: f1={f1}, precision={acc}, recall={rec}')
-        if f1 >= 0.5:
-            # print(f'Arvore {idx} aprovada')
-            valid_trees.append({'model': pipeline.steps[1][1], 'idx': idx, 'y_mask': train_target_mask, 'metrics': metrics})
-            export_graphviz(pipeline['tree'], out_file=f'{TREE_GRAPH_PATH}/{idx}.dot', feature_names=feature_names)
-            # text_rules = export_text(
-            #     clf,
-            #     feature_names=feature_names,
-            #     show_weights=True
-            # )
-            # print(text_rules)
+            text_rules = export_text(
+                clf,
+                feature_names=feature_names,
+                max_depth=clf.get_depth()
+            )
 
-    print(f'Arvores boas encontradas: {len(valid_trees)}')
-    return valid_trees
+            path = []
+            tree_rules = []
+
+            for line in text_rules.split('\n'):
+                depth = line.count('|   ')
+                
+                # "class:" indica um nó folha (o final de uma regra)
+                if 'class' in line:
+                    cls = line.split('class:')[1].strip()
+                    tree_rules.append({'Path': ' AND '.join(path), 'Class': cls})
+                
+                # nós com filhos indicam a continuação de uma regra
+                else:
+                    cond = line.split('|--- ')[-1].strip()
+                    # "volta" o conjunto de regras para a altura do nó atual
+                    path = path[:depth]
+                    path.append(cond)
+
+            tree_rules_df = pd.DataFrame(tree_rules)
+            if os.path.exists(f'factor_[{idx}]_perc[{perc}].pkl'):
+                with open(f'factor_[{idx}]_perc[{perc}].pkl', 'rb') as f:
+                    nb_rules_df = load(f)
+            
+                    print(f'Nb rules: {nb_rules_df}')
+                    print(f'Code rules: {tree_rules_df}')
+                    input('Pressione Enter para continuar...')
+
+            best_rule = None
+            best_recall = None
+            best_prec = None
+
+            for _, row in tree_rules_df.iterrows():
+                rule = row['Path']
+                true_mask = mask_from_rule(rule, X, feature_names)
+
+                if true_mask.sum() == 0:
+                    continue
+                    
+                n_true_positive = (true_mask & train_target_mask).sum()
+                recall = n_true_positive / max(n_high, 1)
+                precision = float(train_target_mask[true_mask].mean())
+
+                if precision < 0.9 or recall < 0.25:
+                    continue
+                
+                if best_recall is None or recall > best_recall:
+                    best_rule = row
+                    best_prec = precision
+                    best_recall = recall
+
+            if best_rule is not None:
+                valid_rules[perc].append({
+                    "Factor": idx,
+                    "Rule": best_rule['Path'],
+                    "Class": best_rule['Class'],
+                    "Precision": best_prec,
+                    "Recall": best_recall,
+                })
+        print(f'Regras válidas encontradas com percentil {perc}: {len(valid_rules[perc])}')
+    return valid_rules
