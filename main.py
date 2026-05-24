@@ -9,7 +9,7 @@ from sae import train_sae_model
 from tabpfn_model import fit_dr_tabpfn, walkforward_evaluate_tabpfn, TabPFNEvalConfig, load_or_extract_embeddings, \
     EmbeddingExtractConfig, scale_embeddings, scale_embeddings_l2, temporal_test_subsplits, TRAINING_EMBEDDING_FILE, TEST_EMBEDDING_FILE, PRED_PROB_FILE
 from decision_tree import train_binary_trees, get_binary_targets, extrair_regras_resumidas
-# from tcav import get_cavs, get_tcav_scores
+from tcav import train_cavs_from_rules, get_model_gradients, get_tcav_scores, robust_tcav_significance_test
 from filepaths import get_env_path
 from pickle import dump, load
 import os
@@ -17,7 +17,7 @@ import pandas as pd
 from tabpfn import TabPFNClassifier
 from sklearn import tree as sktree
 from decision_tree import extrair_regras_positivas
-from results import cid10_dict, translate_event_name, events_dict
+from results import cid10_dict, translate_event_name, events_dict, tcav_result_df_from_concepts
 # from TCAV.renal_framework.src.tabpfn_pipeline.evaluation import walkforward_evaluate_tabpfn
 
 PREPARED_DB_PATH = get_env_path('data/renal/prep.pkl')
@@ -195,53 +195,69 @@ if __name__ == '__main__':
     embeddings_dt = sae_codes_test[idx_tree_train]
     X_cav_train_df = test_rows_checked.iloc[idx_test_cav_train][feature_cols].reset_index(drop=True)
     X_feat_tree_train = X_cav_train_df.iloc[idx_tree_train].copy().to_numpy()
+    X_cav_final_df = X_cav_train_df.iloc[idx_cav_final_train].reset_index(drop=True)
 
-    print("X_feat_dt_train:", X_feat_tree_train.shape)
-    print("codes_dt_train:", embeddings_dt.shape)
-
-    with open('X_dt.pkl', 'rb') as f:
-        X_dt_nb = load(f)
-    with open('codes_dt.pkl', 'rb') as f:
-        codes_dt = load(f)
-
-    print(f'Codes diferentes? {np.count_nonzero(np.count_nonzero(codes_dt != embeddings_dt, axis=0))}')
-    print(f'X diferentes? {np.count_nonzero(X_feat_tree_train != X_dt_nb)}')
+    # print("X_feat_dt_train:", X_feat_tree_train.shape)
+    # print("codes_dt_train:", embeddings_dt.shape)
     
     tree_rules = train_binary_trees(embeddings_dt, X_feat_tree_train, feature_cols)
     best_p = max(tree_rules.keys(), key=lambda p: len(tree_rules[p]))
     rules_df = pd.DataFrame(tree_rules[best_p])
 
     embeddings_cav = test_emb_scaled[idx_test_cav_train]
-    embeddings_cav_training = test_emb[idx_cav_final_train]
+    embeddings_cav_training = embeddings_cav[idx_cav_final_train]
+    embeddings_cav_training_encoded = sae_codes_test[idx_cav_final_train]
     y_cav_training = y_test_cav_train[idx_cav_final_train]
 
-    # cavs = get_cavs(trees, embeddings_cav)
+    high_quantile = 1.0 - (best_p / 100.0)
 
-    # X_test_tcav_score = X_test_np[idx_test_tcav_eval]
-    # dist = np.asarray([year_to_domain_combined[int(y)] for y in years_test_np[idx_test_tcav_eval]], dtype=np.int64)
-    # tcav_scores = get_tcav_scores(cavs=cavs, model=drift_model, x=X_test_tcav_score, dist_vec=dist)
-    # significant_factors = []
-    # for idx, score in tcav_scores:
-    #     if 0.4 <= score <= 0.6:
-    #         # regra fraca
-    #         pass
-    #     else:
-    #         significant_factors.append((idx, score))
-
-    # full_events_dict = cid | events_dict
-    # for idx, score in significant_factors:
-    #     print(f'Fator {idx}: TCAV score = {score:.2f} ({"PREVENÇÃO" if score < 0.4 else "RISCO"})')
-    #     for tree in trees:
-    #         if tree['idx'] == idx:
-    #             rule = sktree.export_text(tree['model'], feature_names=feature_cols)
-    #             true_text = 'PREVENÇÃO' if score < 0.4 else 'RISCO'
-    #             false_text = 'RISCO' if score < 0.4 else 'PREVENÇÃO'
-    #             rules = extrair_regras_resumidas(tree['model'], feature_cols, scaler, dicionario=full_events_dict)
-    #             metrics = tree['metrics']
-    #             print(f'Árvore do fator {tree["idx"]}: Precisão={metrics["acc"]:.2f}, Recall={metrics["rec"]:.2f}, F1={metrics["f1"]:.2f}')
-    #             for i, rule in enumerate(rules):                
-    #                 print(f'Regra {i}: {rule}')
-
-    #             input()
+    X_eval = X_test_np[idx_test_tcav_eval]
+    dist_eval = np.array([year_to_domain_combined[y] for y in years_test_tcav_eval], dtype=np.int64)
+    grads = get_model_gradients(model=drift_model, X=X_eval, dist_vec=dist_eval)
+    cavs = train_cavs_from_rules(rules_per_percentile=tree_rules[best_p], X_cav_train_df=X_cav_final_df, cav_train_emb=embeddings_cav_training,
+                                 cav_train_emb_encoded=embeddings_cav_training_encoded, y_cav_train=y_cav_training,
+                                 feature_cols=feature_cols, emb_scaler=scaler, high_quantile=high_quantile, min_pos_samples=50, random_state=42)
+    tcav_scores = get_tcav_scores(cavs=cavs.values(), grads=grads)
+    for cav in cavs.values():
+        idx = cav['Factor']
+        cav['TCAV_score'] = tcav_scores[idx]
     
-    # print(f'Total de fatores significativos encontrados: {len(significant_factors)}')
+    for rule in tree_rules[best_p]:
+        idx = rule['Factor']
+        if idx in cavs:
+            prec, rec = rule['Precision'], rule['Recall']
+            cavs[idx]['Precision'] = prec
+            cavs[idx]['Recall'] = rec
+    
+    robust_tcav_results = {}
+    for idx, info in cavs.items():
+        robust_result = robust_tcav_significance_test(
+            concept_idx=idx, embs=embeddings_cav_training,
+            idx_pos=info['positive_idx'],
+            idx_neg=info['negative_idx'],
+            model_grads=grads, scaler_emb=scaler,
+            sample_fraction=1.0, rng_seed=42
+        )
+        robust_tcav_results[idx] = robust_result
+        if robust_result['is_significant']:
+            # print(f'Factor {idx}: p={robust_result["p_value"]}, t={robust_result["t_stat"]}')
+            pass
+    
+    significant_concepts = {}
+    for idx in cavs:
+        if robust_tcav_results[idx]['is_significant']:
+            significant_concepts[idx] = cavs[idx]
+            significant_concepts[idx]['p_value'] = robust_tcav_results[idx]['p_value']
+            significant_concepts[idx]['t_stat'] = robust_tcav_results[idx]['t_stat']
+            significant_concepts[idx]['Precision'] = cavs[idx]['Precision']
+            significant_concepts[idx]['Recall'] = cavs[idx]['Recall']
+
+    for idx, info in significant_concepts.items():
+        # print(f'Factor {idx} (TCAV = {info["TCAV_score"]}): {info["Rule"]}')
+        # print(f'p={robust_tcav_results[idx]["p_value"]}, t={robust_tcav_results[idx]["t_stat"]}')
+        continue
+    
+    print(f'Total de fatores significativos encontrados: {len(significant_concepts)}')
+    tcav_df = tcav_result_df_from_concepts(significant_concepts)
+
+    print(tcav_df)

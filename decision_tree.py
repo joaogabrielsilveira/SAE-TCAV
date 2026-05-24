@@ -269,13 +269,6 @@ def train_binary_trees(train_activations: np.ndarray, X: np.ndarray,
                     path.append(cond)
 
             tree_rules_df = pd.DataFrame(tree_rules)
-            if os.path.exists(f'factor_[{idx}]_perc[{perc}].pkl'):
-                with open(f'factor_[{idx}]_perc[{perc}].pkl', 'rb') as f:
-                    nb_rules_df = load(f)
-            
-                    print(f'Nb rules: {nb_rules_df}')
-                    print(f'Code rules: {tree_rules_df}')
-                    input('Pressione Enter para continuar...')
 
             best_rule = None
             best_recall = None

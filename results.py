@@ -4,6 +4,8 @@ import numpy as np
 import torch.nn.functional as F
 from filepaths import get_env_path
 import csv
+from typing import Any
+import pandas as pd
 
 MODEL_RESULTS_PATH = get_env_path('stats/SAE.txt')
 MODEL_RESULTS_CSV_PATH = get_env_path('stats/SAE.csv')
@@ -142,3 +144,11 @@ def translate_event_name(event: str, cid_dict: dict[str, str]):
     
     else:
         return 'EVENTO INVÁLIDO'
+
+def tcav_result_df_from_concepts(cavs: dict[str, Any]) -> pd.DataFrame:
+    cols_to_keep = ['Factor', 'Rule', 'TCAV_score', 'p_value', 't_stat']
+    df_dict = {
+        key: {k: v for k, v in obj.items() if k in cols_to_keep} for key, obj in cavs.items()
+    }
+    
+    return pd.DataFrame(df_dict).transpose().reset_index(drop=True)
