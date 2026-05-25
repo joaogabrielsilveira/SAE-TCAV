@@ -258,6 +258,10 @@ if __name__ == '__main__':
         continue
     
     print(f'Total de fatores significativos encontrados: {len(significant_concepts)}')
-    tcav_df = tcav_result_df_from_concepts(significant_concepts)
-
-    print(tcav_df)
+    for idx, info in significant_concepts.items():
+        print(f'Factor {info["Factor"]}: Precision={info["Precision"]:.4f}, Recall={info["Recall"]:.4f}')
+        print(f'TCAV_score={info["TCAV_score"]:.2f} ({"PREVENÇÃO" if info["TCAV_score"] < 0.4 else "RISCO"}), p_value={info["p_value"]:.4f}, t_stat={info["t_stat"]:.4f}')
+        print(f'Rule: {info["Rule"]}')
+        print()
+    # tcav_df = tcav_result_df_from_concepts(significant_concepts)
+    # print(tcav_df)
