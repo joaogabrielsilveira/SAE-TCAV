@@ -368,6 +368,7 @@ def robust_tcav_significance_test(concept_idx: int, embs: np.ndarray, idx_pos: n
                     +(len(random_scores) - 1) * std_dev_random ** 2
                     ) / (len(concept_tcav_scores) + len(random_scores) - 2)
                 )
+    d = (np.mean(concept_tcav_scores) - np.mean(random_scores)) / (pooled_std_dev + 1e-10)
     
 
     return {
@@ -378,8 +379,92 @@ def robust_tcav_significance_test(concept_idx: int, embs: np.ndarray, idx_pos: n
         'random_scores': random_scores,
         'p_value': p_value,
         't_stat': t,
-        'is_significant': (not np.isnan(p_value) or p_value < 0.05)
+        'is_significant': (not np.isnan(p_value) or p_value < 0.05),
+        'cohens_d': d
     }
     
+def compute_feature_associations(concept_activations: np.ndarray, X_features: np.ndarray, feature_names: list[str], quantile: float=0.1):
+    high_thresh = np.quantile(concept_activations, 1.0 - quantile)
+    low_thresh = np.quantile(concept_activations, quantile)
 
+    high_idx = (concept_activations >= high_thresh)
+    low_idx = (concept_activations <= low_thresh)
 
+    rows = []
+    for i, feat in enumerate(feature_names):
+        feat_high = X_features[high_idx, i]
+        feat_low = X_features[low_idx, i]
+
+        mean_high = np.nanmean(feat_high)
+        mean_low = np.nanmean(feat_low)
+
+        std_high = np.nanstd(feat_high)
+        std_low = np.nanstd(feat_low)
+
+        pooled_variance = ((std_high ** 2 + std_low ** 2) / 2)
+        pooled_std = np.sqrt(pooled_variance)
+
+        # cohen's d: mede a diferença entre as médias de dois grupos (quantificada em desvios-padrão)
+        # neste caso, ele compara as médias dos valores de uma feature entre os grupos de alta e baixa ativação do conceito analisado
+        d = (mean_high - mean_low) / pooled_std if pooled_std > 0 else 0.0
+
+        try:
+            # teste two-sided que também compara as médias de duas distribuições
+            _, pval = stats.mannwhitneyu(feat_high, feat_low)
+        except Exception:
+            pval = 1.0
+
+        rows.append(
+            {
+                'feature': feat,
+                'mean_high': mean_high,
+                'mean_low': mean_low,
+                'diff': mean_high - mean_low,
+                'std_high': std_high,
+                'std_low': std_low,
+                'cohens_d': d,
+                'p_value': pval,
+                'n_high': len(high_idx),
+                'n_low': len(low_idx)
+            }
+        )
+    
+    df = pd.DataFrame(rows)
+    df['significant'] = df['p_value'] < 0.05
+    df = df.sort_values('cohens_d', key=lambda s: np.abs(s), ascending=False).reset_index(drop=True)
+    return df, high_idx, low_idx
+
+def run_feature_association_dual_split(significant_factors: dict[int], tcav_eval_concept_activations: np.ndarray,
+                                       held_out_concept_activations: np.ndarray, X_tcav_eval: np.ndarray, X_held_out: np.ndarray,
+                                       feature_cols: list[str], quantile: float=0.1):
+    fa_results_eval = {}
+    fa_results_held_out = {}
+    consistency_rows = []
+
+    for factor in significant_factors:
+        print(f'Factor {factor}')
+        factor_activations_tcav = tcav_eval_concept_activations[:, factor]
+        df_fa_eval, _, _ = compute_feature_associations(concept_activations=factor_activations_tcav, X_features=X_tcav_eval, feature_names=feature_cols, quantile=quantile)
+        fa_results_eval[factor] = df_fa_eval
+    
+        factor_activations_held_out = held_out_concept_activations[:, factor]
+        df_fa_held_out, _, _ = compute_feature_associations(concept_activations=factor_activations_held_out, X_features=X_held_out, feature_names=feature_cols, quantile=quantile)
+        fa_results_held_out[factor] = df_fa_held_out
+
+        # top 5 conceitos com maior diferenciação de valor entre as amostras de alta ativação e as de baixa ativação
+        top_eval = set(df_fa_eval.head(5)['feature'].values.tolist())
+        top_held_out = set(df_fa_held_out.head(5)['feature'].values.tolist())
+
+        # conceitos que apareceram nos dois conjuntos
+        overlap = len(top_eval & top_held_out)
+
+        consistency_rows.append(
+            {
+                'concept': factor,
+                'top5_overlap': overlap,
+                'top5_overlap_ratio': float(overlap / 5.0)
+            }
+        )
+
+    consistency_df = pd.DataFrame(consistency_rows).sort_values('concept').reset_index(drop=True)
+    return fa_results_eval, fa_results_held_out, consistency_df

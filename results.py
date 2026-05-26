@@ -145,6 +145,18 @@ def translate_event_name(event: str, cid_dict: dict[str, str]):
     else:
         return 'EVENTO INVÁLIDO'
 
+def translate_event_names(full_text: str, cid_dict: dict[str, str]) -> list[str]:
+    words = full_text.split(' ')
+    new_words = []
+    for word in words:
+        new_words.append(word)
+        translated = translate_event_name(event=word, cid_dict=cid_dict)
+        if translated != 'EVENTO INVÁLIDO':
+            new_words.append(f'[{translated}]')
+    
+    return ' '.join(new_words)
+
+
 def tcav_result_df_from_concepts(cavs: dict[str, Any]) -> pd.DataFrame:
     cols_to_keep = ['Factor', 'Rule', 'TCAV_score', 'p_value', 't_stat']
     df_dict = {

@@ -9,7 +9,7 @@ from sae import train_sae_model
 from tabpfn_model import fit_dr_tabpfn, walkforward_evaluate_tabpfn, TabPFNEvalConfig, load_or_extract_embeddings, \
     EmbeddingExtractConfig, scale_embeddings, scale_embeddings_l2, temporal_test_subsplits, TRAINING_EMBEDDING_FILE, TEST_EMBEDDING_FILE, PRED_PROB_FILE
 from decision_tree import train_binary_trees, get_binary_targets, extrair_regras_resumidas
-from tcav import train_cavs_from_rules, get_model_gradients, get_tcav_scores, robust_tcav_significance_test
+from tcav import train_cavs_from_rules, get_model_gradients, get_tcav_scores, robust_tcav_significance_test, run_feature_association_dual_split
 from filepaths import get_env_path
 from pickle import dump, load
 import os
@@ -17,7 +17,7 @@ import pandas as pd
 from tabpfn import TabPFNClassifier
 from sklearn import tree as sktree
 from decision_tree import extrair_regras_positivas
-from results import cid10_dict, translate_event_name, events_dict, tcav_result_df_from_concepts
+from results import cid10_dict, translate_event_name, events_dict, tcav_result_df_from_concepts, translate_event_names
 # from TCAV.renal_framework.src.tabpfn_pipeline.evaluation import walkforward_evaluate_tabpfn
 
 PREPARED_DB_PATH = get_env_path('data/renal/prep.pkl')
@@ -245,7 +245,7 @@ if __name__ == '__main__':
     
     significant_concepts = {}
     for idx in cavs:
-        if robust_tcav_results[idx]['is_significant']:
+        if robust_tcav_results[idx]['is_significant'] and abs(cavs[idx]['TCAV_score'] - 0.5) > 0.1:
             significant_concepts[idx] = cavs[idx]
             significant_concepts[idx]['p_value'] = robust_tcav_results[idx]['p_value']
             significant_concepts[idx]['t_stat'] = robust_tcav_results[idx]['t_stat']
@@ -261,7 +261,37 @@ if __name__ == '__main__':
     for idx, info in significant_concepts.items():
         print(f'Factor {info["Factor"]}: Precision={info["Precision"]:.4f}, Recall={info["Recall"]:.4f}')
         print(f'TCAV_score={info["TCAV_score"]:.2f} ({"PREVENÇÃO" if info["TCAV_score"] < 0.4 else "RISCO"}), p_value={info["p_value"]:.4f}, t_stat={info["t_stat"]:.4f}')
-        print(f'Rule: {info["Rule"]}')
+        print(f'Rule: {translate_event_names(full_text=info["Rule"], cid_dict=cid)}')
         print()
     # tcav_df = tcav_result_df_from_concepts(significant_concepts)
     # print(tcav_df)
+
+    tcav_eval_t = torch.tensor(test_emb_scaled[idx_test_tcav_eval])
+    tcav_eval_concept_activations = sae.encode(tcav_eval_t).detach().cpu().numpy()
+
+    held_out_t = torch.tensor(test_emb_scaled[idx_test_held_out])
+    held_out_concept_activations = sae.encode(held_out_t).detach().cpu().numpy()
+
+    cav_train_t = torch.tensor(test_emb_scaled[idx_test_cav_train])
+    cav_train_concept_activations = sae.encode(cav_train_t).detach().cpu().numpy()
+
+    X_test_df = test_rows_checked[feature_cols].copy()
+    X_tcav_eval = X_test_df.to_numpy()[idx_test_tcav_eval]
+    X_held_out = X_test_df.to_numpy()[idx_test_held_out]
+    X_cav_train = X_test_df.to_numpy()[idx_test_cav_train]
+
+    # print("tcav_eval_concept_activations:", tcav_eval_concept_activations.shape)
+    # print("held_out_concept_activations :", held_out_concept_activations.shape)
+    # print("cav_train_concept_activations:", cav_train_concept_activations.shape)
+
+    fa_results_eval, fa_results_held_out, consistency_df = run_feature_association_dual_split(
+        significant_factors=significant_concepts,
+        tcav_eval_concept_activations=tcav_eval_concept_activations,
+        held_out_concept_activations=held_out_concept_activations,
+        X_tcav_eval=X_tcav_eval,
+        X_held_out=X_held_out,
+        feature_cols=feature_cols,
+        quantile=0.1
+    )
+
+    print(consistency_df)
