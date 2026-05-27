@@ -9,7 +9,7 @@ from sae import train_sae_model
 from tabpfn_model import fit_dr_tabpfn, walkforward_evaluate_tabpfn, TabPFNEvalConfig, load_or_extract_embeddings, \
     EmbeddingExtractConfig, scale_embeddings, scale_embeddings_l2, temporal_test_subsplits, TRAINING_EMBEDDING_FILE, TEST_EMBEDDING_FILE, PRED_PROB_FILE
 from decision_tree import train_binary_trees, get_binary_targets, extrair_regras_resumidas
-from tcav import train_cavs_from_rules, get_model_gradients, get_tcav_scores, robust_tcav_significance_test, run_feature_association_dual_split
+from tcav import train_cavs_from_rules, get_model_gradients, get_tcav_scores, robust_tcav_significance_test, run_feature_association_dual_split, run_sparse_readout_dual_split
 from filepaths import get_env_path
 from pickle import dump, load
 import os
@@ -295,3 +295,13 @@ if __name__ == '__main__':
     )
 
     print(consistency_df)
+
+    _, _, sre_df = run_sparse_readout_dual_split(
+        significant_factors=significant_concepts, cav_train_concept_activations=cav_train_concept_activations,
+        tcav_eval_concept_activations=tcav_eval_concept_activations, held_out_concept_activations=held_out_concept_activations,
+        X_cav_train=X_cav_train, X_tcav_eval=X_tcav_eval, X_held_out=X_held_out, feature_cols=feature_cols, cv=5,
+        overfit_drop_warn_threshold=0.2
+    )
+
+    pd.set_option('display.max_columns', None)
+    print(sre_df)

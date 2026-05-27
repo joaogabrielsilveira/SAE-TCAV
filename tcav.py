@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from torch import nn
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegression, Lasso, LassoCV
 from typing_extensions import Any
 from pickle import dump, load
 import os
@@ -11,47 +11,12 @@ from tabpfn_model import make_dist_tensor
 from torch.func import grad, vmap
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import cross_val_score
 from scipy import stats
 import warnings
+
 CAVS_FILE = get_env_path('models/tcav/cavs.pkl')
 GRADS_FILE = get_env_path('models/tcav/grads.pkl')
-
-# class LogisticRegression(nn.Module):
-#     def __init__(self):
-#         super().__init__()
-#         self.linear = nn.Linear(in_features=288, out_features=1)
-#         self.criterion = nn.BCELoss()
-#         self.optimizer = torch.optim.SGD(self.parameters(), lr=1e-3)
-
-#     def forward(self, x):
-#         return torch.sigmoid(self.linear(x)).squeeze()
-    
-#     def loss(self, y_pred, y_true):
-#         return self.criterion(y_pred, y_true.float())
-
-# def train_logistic_regression(model: LogisticRegression, x: np.ndarray, y: np.ndarray, epochs: int = 1000):
-#     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-#     model.to(device)
-#     x_t = torch.tensor(x, dtype=torch.float32).to(device)
-#     y_t = torch.tensor(y, dtype=torch.float32).to(device)
-
-#     for epoch in range(epochs):
-#         model.train()
-#         y_pred = model(x_t)
-#         loss = model.loss(y_pred, y_t)
-#         model.optimizer.zero_grad()
-#         loss.backward()
-#         model.optimizer.step()
-
-#         model.eval()
-#         if epoch % 100 == 0:
-#             with torch.no_grad():
-#                 y_pred = model(x_t)
-#                 pred_labels = (y_pred > 0.5).cpu().numpy()
-#                 acc = (pred_labels == y).mean()
-#                 print(f'Epoch {epoch}, Loss: {loss.item():.4f}, Accuracy: {acc:.4f}')
-
-#     return model.to('cpu')
 
 def get_model_gradients(model: TabPFNClassifier, dist_vec: np.ndarray, X: np.ndarray) -> np.ndarray:
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -409,7 +374,7 @@ def compute_feature_associations(concept_activations: np.ndarray, X_features: np
         d = (mean_high - mean_low) / pooled_std if pooled_std > 0 else 0.0
 
         try:
-            # teste two-sided que também compara as médias de duas distribuições
+            # teste two-sided que também compara as médias de duas distribuições (e dá a chance de elas serem diferente por acaso, no p_value)
             _, pval = stats.mannwhitneyu(feat_high, feat_low)
         except Exception:
             pval = 1.0
@@ -468,3 +433,121 @@ def run_feature_association_dual_split(significant_factors: dict[int], tcav_eval
 
     consistency_df = pd.DataFrame(consistency_rows).sort_values('concept').reset_index(drop=True)
     return fa_results_eval, fa_results_held_out, consistency_df
+
+def sparse_readout(concept_activations: np.ndarray, X_features: np.ndarray, feature_names: list[str], cv: int=5):
+    ### avalia com um modelo linear a importância das features de entrada para a ativação do conceito ###
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_features)
+    X_scaled = np.nan_to_num(X_scaled, nan=0.0)
+
+    # modelo linear com incentivo à esparsidade que mapeia a influência das features na ativação do conceitos
+    # usa k-fold cv para encontrar o melhor alpha (hiperparametro de esparsidade)
+    model = LassoCV(cv=cv, random_state=42, max_iter=10000)
+    model.fit(X_scaled, concept_activations)
+
+    coefs = model.coef_
+    # r² mede o erro médio das predições do modelo e dá um score (máximo 1.0)
+    r2_train = model.score(X_scaled, concept_activations)
+
+    cv_scores = cross_val_score(estimator=Lasso(alpha=model.alpha_, max_iter=10000),
+                                X=X_scaled, y=concept_activations, cv=cv, scoring='r2')
+    
+    r2_cv = float(cv_scores.mean())
+    r2_cv_std = float(np.std(cv_scores))
+    
+    idx = (np.abs(coefs) > 1e-10)
+    selected_features = [feature_names[i] for i in idx]
+    selected_coefs = coefs[idx]
+
+    sorted_idx = np.argsort(np.abs(selected_coefs))[::-1]
+    selected_features = [feature_names[i] for i in sorted_idx]
+    selected_coefs = selected_coefs[sorted_idx]
+
+    return {
+        'coefs': coefs,
+        'alpha': float(model.alpha_),
+        'r2_train': r2_train,
+        'r2_cv': r2_cv,
+        'r2_cv_std': r2_cv_std,
+        'selected_features': selected_features,
+        'selected_coefs': selected_coefs,
+        'scaler': scaler,
+        'model': model,
+    }
+
+
+def evaluate_sparse_readout(sparse_result: dict[str], X_features: np.ndarray, concept_activations: np.ndarray):
+    scaler = sparse_result['scaler']
+    model = sparse_result['model']
+
+    X_scaled = scaler.transform(X_features)
+    X_scaled = np.nan_to_num(X_scaled, nan=0.0)
+
+    r2 = float (model.score(X_scaled, concept_activations))
+    pred = model.predict(X_scaled)
+    # corrcoef cria uma matriz 2x2 de correlação entre predições e ativações reais
+    # a diagonal principal é a correlação de predições com predições (100%) e ativações com ativações (100%),
+    # já os outros membros correalcionam ativações e predições (ou vice-versa, o que é equivalente)
+    corr = float(np.corrcoef(pred, concept_activations)[0, 1]) if len(concept_activations) > 1 else np.nan
+
+    return {'r2': r2, 'correlation': corr}
+
+def run_sparse_readout_dual_split(significant_factors: dict[int], cav_train_concept_activations: np.ndarray,
+                                  tcav_eval_concept_activations: np.ndarray, held_out_concept_activations: np.ndarray,
+                                  X_cav_train: np.ndarray, X_tcav_eval: np.ndarray, X_held_out: np.ndarray,
+                                  feature_cols: list[str], cv: int, overfit_drop_warn_threshold: float):
+    sparse_readout_results = {}
+    sparse_readout_validation = {}
+    summary_rows = []
+
+    for factor in significant_factors:
+        cav_train_sparse_readout = sparse_readout(
+            concept_activations=cav_train_concept_activations[:, factor],
+            X_features=X_cav_train, feature_names=feature_cols, cv=cv
+        )
+
+        sparse_readout_results[factor] = cav_train_sparse_readout
+
+        tcav_eval_result = evaluate_sparse_readout(
+            sparse_result=cav_train_sparse_readout, X_features=X_tcav_eval,
+            concept_activations=tcav_eval_concept_activations[:, factor]
+        )
+
+        held_out_result = evaluate_sparse_readout(
+            sparse_result=cav_train_sparse_readout, X_features=X_held_out,
+            concept_activations=held_out_concept_activations[:, factor]
+        )
+
+        sparse_readout_validation[factor] = {
+            'tcav_eval': tcav_eval_result,
+            'test': held_out_result
+        }
+
+        r2_drop_tcav = cav_train_sparse_readout['r2_cv'] - tcav_eval_result['r2']
+        r2_drop_test = cav_train_sparse_readout['r2_cv'] - held_out_result['r2']
+
+        summary_rows.append(
+            {
+                'concept': factor,
+                'alpha': cav_train_sparse_readout['alpha'],
+                'r2_train': cav_train_sparse_readout['r2_train'],
+                'r2_cv': cav_train_sparse_readout['r2_cv'],
+                'r2_cv_std': cav_train_sparse_readout['r2_cv_std'],
+                'r2_tcav_eval': tcav_eval_result['r2'],
+                'corr_tcav_eval': tcav_eval_result['correlation'],
+                'r2_test': held_out_result['r2'],
+                'corr_test': held_out_result['correlation'],
+                'r2_drop_tcav_eval': r2_drop_tcav,
+                'r2_drop_test': r2_drop_test,
+                'warn_overfit': bool(r2_drop_test > overfit_drop_warn_threshold),
+                'n_selected_features': len(cav_train_sparse_readout['selected_features'])
+            }
+        )
+
+    summary_df = pd.DataFrame(summary_rows).sort_values('concept').reset_index(drop=True)
+    return sparse_readout_results, sparse_readout_validation, summary_df
+
+
+
+        
+
