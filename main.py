@@ -23,20 +23,6 @@ from results import cid10_dict, translate_event_name, events_dict, tcav_result_d
 PREPARED_DB_PATH = get_env_path('data/renal/prep.pkl')
 
 if __name__ == '__main__':
-    # my_train_emb = np.load(TRAINING_EMBEDDING_FILE).squeeze().astype(np.float32)
-    # my_test_emb = np.load(TEST_EMBEDDING_FILE).squeeze().astype(np.float32)
-
-    # nb_train_emb = np.load('TCAV/renal_framework/results/demo_tabpfn/embeddings/train_emb_flat.npy').astype(np.float32)
-    # nb_test_emb = np.load('TCAV/renal_framework/results/demo_tabpfn/embeddings/test_emb_flat.npy').astype(np.float32)
-
-    # print(f'My train emb shape: {my_train_emb.shape}, mean: {my_train_emb.mean()}, var: {my_train_emb.var()}')
-    # print(f'My test emb shape: {my_test_emb.shape}, mean: {my_test_emb.mean()}, var: {my_test_emb.var()}')
-    # print(f'NB train emb shape: {nb_train_emb.shape}, mean: {nb_train_emb.mean()}, var: {nb_train_emb.var()}')
-    # print(f'NB test emb shape: {nb_test_emb.shape}, mean: {nb_test_emb.mean()}, var: {nb_test_emb.var()}')
-
-    # print(np.count_nonzero(my_train_emb != nb_train_emb))
-    # print(np.count_nonzero(my_test_emb != nb_test_emb))
-
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     df = open_feather(RENAL_DB_PATH)
     if not os.path.exists(PREPARED_DB_PATH):
@@ -169,8 +155,19 @@ if __name__ == '__main__':
     emb_tcav_eval = test_emb_scaled[idx_test_tcav_eval]
     emb_discovery = test_emb_scaled[idx_test_discover]
 
-    sae = train_sae_model(torch.tensor(emb_discovery), data_source='discovery', save_data=False, use_decoder_bias=False)
-    sae.eval()
+    from sae_compare import run_sae_random_comparison, plot_run_results
+    import matplotlib.pyplot as plt
+    inputs = train_emb_scaled
+    model_n = range(3, 15)
+    alphas = [1e-1, 3e-1, 5e-1, 1]
+    scaling_factors = [1.5]
+    res = run_sae_random_comparison(model_nums=model_n, alphas=alphas, embs=inputs, scaling_factors=scaling_factors, model_type='ReLU')
+
+    for alpha in alphas:
+        for s in scaling_factors:
+            plot_run_results(full_results=res, alpha=alpha, scaling_factor=s, model_n=model_n)
+
+    exit()
     sae_codes_train = sae.encode(torch.tensor(emb_discovery)).cpu().detach().numpy()
     sae_codes_test = sae.encode(torch.tensor(test_emb_scaled[idx_test_cav_train])).cpu().detach().numpy()
 
@@ -191,7 +188,6 @@ if __name__ == '__main__':
     idx_tree_train = rng.choice(idx_local, size=int(n_cav * 0.5), replace=False)
     idx_cav_final_train = np.setdiff1d(idx_local, idx_tree_train)
 
-    
     embeddings_dt = sae_codes_test[idx_tree_train]
     X_cav_train_df = test_rows_checked.iloc[idx_test_cav_train][feature_cols].reset_index(drop=True)
     X_feat_tree_train = X_cav_train_df.iloc[idx_tree_train].copy().to_numpy()
