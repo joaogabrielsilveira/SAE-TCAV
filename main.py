@@ -157,15 +157,14 @@ if __name__ == '__main__':
 
     from sae_compare import run_sae_random_comparison, plot_run_results
     import matplotlib.pyplot as plt
-    inputs = train_emb_scaled
+    inputs = emb_discovery
     model_n = range(3, 15)
-    alphas = [1e-1, 3e-1, 5e-1, 1]
+    alphas = [3e-1]
     scaling_factors = [1.5]
-    res = run_sae_random_comparison(model_nums=model_n, alphas=alphas, embs=inputs, scaling_factors=scaling_factors, model_type='ReLU')
+    res, model_res = run_sae_random_comparison(model_nums=model_n, alphas=alphas, embs=inputs, scaling_factors=scaling_factors, model_type='ReLU')
 
     for alpha in alphas:
-        for s in scaling_factors:
-            plot_run_results(full_results=res, alpha=alpha, scaling_factor=s, model_n=model_n)
+        plot_run_results(full_results=res, model_results=model_res, alpha=alpha, scaling_factors=scaling_factors, model_n=model_n)
 
     exit()
     sae_codes_train = sae.encode(torch.tensor(emb_discovery)).cpu().detach().numpy()

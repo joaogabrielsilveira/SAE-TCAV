@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.optimize import linear_sum_assignment
+from matplotlib.ticker import PercentFormatter
 
 def activation_threshold(concept: np.ndarray, perc: int=90):
     pos_act = concept[concept > 0]
@@ -89,6 +90,8 @@ def train_all_saes(num_models: int, embs: np.ndarray, alpha: float=1e-1, scaling
             
         sparsity = (codes <= 1e-5).mean()
         dead_neurons = np.all(codes <= 1e-5, axis=0).sum().item()
+        reconstruction = sae.decode(torch.tensor(codes))
+        mse = torch.nn.functional.mse_loss(reconstruction, torch.tensor(embs))
 
         # matriz binária. cada (i, j) representa se o conceito j teve ativação
         # alta (acima do percentil perc de ativações positivas) na amostra i
@@ -97,6 +100,7 @@ def train_all_saes(num_models: int, embs: np.ndarray, alpha: float=1e-1, scaling
         sae_list.append({
             'idx': i,
             'model': sae,
+            'mse': mse,
             'encoded_embs': codes,
             'sparsity_level': sparsity,
             'encoder_weights': weights,
@@ -159,12 +163,26 @@ def get_matching_stats(match_df: pd.DataFrame, relevant_cos_sim_threshold: float
         'mean_cos_sim_relevant_pairs': mean_cos_sim_good_matches
     }
 
+def get_model_stats(sae_list: list[dict[str]]):
+    models_df = pd.DataFrame(sae_list)
+
+    mean_dead_neurons = models_df['dead_neurons'].mean()
+    mean_sparsity_level = models_df['sparsity_level'].mean()
+    mean_mse = models_df['mse'].mean()
+
+    return {
+        'mean_dead_neurons': mean_dead_neurons,
+        'mean_sparsity': mean_sparsity_level,
+        'mean_mse': mean_mse
+    }
+
 def get_full_run_df(match_matrix: list[list], n_models: int) -> pd.DataFrame:
     flat_matrix = [match_matrix[i][j] for i in range(n_models) for j in range(n_models)]
     return pd.concat(flat_matrix, axis=0)
 
 def run_sae_random_comparison(model_nums: list[int], alphas: list[int], embs: np.ndarray, scaling_factors: list[float], model_type: str='ReLU'):
     stats_dict = {}
+    model_stats_dict = {}
     for m in scaling_factors:
         for a in alphas:
             print(f'Training {max(model_nums)} SAEs with Alpha = {a}, Scaling Factor = {m}')
@@ -174,20 +192,104 @@ def run_sae_random_comparison(model_nums: list[int], alphas: list[int], embs: np
                 print(f'Calculating matching stats for the first {n} models')
                 full_df = get_full_run_df(match_matrix=match_matrix, n_models=n)
                 run_stats = get_matching_stats(full_df)
-                print(f'Relevant pairs: {run_stats["relevant_pairs_fraction"]}')
+                model_stats = get_model_stats(sae_list)
+                # print(f'Relevant pairs: {run_stats["relevant_pairs_fraction"]}')
                 stats_dict[(m, n, a)] = run_stats
+                model_stats_dict[(m, a)] = model_stats
     
-    return stats_dict
+    return stats_dict, model_stats_dict
 
-def plot_run_results(full_results: dict[tuple[int, int, int]], alpha: float, scaling_factor: float, model_n: list[int]):
-    rel = []
-    for n in model_n:
-        result = full_results[(scaling_factor, n, alpha)]
-        relevancy = result['relevant_pairs_fraction']
-        rel.append(relevancy)
+def plot_run_results(full_results: dict[tuple[int, int, int]], model_results: dict[tuple[int, int]], alpha: float, scaling_factors: list[float], model_n: list[int]):
+    if len(scaling_factors) == 1:
+        rel = []
+        cos_sims = []
+        scaling_factor = scaling_factors[0]
+        for n in model_n:
+            result = full_results[(scaling_factor, n, alpha)]
+            relevancy = result['relevant_pairs_fraction']
+            rel.append(relevancy)
 
-    plt.figure(figsize=(5, 5))
-    plt.plot(model_n, rel)
-    plt.title(f'Relevant pairs fraction x number of SAE models trained\nAlpha = {alpha}, Scaling factor = {scaling_factor}')
-    plt.grid()
-    plt.savefig(f'stats/sae/good_pairs[alpha={alpha},scale={scaling_factor}].png')
+            cos_sim = result['mean_cos_sim']
+            cos_sims.append(cos_sim)
+
+        
+        mean_mse = model_results[(scaling_factor, alpha)]['mean_mse']
+        mean_sparsity = model_results[(scaling_factor, alpha)]['mean_sparsity']
+        mean_dead_neurons = model_results[(scaling_factor, alpha)]['mean_dead_neurons']
+
+        plt.figure(figsize=(7, 7))
+        plt.gca().yaxis.set_major_formatter(PercentFormatter(1.0))
+        plt.plot(model_n, rel, c='b', label='Fraction of concepts with relevant pairs')
+        plt.title(f'Relevant pairs fraction x number of SAE models trained\nAlpha = {alpha}, Scaling factor = {scaling_factor}')
+        
+        num_latents = int(192*scaling_factor)
+        perc_dead_neurons = (mean_dead_neurons / num_latents) * 100
+        total_mean_cos_sim = np.asarray(cos_sims).mean()
+
+        model_stats_text = (
+            f'Mean model sparsity: {mean_sparsity*100:.4f}%\n'
+            f'Mean model dead neurons: {perc_dead_neurons:.2f}% ({mean_dead_neurons:.2f}/{num_latents})\n'
+            f'Total mean cosine similarity: {total_mean_cos_sim:.4f}\n'
+            f'Mean MSE: {mean_mse:.4f}'
+        )
+        
+        plt.subplots_adjust(bottom=0.25)
+
+        plt.figtext(
+            0.5, 0.20,
+            model_stats_text,
+            ha='center', va='top',
+            fontsize=10,
+            bbox=dict(boxstyle='round,pad=0.5', facecolor='#f8f9fa', edgecolor='lightgray')
+        )
+       
+        plt.grid()
+        plt.savefig(f'stats/sae/good_pairs[alpha={alpha},scale={scaling_factor}].png', bbox_inches='tight')
+
+    else:
+        rel = {s: [] for s in scaling_factors}
+        cos_sims = {s: [] for s in scaling_factors}
+        full_model_stats_text = ['Statistics per model scale:']
+
+        for s in scaling_factors:
+            for n in model_n:
+                result = full_results[(s, n, alpha)]
+                relevancy = result['relevant_pairs_fraction']
+                rel[s].append(relevancy)
+
+                cos_sim = result['mean_cos_sim']
+                cos_sims[s].append(cos_sim)
+
+            mean_mse = model_results[(s, alpha)]['mean_mse']
+            mean_sparsity = model_results[(s, alpha)]['mean_sparsity']
+            mean_dead_neurons = model_results[(s, alpha)]['mean_dead_neurons']
+
+            num_latents = int(192*s)
+            perc_dead_neurons = (mean_dead_neurons / num_latents) * 100
+            total_mean_cos_sim = np.asarray(cos_sims[s]).mean()
+
+            model_stats_text = f'Scale {s} |  Sparsity: {mean_sparsity*100:.2f}%  |  Dead Neurons: {perc_dead_neurons:.2f}%  |  MSE: {mean_mse:.4f}\n'
+            full_model_stats_text.append(model_stats_text)
+            
+        final_text = '\n'.join(full_model_stats_text)
+        
+        plt.figure(figsize=(7, 7))
+        plt.gca().yaxis.set_major_formatter(PercentFormatter(1.0))
+        
+        plt.subplots_adjust(bottom=0.30)
+        plt.figtext(
+            0.5, 0.22,
+            final_text,
+            ha='center',
+            va='top',            
+            fontsize=10,
+            bbox=dict(boxstyle='round,pad=0.5', facecolor='#f8f9fa', edgecolor='lightgray')
+        )
+
+        colors = plt.cm.tab10.colors
+        for idx, s in enumerate(scaling_factors):
+            plt.scatter(model_n, rel[s], color=colors[idx%len(colors)], label=f'Scaling factor = {s}', s=10 + (25 * np.log2(s)), alpha=0.8)
+        plt.title(f'Relevant pairs fraction x number of SAE models trained\nAlpha = {alpha}, Scaling factors = {[s for s in scaling_factors]}')
+        plt.grid()
+        plt.legend(loc='best')
+        plt.savefig(f'stats/sae/good_pairs[alpha={alpha}].png', bbox_inches='tight')
