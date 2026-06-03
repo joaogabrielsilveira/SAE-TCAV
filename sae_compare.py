@@ -139,17 +139,21 @@ def get_overlap(sae_i: dict[str], idx_i: int, sae_j: dict[str], idx_j: int) -> f
 def get_concepts_matching(sae_i: dict[str], sae_j: dict[str], pair_criteria: str='cos_sim'):
     if sae_i['idx'] == sae_j['idx']:
         return None
-
+    
     cos_sim_matrix = cosine_similarity_matrix(sae_i, sae_j)
 
     if pair_criteria == 'cos_sim':
-        rows_idx, cols_idx = linear_sum_assignment(cos_sim_matrix, maximize=True)
+        pairing_matrix = cos_sim_matrix
+
     elif pair_criteria == 'overlap':
-        rows_idx, cols_idx = linear_sum_assignment(ov_matrix, maximize=True)
         ov_matrix = overlap_matrix(sae_i, sae_j)
+        pairing_matrix = ov_matrix
+
     else:
         raise RuntimeError('Invalid pairing criteira, try \'cos_sim\' or \'overlap\'')
-    
+
+    rows_idx, cols_idx = linear_sum_assignment(pairing_matrix, maximize=True)
+
     results = []
     for i, j in zip(rows_idx, cols_idx):
         if pair_criteria == 'cos_sim':
@@ -313,7 +317,7 @@ def plot_run_results(full_results: dict[tuple[int, int, int]], model_results: di
             total_mean_cos_sim = np.asarray(cos_sims[s]).mean()
             perc_mean_overlap = np.asarray(overlaps[s]).mean() * 100
 
-            model_stats_text = f'Scale {s} |  Sparsity: {mean_sparsity*100:.2f}%  | Overlap: {perc_mean_overlap:.2f}%  | Cos sim: {total_mean_cos_sim:.4f}  Dead Neurons: {perc_dead_neurons:.2f}%  |  MSE: {mean_mse:.4f}\n'
+            model_stats_text = f'Scale {s} |  Sparsity: {mean_sparsity*100:.2f}%  | Overlap: {perc_mean_overlap:.2f}%  | Cos sim: {total_mean_cos_sim:.4f}  |  Dead Neurons: {perc_dead_neurons:.2f}%  |  MSE: {mean_mse:.4f}\n'
             full_model_stats_text.append(model_stats_text)
             
         final_text = '\n'.join(full_model_stats_text).strip()

@@ -160,7 +160,7 @@ if __name__ == '__main__':
     inputs = emb_discovery
     pair_criteria = 'cos_sim'
     model_n = range(3, 15)
-    alphas = [1e-1]
+    alphas = [1e-1, 3e-1, 5e-1, 1]
     scaling_factors = [1.5]
     res, model_res = run_sae_random_comparison(
         model_nums=model_n,
