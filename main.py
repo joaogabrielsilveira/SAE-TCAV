@@ -158,13 +158,22 @@ if __name__ == '__main__':
     from sae_compare import run_sae_random_comparison, plot_run_results
     import matplotlib.pyplot as plt
     inputs = emb_discovery
+    pair_criteria = 'cos_sim'
     model_n = range(3, 15)
-    alphas = [3e-1]
+    alphas = [1e-1]
     scaling_factors = [1.5]
-    res, model_res = run_sae_random_comparison(model_nums=model_n, alphas=alphas, embs=inputs, scaling_factors=scaling_factors, model_type='ReLU')
+    res, model_res = run_sae_random_comparison(
+        model_nums=model_n,
+        alphas=alphas,
+        embs=inputs, 
+        scaling_factors=scaling_factors, 
+        model_type='ReLU',
+        pair_criteria=pair_criteria    
+    )
 
     for alpha in alphas:
-        plot_run_results(full_results=res, model_results=model_res, alpha=alpha, scaling_factors=scaling_factors, model_n=model_n)
+        plot_run_results(full_results=res, model_results=model_res, alpha=alpha,
+                         scaling_factors=scaling_factors, model_n=model_n, pair_criteria=pair_criteria)
 
     exit()
     sae_codes_train = sae.encode(torch.tensor(emb_discovery)).cpu().detach().numpy()

@@ -69,6 +69,23 @@ def cosine_similarity_matrix(sae_i: dict[str], sae_j: dict[str]) -> np.ndarray:
     from sklearn.metrics.pairwise import cosine_similarity
     return cosine_similarity(w_i, w_j)
 
+def overlap_matrix(sae_i: dict[str], sae_j: dict[str]) -> np.ndarray:
+    high_i, high_j = sae_i['high_activation_matrix'], sae_j['high_activation_matrix']
+    # nesta matriz de interseção, cada elemento (a, b) conta quantas vezes o conceito a de i ativou junto do conceito j de b
+    intersection = np.dot(high_i.T, high_j)
+
+    # essses vetores contam quantas vezes cada conceito ativou individualmente
+    sum_i = high_i.sum(axis=0).reshape(-1, 1)
+    sum_j = high_j.sum(axis=0).reshape(1, -1)
+
+    union = sum_i + sum_j - intersection
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        matrix = np.where(union > 0, intersection / union, 0.0)
+    
+    # print(f'overlap_matrix: {matrix.shape}')
+    return matrix
+
 def train_all_saes(num_models: int, embs: np.ndarray, alpha: float=1e-1, scaling_factor: float=1.5, model_type: str='ReLU') -> list[dict[str]]:
     sae_list = []
     for i in range(num_models):
@@ -119,17 +136,26 @@ def get_overlap(sae_i: dict[str], idx_i: int, sae_j: dict[str], idx_j: int) -> f
         return 0.0
     
     return float(intersection / union)
-def get_concepts_matching(sae_i: dict[str], sae_j: dict[str]):
+def get_concepts_matching(sae_i: dict[str], sae_j: dict[str], pair_criteria: str='cos_sim'):
     if sae_i['idx'] == sae_j['idx']:
         return None
-    
-    cos_sim_matrix = cosine_similarity_matrix(sae_i, sae_j)
-    rows_idx, cols_idx = linear_sum_assignment(cos_sim_matrix, maximize=True)
 
+    cos_sim_matrix = cosine_similarity_matrix(sae_i, sae_j)
+
+    if pair_criteria == 'cos_sim':
+        rows_idx, cols_idx = linear_sum_assignment(cos_sim_matrix, maximize=True)
+    elif pair_criteria == 'overlap':
+        rows_idx, cols_idx = linear_sum_assignment(ov_matrix, maximize=True)
+        ov_matrix = overlap_matrix(sae_i, sae_j)
+    else:
+        raise RuntimeError('Invalid pairing criteira, try \'cos_sim\' or \'overlap\'')
+    
     results = []
     for i, j in zip(rows_idx, cols_idx):
-        overlap = get_overlap(sae_i=sae_i, idx_i=i,
-                              sae_j=sae_j, idx_j=j)
+        if pair_criteria == 'cos_sim':
+            overlap = get_overlap(sae_i=sae_i, idx_i=i, sae_j=sae_j, idx_j=j)
+        else:
+            overlap = ov_matrix[i][j]
         results.append({
             'original_concept': i,
             'best_pair': j,
@@ -139,20 +165,27 @@ def get_concepts_matching(sae_i: dict[str], sae_j: dict[str]):
     
     return pd.DataFrame(results)
 
-def get_all_pairwise_matchings(num_models: int, sae_list: list[dict[str]]) -> list[list[pd.DataFrame]]:
+def get_all_pairwise_matchings(num_models: int, sae_list: list[dict[str]], pair_criteria: str='cos_sim') -> list[list[pd.DataFrame]]:
     matchings_matrix = [[None for _ in range(num_models)] for _ in range(num_models)]
     for i in range(num_models):
         for j in range(num_models):
             if i == j: continue
-            matchings_matrix[i][j] = get_concepts_matching(sae_i=sae_list[i], sae_j=sae_list[j])
+            matchings_matrix[i][j] = get_concepts_matching(sae_i=sae_list[i], sae_j=sae_list[j], pair_criteria=pair_criteria)
     
     return matchings_matrix
 
-def get_matching_stats(match_df: pd.DataFrame, relevant_cos_sim_threshold: float=0.7):
+def get_matching_stats(match_df: pd.DataFrame, pair_criteria: str='cos_sim', relevant_pair_threshold: float=0.7):
     mean_cos_sim = match_df['cos_sim'].mean()
-    match_df['is_relevant_pair'] = match_df['cos_sim'] > relevant_cos_sim_threshold    
+    mean_overlap = match_df['overlap'].mean()
+    if pair_criteria == 'cos_sim':
+        match_df['is_relevant_pair'] = match_df['cos_sim'] > relevant_pair_threshold
+    elif pair_criteria == 'overlap':
+        match_df['is_relevant_pair'] = match_df['overlap'] > relevant_pair_threshold
+    else:
+        raise RuntimeError('Invalid pairing criteira, try \'cos_sim\' or \'overlap\'')
     fraction_good_matches = match_df['is_relevant_pair'].mean()
     mean_cos_sim_good_matches = (match_df[match_df['is_relevant_pair'] == True])['cos_sim'].mean()
+    mean_overlap_good_matches = (match_df[match_df['is_relevant_pair'] == True])['overlap'].mean()
 
     if np.isnan(fraction_good_matches) or np.isnan(mean_cos_sim_good_matches):
         fraction_good_matches, mean_cos_sim_good_matches = 0.0, 0.0
@@ -160,7 +193,9 @@ def get_matching_stats(match_df: pd.DataFrame, relevant_cos_sim_threshold: float
     return {
         'mean_cos_sim': mean_cos_sim,
         'relevant_pairs_fraction': fraction_good_matches,
-        'mean_cos_sim_relevant_pairs': mean_cos_sim_good_matches
+        'mean_cos_sim_relevant_pairs': mean_cos_sim_good_matches,
+        'mean_overlap': mean_overlap,
+        'mean_overlap_relevant_pairs': mean_cos_sim_good_matches
     }
 
 def get_model_stats(sae_list: list[dict[str]]):
@@ -180,29 +215,29 @@ def get_full_run_df(match_matrix: list[list], n_models: int) -> pd.DataFrame:
     flat_matrix = [match_matrix[i][j] for i in range(n_models) for j in range(n_models)]
     return pd.concat(flat_matrix, axis=0)
 
-def run_sae_random_comparison(model_nums: list[int], alphas: list[int], embs: np.ndarray, scaling_factors: list[float], model_type: str='ReLU'):
+def run_sae_random_comparison(model_nums: list[int], alphas: list[int], embs: np.ndarray, scaling_factors: list[float], pair_criteria: str='cos_sim', relevant_pair_threshold: float=0.7, model_type: str='ReLU'):
     stats_dict = {}
     model_stats_dict = {}
     for m in scaling_factors:
         for a in alphas:
             print(f'Training {max(model_nums)} SAEs with Alpha = {a}, Scaling Factor = {m}')
             sae_list = train_all_saes(num_models=max(model_nums), embs=embs, alpha=a, scaling_factor=m, model_type=model_type)
-            match_matrix = get_all_pairwise_matchings(num_models=max(model_nums), sae_list=sae_list)
+            match_matrix = get_all_pairwise_matchings(num_models=max(model_nums), sae_list=sae_list, pair_criteria=pair_criteria)
             for n in model_nums:
                 print(f'Calculating matching stats for the first {n} models')
                 full_df = get_full_run_df(match_matrix=match_matrix, n_models=n)
-                run_stats = get_matching_stats(full_df)
+                run_stats = get_matching_stats(full_df, pair_criteria=pair_criteria, relevant_pair_threshold=relevant_pair_threshold)
                 model_stats = get_model_stats(sae_list)
-                # print(f'Relevant pairs: {run_stats["relevant_pairs_fraction"]}')
                 stats_dict[(m, n, a)] = run_stats
                 model_stats_dict[(m, a)] = model_stats
     
     return stats_dict, model_stats_dict
 
-def plot_run_results(full_results: dict[tuple[int, int, int]], model_results: dict[tuple[int, int]], alpha: float, scaling_factors: list[float], model_n: list[int]):
+def plot_run_results(full_results: dict[tuple[int, int, int]], model_results: dict[tuple[int, int]], alpha: float, scaling_factors: list[float], model_n: list[int], pair_criteria: str='cos_sim'):
     if len(scaling_factors) == 1:
         rel = []
         cos_sims = []
+        overlaps = []
         scaling_factor = scaling_factors[0]
         for n in model_n:
             result = full_results[(scaling_factor, n, alpha)]
@@ -212,24 +247,28 @@ def plot_run_results(full_results: dict[tuple[int, int, int]], model_results: di
             cos_sim = result['mean_cos_sim']
             cos_sims.append(cos_sim)
 
-        
+            overlap = result['mean_overlap']
+            overlaps.append(overlap)
+
         mean_mse = model_results[(scaling_factor, alpha)]['mean_mse']
         mean_sparsity = model_results[(scaling_factor, alpha)]['mean_sparsity']
         mean_dead_neurons = model_results[(scaling_factor, alpha)]['mean_dead_neurons']
 
         plt.figure(figsize=(7, 7))
         plt.gca().yaxis.set_major_formatter(PercentFormatter(1.0))
-        plt.plot(model_n, rel, c='b', label='Fraction of concepts with relevant pairs')
-        plt.title(f'Relevant pairs fraction x number of SAE models trained\nAlpha = {alpha}, Scaling factor = {scaling_factor}')
+        plt.plot(model_n, rel, c='b')
+        plt.title(f'Relevant pairs (by {pair_criteria}) fraction x number of SAE models trained\nAlpha = {alpha}, Scaling factor = {scaling_factor}')
         
         num_latents = int(192*scaling_factor)
         perc_dead_neurons = (mean_dead_neurons / num_latents) * 100
         total_mean_cos_sim = np.asarray(cos_sims).mean()
+        perc_mean_overlap = np.asarray(overlaps).mean() * 100
 
         model_stats_text = (
             f'Mean model sparsity: {mean_sparsity*100:.4f}%\n'
             f'Mean model dead neurons: {perc_dead_neurons:.2f}% ({mean_dead_neurons:.2f}/{num_latents})\n'
             f'Total mean cosine similarity: {total_mean_cos_sim:.4f}\n'
+            f'Total mean overlap: {perc_mean_overlap:.2f}%\n'
             f'Mean MSE: {mean_mse:.4f}'
         )
         
@@ -244,11 +283,13 @@ def plot_run_results(full_results: dict[tuple[int, int, int]], model_results: di
         )
        
         plt.grid()
-        plt.savefig(f'stats/sae/good_pairs[alpha={alpha},scale={scaling_factor}].png', bbox_inches='tight')
+        plt.savefig(f'stats/sae/good_pairs_{pair_criteria}[alpha={alpha},scale={scaling_factor}].png', bbox_inches='tight')
 
     else:
         rel = {s: [] for s in scaling_factors}
         cos_sims = {s: [] for s in scaling_factors}
+        overlaps = {s: [] for s in scaling_factors}
+
         full_model_stats_text = ['Statistics per model scale:']
 
         for s in scaling_factors:
@@ -260,6 +301,9 @@ def plot_run_results(full_results: dict[tuple[int, int, int]], model_results: di
                 cos_sim = result['mean_cos_sim']
                 cos_sims[s].append(cos_sim)
 
+                overlap = result['mean_overlap']
+                overlaps[s].append(overlap)
+
             mean_mse = model_results[(s, alpha)]['mean_mse']
             mean_sparsity = model_results[(s, alpha)]['mean_sparsity']
             mean_dead_neurons = model_results[(s, alpha)]['mean_dead_neurons']
@@ -267,11 +311,12 @@ def plot_run_results(full_results: dict[tuple[int, int, int]], model_results: di
             num_latents = int(192*s)
             perc_dead_neurons = (mean_dead_neurons / num_latents) * 100
             total_mean_cos_sim = np.asarray(cos_sims[s]).mean()
+            perc_mean_overlap = np.asarray(overlaps[s]).mean() * 100
 
-            model_stats_text = f'Scale {s} |  Sparsity: {mean_sparsity*100:.2f}%  |  Dead Neurons: {perc_dead_neurons:.2f}%  |  MSE: {mean_mse:.4f}\n'
+            model_stats_text = f'Scale {s} |  Sparsity: {mean_sparsity*100:.2f}%  | Overlap: {perc_mean_overlap:.2f}%  | Cos sim: {total_mean_cos_sim:.4f}  Dead Neurons: {perc_dead_neurons:.2f}%  |  MSE: {mean_mse:.4f}\n'
             full_model_stats_text.append(model_stats_text)
             
-        final_text = '\n'.join(full_model_stats_text)
+        final_text = '\n'.join(full_model_stats_text).strip()
         
         plt.figure(figsize=(7, 7))
         plt.gca().yaxis.set_major_formatter(PercentFormatter(1.0))
@@ -289,7 +334,7 @@ def plot_run_results(full_results: dict[tuple[int, int, int]], model_results: di
         colors = plt.cm.tab10.colors
         for idx, s in enumerate(scaling_factors):
             plt.scatter(model_n, rel[s], color=colors[idx%len(colors)], label=f'Scaling factor = {s}', s=10 + (25 * np.log2(s)), alpha=0.8)
-        plt.title(f'Relevant pairs fraction x number of SAE models trained\nAlpha = {alpha}, Scaling factors = {[s for s in scaling_factors]}')
+        plt.title(f'Relevant pairs (by {pair_criteria}) fraction  x number of SAE models trained\nAlpha = {alpha}, Scaling factors = {[s for s in scaling_factors]}')
         plt.grid()
         plt.legend(loc='best')
-        plt.savefig(f'stats/sae/good_pairs[alpha={alpha}].png', bbox_inches='tight')
+        plt.savefig(f'stats/sae/good_pairs_{pair_criteria}[alpha={alpha}].png', bbox_inches='tight')
