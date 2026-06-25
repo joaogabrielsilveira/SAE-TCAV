@@ -11,6 +11,7 @@ from sklearn.exceptions import UndefinedMetricWarning
 from imblearn.under_sampling import RandomUnderSampler
 from imblearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.tree import export_graphviz
 from results import translate_event_name
 import re
 import pandas as pd
@@ -168,8 +169,9 @@ def extrair_regras_resumidas(modelo_arvore, nomes_das_features, scaler=None, dic
     percorrer_arvore(0, {})
     return regras_positivas
 
-def get_binary_targets(train_activations: np.ndarray, perc=50) -> list[tuple[int, float]]:
+def get_binary_targets(train_activations: np.ndarray, perc=50, model_type:str='ReLU') -> list[tuple[int, float]]:
     bin_targets = []
+    print(f'model_type: {model_type}')
 
     for col in range(train_activations.shape[1]):
         # lista com todas as ativações para o embedding atual
@@ -177,10 +179,18 @@ def get_binary_targets(train_activations: np.ndarray, perc=50) -> list[tuple[int
 
         # threshold: ativação maior que 50% das positivas (mediana)
         cur_concept_positive = cur_concept[cur_concept > 0]
-        if cur_concept_positive.shape[0] > 0:
-            threshold = np.percentile(cur_concept_positive, perc)
-            bin_targets.append((col, threshold))
-            #print(f'Fator {col}: target={threshold}')
+        if model_type == 'ReLU':
+            if cur_concept_positive.shape[0] > 0:
+                threshold = np.percentile(cur_concept_positive, perc)
+                bin_targets.append((col, threshold)) 
+        elif model_type == 'TopK':
+            if cur_concept_positive.shape[0] > 0:
+                threshold = np.min(cur_concept_positive)
+                bin_targets.append((col, threshold)) 
+        else:
+            raise ValueError('Invalid model type')
+        
+           
 
     return bin_targets
 
@@ -212,8 +222,29 @@ def mask_from_rule(rule: str, X: np.ndarray, feature_names: list[str]) -> np.nda
     
     return mask
 
+def get_rules_from_text(text_rules: str) -> pd.DataFrame:
+    path = []
+    tree_rules = []
+
+    for line in text_rules.split('\n'):
+        depth = line.count('|   ')
+        
+        # "class:" indica um nó folha (o final de uma regra)
+        if 'class' in line:
+            cls = line.split('class:')[1].strip()
+            tree_rules.append({'Path': ' AND '.join(path), 'Class': cls})
+        
+        # nós com filhos indicam a continuação de uma regra
+        else:
+            cond = line.split('|--- ')[-1].strip()
+            # "volta" o conjunto de regras para a altura do nó atual
+            path = path[:depth]
+            path.append(cond)
+
+    return pd.DataFrame(tree_rules)
+
 def train_binary_trees(train_activations: np.ndarray, X: np.ndarray,
-                       feature_names: list[str], max_depth:int=15)\
+                       feature_names: list[str], model_type: str='ReLU', max_depth:int=15)\
         -> list[dict[str, Any]]:
     warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 
@@ -221,7 +252,7 @@ def train_binary_trees(train_activations: np.ndarray, X: np.ndarray,
     valid_rules = {p: [] for p in percentiles}
 
     for perc in percentiles:
-        bin_targets = get_binary_targets(train_activations, perc)
+        bin_targets = get_binary_targets(train_activations, perc, model_type)
         for (idx, target) in bin_targets:
             cur_train_activations = train_activations[:, idx]
             n_positives = (cur_train_activations > 0).sum()
@@ -250,29 +281,12 @@ def train_binary_trees(train_activations: np.ndarray, X: np.ndarray,
                 max_depth=clf.get_depth()
             )
 
-            path = []
-            tree_rules = []
-
-            for line in text_rules.split('\n'):
-                depth = line.count('|   ')
-                
-                # "class:" indica um nó folha (o final de uma regra)
-                if 'class' in line:
-                    cls = line.split('class:')[1].strip()
-                    tree_rules.append({'Path': ' AND '.join(path), 'Class': cls})
-                
-                # nós com filhos indicam a continuação de uma regra
-                else:
-                    cond = line.split('|--- ')[-1].strip()
-                    # "volta" o conjunto de regras para a altura do nó atual
-                    path = path[:depth]
-                    path.append(cond)
-
-            tree_rules_df = pd.DataFrame(tree_rules)
+            tree_rules_df = get_rules_from_text(text_rules=text_rules)
 
             best_rule = None
             best_recall = None
             best_prec = None
+            num_true = None
 
             for _, row in tree_rules_df.iterrows():
                 rule = row['Path']
@@ -292,6 +306,7 @@ def train_binary_trees(train_activations: np.ndarray, X: np.ndarray,
                     best_rule = row
                     best_prec = precision
                     best_recall = recall
+                    num_true = true_mask.sum()
 
             if best_rule is not None:
                 valid_rules[perc].append({
@@ -300,6 +315,103 @@ def train_binary_trees(train_activations: np.ndarray, X: np.ndarray,
                     "Class": best_rule['Class'],
                     "Precision": best_prec,
                     "Recall": best_recall,
+                    "Patients": num_true,
+                    "Patients_concept": n_high
                 })
         print(f'Regras válidas encontradas com percentil {perc}: {len(valid_rules[perc])}')
     return valid_rules
+
+def get_rules_forced(train_activations: np.ndarray, X: np.ndarray, surviving_concepts: np.ndarray, tree_rules_df: pd.DataFrame,  perc: int, feature_names: list[str], model_type: str='ReLU', balanced:bool = False):
+    if tree_rules_df is not None:
+        surviving_concepts = np.asarray(surviving_concepts, dtype=np.int64)
+        existing_rules = tree_rules_df['Factor'].tolist()
+        if existing_rules:
+            non_existing_mask = ~(np.isin(surviving_concepts, existing_rules))
+            surviving_concepts = surviving_concepts[non_existing_mask]
+
+    # print(train_activations.shape)
+    bin_targets = get_binary_targets(train_activations, perc, model_type)
+    bin_targets = [(idx, target) for (idx, target) in bin_targets if idx in surviving_concepts]
+
+    valid_rules = []
+    for concept, target in bin_targets:
+        concept_activations = train_activations[:, concept]
+
+        y_high = (concept_activations >= target)
+        n_high = y_high.sum()
+
+        if n_high == 0:
+            y_high = (concept_activations > 0)
+            n_high = y_high.sum()
+
+            if n_high == 0:
+                continue
+        
+        clf = DecisionTreeClassifier(
+            max_depth=15,
+            min_samples_leaf=0.01,
+            class_weight='balanced' if balanced else None,
+            random_state=42
+        )
+        clf.fit(X, y_high)
+
+        text_rules = export_text(
+            clf,
+            feature_names=feature_names,
+            max_depth=clf.get_depth()
+        )
+
+        tree_rules_df = get_rules_from_text(text_rules=text_rules)
+
+        best_f1 = None
+        best_rule = None
+        best_recall = None
+        best_precision = None
+        num_true = None
+
+        export_graphviz(decision_tree=clf, out_file=f'models/trees/graphs/{concept}.dot', max_depth=clf.get_depth(), feature_names=feature_names)
+
+        for idx, row in tree_rules_df.iterrows():
+            # print(f'Concept {concept}, Row {idx}')
+            if row['Class'] in [0, 0.0, False, 'False']:
+                # print('False rule')
+                continue
+
+            rule = row['Path']
+            true_mask = mask_from_rule(rule, X, feature_names)
+
+            if true_mask.sum() == 0:
+                # print('No true patients for rule')
+                continue
+                
+            n_true_positive = (true_mask & y_high).sum()
+            recall = n_true_positive / max(n_high, 1)
+            precision = float(y_high[true_mask].mean())
+            f1 = 2 * (precision * recall) / (precision + recall)
+            if np.isnan(f1):
+                # print('Invalid f1')
+                continue
+
+            # print(f'Rule found, prec={precision}, rec={recall}')
+            if best_rule is None or f1 > best_f1:
+                # print(f'Is new best rule')
+                best_f1 = f1
+                best_rule = row
+                best_recall = recall
+                best_precision = precision
+                num_true = true_mask.sum()
+
+
+        if best_rule is not None:
+            # print(f'Found rule for concept {concept}')
+            valid_rules.append({
+                "Factor": concept,
+                "Rule": best_rule['Path'],
+                "Class": best_rule['Class'],
+                "Precision": best_precision,
+                "Recall": best_recall,
+                "Patients": num_true,
+                "Patients_concept": n_high
+            })
+
+    return valid_rules    

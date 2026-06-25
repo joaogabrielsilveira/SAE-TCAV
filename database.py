@@ -8,6 +8,7 @@ from sklearn.impute import SimpleImputer
 import numpy as np
 from sklearn.model_selection import train_test_split
 from filepaths import get_env_path
+import matplotlib.pyplot as plt
 
 TARGET_POS_LINES = 5000
 TARGET_NEG_LINES = 5000
@@ -272,11 +273,12 @@ def select_top_events_lgbm(df:pd.DataFrame, selected_train_patients: Sequence[st
     importance_df = pd.DataFrame(
         {
             'feature': availbale_candidate_events,
-            'importance': gbm.feature_importance(importance_type='gain')
+            'importance': gbm.feature_importance(importance_type='gain'),
+            'importance_perc': gbm.feature_importance(importance_type='gain') / gbm.feature_importance(importance_type='gain').sum()
          }
     ).sort_values('importance', ascending=False)
 
-    return importance_df['feature'].tolist()[:final_top_k]
+    return importance_df[:final_top_k]
 
 
 def trim_post_death_rows(pivot_df: pd.DataFrame):
@@ -330,13 +332,61 @@ def build_train_test_rows(df: pd.DataFrame, selected_train_patients: Sequence[st
 
     return train_rows, test_rows
 
+def plot_feature_importance(top_k_events: pd.DataFrame, num_features: int = 15, data_source: str = 'training'):
+    _, ax = plt.subplots(figsize=(10,7))
+
+    feats = top_k_events['feature'].tolist()[:num_features]
+    imps = top_k_events['importance_perc'].tolist()[:num_features]
+
+    bars = ax.barh(feats, imps, height=0.6)
+    ax.invert_yaxis()
+    ax.set_xlabel('Importance')
+    ax.set_ylabel('Feature')
+    ax.bar_label(bars, padding=5)
+    ax.set_title(f'Most important events in {data_source} data')
+    plt.savefig(f'top_k_events_{data_source}.png')
+
+from scipy.stats import levene
+def compare_distributions(x_i: np.ndarray, x_j: np.ndarray, top_k_events: list[str]):
+    mean_i = np.mean(x_i, axis=0)
+    std_i = np.std(x_i, axis=0)
+
+    mean_j = np.mean(x_j, axis=0)
+    std_j = np.std(x_j, axis=0)
+
+    rows = []
+    features_to_keep = []
+    features_to_keep_name = []
+    for idx, feat in enumerate(top_k_events):
+        stat, p_value = levene(x_i[:, idx], x_j[:, idx])
+        if np.isnan(p_value) or (mean_i[idx] * mean_j[idx] == 0 and mean_i[idx] != mean_j[idx])\
+            or (std_i[idx] * std_j[idx] == 0 and std_i[idx] != std_j[idx]):
+            is_different = True
+        else:
+            var_i = std_i[idx] ** 2
+            var_j = std_j[idx] ** 2
+            variance_ratio = max(var_i, var_j) / min(var_i, var_j)
+            mean_ratio = max(mean_i[idx], mean_j[idx]) / min(mean_i[idx], mean_j[idx])
+            is_different = (p_value < 0.05) and (variance_ratio > 1.2) and (mean_ratio > 1.2)
+        rows.append({
+            'Feature name': feat,
+            'Mean ratio': max(mean_i[idx], mean_j[idx]) / min(mean_i[idx], mean_j[idx]),
+            'Std ratio': max(std_i[idx], std_j[idx]) / min(std_i[idx], std_j[idx]),
+            'p value': p_value, 'Different': is_different,
+        })
+        features_to_keep.append(not(is_different))
+        if not(is_different):
+            features_to_keep_name.append(feat)
+        data_shift_df = pd.DataFrame(rows)
+    
+    return data_shift_df, features_to_keep, features_to_keep_name
+
 def prepare_tabpfn_rows(df: pd.DataFrame, cfg: TabPFNPrepConfig, lgbm_params: dict) -> dict[str, object]:
     years_all = sorted(df['year'].unique())
     # separação dos anos
     train_years, test_years = infer_train_test_years(years_all=years_all, forced_start=cfg.forced_train_year_start,
                                                      forced_end=cfg.forced_test_year_start)
     # print(f'year_tr: {train_years}, year_ts: {test_years}')
-    # input()
     all_patients = np.asarray(df['patient_id'].unique(), dtype=str)
     # separação dos pacientes
     train_patients, test_patients = split_patients(all_patients, test_size=0.1, random_state=cfg.rng_seed)
@@ -380,9 +430,34 @@ def prepare_tabpfn_rows(df: pd.DataFrame, cfg: TabPFNPrepConfig, lgbm_params: di
 
     top_k_events = select_top_events_lgbm(df, selected_train_patients, train_years,
                                           cfg.m_candidates, final_top_k=cfg.final_top_k, lgb_params=lgbm_params)
+    
+    top_k_events_test = select_top_events_lgbm(df=df, selected_train_patients=test_patients, train_years=test_years,
+                                                m_candidates=cfg.m_candidates, final_top_k=cfg.final_top_k, lgb_params=lgbm_params)
+    
+    plot_feature_importance(top_k_events=top_k_events, data_source='training')
+    plot_feature_importance(top_k_events=top_k_events_test, data_source='test')
 
+    top_k_events_training_start = select_top_events_lgbm(df, selected_train_patients, [2000],
+                                          cfg.m_candidates, final_top_k=cfg.final_top_k, lgb_params=lgbm_params)
+    
+    top_k_events_training_end = select_top_events_lgbm(df, selected_train_patients, [max(train_years)],
+                                          cfg.m_candidates, final_top_k=cfg.final_top_k, lgb_params=lgbm_params)
+
+    plot_feature_importance(top_k_events=top_k_events_training_start, data_source=f'training start (2000)')
+    plot_feature_importance(top_k_events=top_k_events_training_end, data_source=f'training end ({max(train_years)})')
+
+    top_k_events_test_start = select_top_events_lgbm(df, test_patients, [min(test_years)],
+                                          cfg.m_candidates, final_top_k=cfg.final_top_k, lgb_params=lgbm_params)
+
+    top_k_events_test_end = select_top_events_lgbm(df, selected_train_patients, [max(test_years)],
+                                          cfg.m_candidates, final_top_k=cfg.final_top_k, lgb_params=lgbm_params)
+
+    plot_feature_importance(top_k_events=top_k_events_test_start, data_source=f'test start ({min(test_years)})')
+    plot_feature_importance(top_k_events=top_k_events_test_end, data_source=f'test end ({max(test_years)})')
+
+    top_k_events_list = top_k_events['feature'].tolist()
     train_rows, test_rows = build_train_test_rows(df, selected_train_patients, test_patients, train_years,
-                                                  test_years, top_k_events)
+                                                  test_years, top_k_events_list)
 
     if len(train_rows) > cfg.max_total_rows:
         train_rows = train_rows.sample(n=cfg.max_total_rows, random_state=cfg.rng_seed).reset_index(drop=True)
@@ -390,7 +465,7 @@ def prepare_tabpfn_rows(df: pd.DataFrame, cfg: TabPFNPrepConfig, lgbm_params: di
     return {
         'train_rows': train_rows,
         'test_rows': test_rows,
-        'top_k_events': top_k_events,
+        'top_k_events': top_k_events_list,
         'train_years': train_years,
         'test_years': test_years,
         'selected_train_patients': selected_train_patients

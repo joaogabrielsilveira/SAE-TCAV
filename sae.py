@@ -23,6 +23,7 @@ class SAE(nn.Module):
     def __init__(self, data_dimension:int=192, scaling_factor:float=1.5, use_decoder_bias: bool = False, type: str='ReLU', k: int | None = None, k_aux: int | None = None):
         super().__init__()
         self.num_latents = int(data_dimension*scaling_factor)
+
         self.encoder = nn.Linear(data_dimension, self.num_latents, bias=True)
 
         if type == 'ReLU':

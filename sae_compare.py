@@ -5,6 +5,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.optimize import linear_sum_assignment
 from matplotlib.ticker import PercentFormatter
+from tabpfn_model import load_or_extract_embeddings, scale_embeddings, temporal_test_subsplits, fit_dr_tabpfn, walkforward_evaluate_tabpfn, TabPFNClassifier, TabPFNEvalConfig, EmbeddingExtractConfig
 
 def activation_threshold(concept: np.ndarray, perc: int=90):
     pos_act = concept[concept > 0]
@@ -86,7 +87,7 @@ def overlap_matrix(sae_i: dict[str], sae_j: dict[str]) -> np.ndarray:
     # print(f'overlap_matrix: {matrix.shape}')
     return matrix
 
-def train_all_saes(num_models: int, embs: np.ndarray, alpha: float=1e-1, scaling_factor: float=1.5, model_type: str='ReLU') -> list[dict[str]]:
+def train_all_saes(num_models: int, embs: np.ndarray, alpha: float=1e-1, scaling_factor: float=1.5, model_type: str='ReLU', k:int=16, k_aux:int=64) -> list[dict[str]]:
     sae_list = []
     for i in range(num_models):
 
@@ -96,7 +97,7 @@ def train_all_saes(num_models: int, embs: np.ndarray, alpha: float=1e-1, scaling
         else:
             current_seed = 10 * (i ** 2) + 50 * i + 75
     
-        sae = train_sae_model(inputs=torch.tensor(embs), type=model_type, alpha=alpha, scaling_factor=scaling_factor, save_data=False, use_decoder_bias=True, use_cache=False, rng_seed=current_seed, epochs=1000)
+        sae = train_sae_model(inputs=torch.tensor(embs), type=model_type, alpha=alpha, scaling_factor=scaling_factor, save_data=False, use_decoder_bias=True, use_cache=False, rng_seed=current_seed, epochs=1000, k=k, k_aux=k_aux)
 
         if model_type == 'ReLU':
             weights = sae.encoder.weight.cpu().detach().numpy()
@@ -161,6 +162,8 @@ def get_concepts_matching(sae_i: dict[str], sae_j: dict[str], pair_criteria: str
         else:
             overlap = ov_matrix[i][j]
         results.append({
+            'sae_i_idx': sae_i['idx'],
+            'sae_j_idx': sae_j['idx'],
             'original_concept': i,
             'best_pair': j,
             'cos_sim': cos_sim_matrix[i][j],
@@ -195,11 +198,11 @@ def get_matching_stats(match_df: pd.DataFrame, pair_criteria: str='cos_sim', rel
         fraction_good_matches, mean_cos_sim_good_matches = 0.0, 0.0
 
     return {
-        'mean_cos_sim': mean_cos_sim,
         'relevant_pairs_fraction': fraction_good_matches,
+        'mean_cos_sim': mean_cos_sim,
         'mean_cos_sim_relevant_pairs': mean_cos_sim_good_matches,
         'mean_overlap': mean_overlap,
-        'mean_overlap_relevant_pairs': mean_cos_sim_good_matches
+        'mean_overlap_relevant_pairs': mean_overlap_good_matches
     }
 
 def get_model_stats(sae_list: list[dict[str]]):
@@ -219,13 +222,17 @@ def get_full_run_df(match_matrix: list[list], n_models: int) -> pd.DataFrame:
     flat_matrix = [match_matrix[i][j] for i in range(n_models) for j in range(n_models)]
     return pd.concat(flat_matrix, axis=0)
 
-def run_sae_random_comparison(model_nums: list[int], alphas: list[int], embs: np.ndarray, scaling_factors: list[float], pair_criteria: str='cos_sim', relevant_pair_threshold: float=0.7, model_type: str='ReLU'):
+def run_sae_random_comparison(model_nums: list[int], hyper_params: list[int | float], embs: np.ndarray, scaling_factors: list[float], pair_criteria: str='cos_sim', relevant_pair_threshold: float=0.7, model_type: str='ReLU'):
     stats_dict = {}
     model_stats_dict = {}
     for m in scaling_factors:
-        for a in alphas:
-            print(f'Training {max(model_nums)} SAEs with Alpha = {a}, Scaling Factor = {m}')
-            sae_list = train_all_saes(num_models=max(model_nums), embs=embs, alpha=a, scaling_factor=m, model_type=model_type)
+        for a in hyper_params:
+            if model_type == 'ReLU':
+                print(f'Training {max(model_nums)} {model_type} SAEs with Alpha = {a}, Scaling Factor = {m}')
+                sae_list = train_all_saes(num_models=max(model_nums), embs=embs, alpha=a, scaling_factor=m, model_type=model_type)
+            elif model_type == 'TopK':
+                print(f'Training {max(model_nums)} {model_type} SAEs with K = {a}, Scaling Factor = {m}')
+                sae_list = train_all_saes(num_models=max(model_nums), embs=embs, k=a, k_aux=4*a, scaling_factor=m, model_type=model_type)
             match_matrix = get_all_pairwise_matchings(num_models=max(model_nums), sae_list=sae_list, pair_criteria=pair_criteria)
             for n in model_nums:
                 print(f'Calculating matching stats for the first {n} models')
@@ -235,18 +242,26 @@ def run_sae_random_comparison(model_nums: list[int], alphas: list[int], embs: np
                 stats_dict[(m, n, a)] = run_stats
                 model_stats_dict[(m, a)] = model_stats
     
-    return stats_dict, model_stats_dict
+    return stats_dict, model_stats_dict, full_df, sae_list
 
-def plot_run_results(full_results: dict[tuple[int, int, int]], model_results: dict[tuple[int, int]], alpha: float, scaling_factors: list[float], model_n: list[int], pair_criteria: str='cos_sim'):
+def plot_run_results(full_results: dict[tuple[int, int, int]], model_results: dict[tuple[int, int]], hyper_param: int | float, scaling_factors: list[float], model_n: list[int], pair_criteria: str='cos_sim', concept_info: str='fraction', model_type: str='ReLU'):
+    if model_type == 'ReLU':
+        hyper = 'Alpha'
+    elif model_type == 'TopK':
+        hyper = 'K'
+
     if len(scaling_factors) == 1:
         rel = []
         cos_sims = []
         overlaps = []
         scaling_factor = scaling_factors[0]
         for n in model_n:
-            result = full_results[(scaling_factor, n, alpha)]
+            result = full_results[(scaling_factor, n, hyper_param)]
             relevancy = result['relevant_pairs_fraction']
-            rel.append(relevancy)
+            if concept_info == 'fraction':
+                rel.append(relevancy)
+            else:
+                rel.append(relevancy * (192*scaling_factor))
 
             cos_sim = result['mean_cos_sim']
             cos_sims.append(cos_sim)
@@ -254,14 +269,15 @@ def plot_run_results(full_results: dict[tuple[int, int, int]], model_results: di
             overlap = result['mean_overlap']
             overlaps.append(overlap)
 
-        mean_mse = model_results[(scaling_factor, alpha)]['mean_mse']
-        mean_sparsity = model_results[(scaling_factor, alpha)]['mean_sparsity']
-        mean_dead_neurons = model_results[(scaling_factor, alpha)]['mean_dead_neurons']
+        mean_mse = model_results[(scaling_factor, hyper_param)]['mean_mse']
+        mean_sparsity = model_results[(scaling_factor, hyper_param)]['mean_sparsity']
+        mean_dead_neurons = model_results[(scaling_factor, hyper_param)]['mean_dead_neurons']
 
         plt.figure(figsize=(7, 7))
-        plt.gca().yaxis.set_major_formatter(PercentFormatter(1.0))
+        if concept_info == 'fraction':
+            plt.gca().yaxis.set_major_formatter(PercentFormatter(1.0))
         plt.plot(model_n, rel, c='b')
-        plt.title(f'Relevant pairs (by {pair_criteria}) fraction x number of SAE models trained\nAlpha = {alpha}, Scaling factor = {scaling_factor}')
+        plt.title(f'Relevant pairs (by {pair_criteria}) fraction x number of SAE models trained\n{hyper} = {hyper_param}, Scaling factor = {scaling_factor}')
         
         num_latents = int(192*scaling_factor)
         perc_dead_neurons = (mean_dead_neurons / num_latents) * 100
@@ -287,7 +303,8 @@ def plot_run_results(full_results: dict[tuple[int, int, int]], model_results: di
         )
        
         plt.grid()
-        plt.savefig(f'stats/sae/good_pairs_{pair_criteria}[alpha={alpha},scale={scaling_factor}].png', bbox_inches='tight')
+        print(f'Salvando grafico em stats/sae/{model_type}/good_pairs_{pair_criteria}[{hyper}={hyper_param},scale={scaling_factor}].png')
+        plt.savefig(f'stats/sae/{model_type}/good_pairs_{pair_criteria}[{hyper}={hyper_param},scale={scaling_factor}].png', bbox_inches='tight')
 
     else:
         rel = {s: [] for s in scaling_factors}
@@ -297,10 +314,14 @@ def plot_run_results(full_results: dict[tuple[int, int, int]], model_results: di
         full_model_stats_text = ['Statistics per model scale:']
 
         for s in scaling_factors:
+            num_latents = int(192*s)
             for n in model_n:
-                result = full_results[(s, n, alpha)]
+                result = full_results[(s, n, hyper_param)]
                 relevancy = result['relevant_pairs_fraction']
-                rel[s].append(relevancy)
+                if concept_info == 'fraction':
+                    rel[s].append(relevancy)
+                else:
+                    rel[s].append(relevancy * num_latents)
 
                 cos_sim = result['mean_cos_sim']
                 cos_sims[s].append(cos_sim)
@@ -308,11 +329,10 @@ def plot_run_results(full_results: dict[tuple[int, int, int]], model_results: di
                 overlap = result['mean_overlap']
                 overlaps[s].append(overlap)
 
-            mean_mse = model_results[(s, alpha)]['mean_mse']
-            mean_sparsity = model_results[(s, alpha)]['mean_sparsity']
-            mean_dead_neurons = model_results[(s, alpha)]['mean_dead_neurons']
+            mean_mse = model_results[(s, hyper_param)]['mean_mse']
+            mean_sparsity = model_results[(s, hyper_param)]['mean_sparsity']
+            mean_dead_neurons = model_results[(s, hyper_param)]['mean_dead_neurons']
 
-            num_latents = int(192*s)
             perc_dead_neurons = (mean_dead_neurons / num_latents) * 100
             total_mean_cos_sim = np.asarray(cos_sims[s]).mean()
             perc_mean_overlap = np.asarray(overlaps[s]).mean() * 100
@@ -323,7 +343,8 @@ def plot_run_results(full_results: dict[tuple[int, int, int]], model_results: di
         final_text = '\n'.join(full_model_stats_text).strip()
         
         plt.figure(figsize=(7, 7))
-        plt.gca().yaxis.set_major_formatter(PercentFormatter(1.0))
+        if concept_info == 'fraction':
+            plt.gca().yaxis.set_major_formatter(PercentFormatter(1.0))
         
         plt.subplots_adjust(bottom=0.30)
         plt.figtext(
@@ -338,7 +359,130 @@ def plot_run_results(full_results: dict[tuple[int, int, int]], model_results: di
         colors = plt.cm.tab10.colors
         for idx, s in enumerate(scaling_factors):
             plt.scatter(model_n, rel[s], color=colors[idx%len(colors)], label=f'Scaling factor = {s}', s=10 + (25 * np.log2(s)), alpha=0.8)
-        plt.title(f'Relevant pairs (by {pair_criteria}) fraction  x number of SAE models trained\nAlpha = {alpha}, Scaling factors = {[s for s in scaling_factors]}')
+
+        plt.title(f'Relevant pairs (by {pair_criteria}) fraction  x number of SAE models trained\n{hyper} = {hyper_param}, Scaling factors = {[s for s in scaling_factors]}')
         plt.grid()
         plt.legend(loc='best')
-        plt.savefig(f'stats/sae/good_pairs_{pair_criteria}[alpha={alpha}].png', bbox_inches='tight')
+        plt.savefig(f'stats/sae/{model_type}/good_pairs_{pair_criteria}[{hyper}={hyper_param}].png', bbox_inches='tight')
+    
+
+def run_random_comparison_year_differences(model_nums: list[int], hyper_params: list[int | float], scaling_factors: list[float], pair_criteria: str='cos_sim', relevant_pair_threshold: float=0.7, model_type: str='ReLU',
+                                            embedding_info: dict[str] = None, years: list[int] | np.ndarray = None, feature_cols: list[str] = None):
+    
+    X_test_df = embedding_info['X_test_df']
+    ytd_map = embedding_info['ytd_map']
+
+    years_unique = np.unique(years)
+    train_year = years_unique[0]
+    # eval_cfg = TabPFNEvalConfig()
+    # fit_out = fit_dr_tabpfn(X_test_df[X_test_df['year'] == train_year][feature_cols], np.asarray((X_test_df[X_test_df['year'] == train_year])['DEATH'] > 0, dtype=np.int32), train_years=years[X_test_df['year'] == train_year], eval_cfg=eval_cfg)
+    # drift_model: TabPFNClassifier = fit_out["model"]
+    # model_add_x_device = fit_out["model_add_x_device"]
+    # example_add_shape = fit_out["example_add_shape"]
+
+    drift_model = embedding_info['model']
+    model_add_x_device = embedding_info['device']
+    example_add_shape = embedding_info['example_add_shape']
+
+    stats = []
+    for dist, year in enumerate(years_unique):
+        test_year = train_year + dist
+        print(f'Extracting embeddings for training: {train_year}, test: {test_year}')
+
+        X_train_np = X_test_df[X_test_df['year'] == train_year][feature_cols]
+        X_test_np = X_test_df[X_test_df['year'] == test_year][feature_cols]
+
+        assert(len(X_train_np) == (X_test_df['year'] == train_year).sum())
+        assert(len(X_test_np) == (X_test_df['year'] == test_year).sum())
+
+        years_train = years[X_test_df['year'] == train_year]
+        years_test = years[X_test_df['year'] == test_year]
+
+        wf = walkforward_evaluate_tabpfn(
+            drift_model=drift_model,
+            test_rows=X_test_df,
+            test_years = [test_year],
+            top_k_events=feature_cols,
+            train_years=years_train,
+            model_add_x_device=model_add_x_device,
+            batch_size_predict=512,
+            example_add_shape=example_add_shape,
+            use_cache=False
+        )
+
+        input()
+        results_per_year = wf["results_per_year"]
+        results_df = pd.DataFrame(results_per_year).sort_values("year").drop('y_pred_bin', axis=1).reset_index(drop=True)
+        print(results_df)
+
+        emb_cfg = EmbeddingExtractConfig()
+        emb_out = load_or_extract_embeddings(
+            model=drift_model,
+            X_train_np=X_train_np,
+            X_test_np=X_test_np,
+            years_train=years_train,
+            years_test=years_test,
+            year_to_domain_map=ytd_map,
+            embeddings_dir='test',
+            cfg=emb_cfg,
+            device=model_add_x_device,
+            example_add_shape=example_add_shape
+        )
+
+        train_emb = emb_out['train_emb_flat'].astype(np.float32)
+        test_emb = emb_out['test_emb_flat'].astype(np.float32)
+
+        train_emb_scaled, test_emb_scaled = scale_embeddings(train_emb, test_emb)
+        y_test = ((X_test_df[X_test_df['year'] == test_year])["DEATH"] > 0).astype(int).to_numpy(copy=True)
+        split_idx = temporal_test_subsplits(
+            y_test,
+            42
+        )
+
+        idx_test_discover = split_idx["idx_test_discover"]
+        emb_discovery = test_emb_scaled[idx_test_discover]
+        embs = emb_discovery
+
+        res, model_res, full_pair_df, sae_list = run_sae_random_comparison(
+            model_nums=model_nums,
+            hyper_params=hyper_params,
+            embs=embs, 
+            scaling_factors=scaling_factors, 
+            model_type=model_type,
+            pair_criteria=pair_criteria,
+        )
+
+        pd.set_option('display.max_rows', 20)
+        full_pair_df['is_relevant_pair'] = full_pair_df[pair_criteria] >= 0.7
+        num_surviving_concepts = full_pair_df['is_relevant_pair'].sum()
+        mean_surviving_concepts = full_pair_df['is_relevant_pair'].mean()
+
+        original_sae_df = full_pair_df[full_pair_df['sae_i_idx'] == 0].copy()
+
+        stats_by_concept = original_sae_df.groupby('original_concept').agg(
+            survival_rate=('is_relevant_pair', 'mean'),
+            mean_cos_sim=('cos_sim', 'mean'),
+            mean_overlap=('overlap', 'mean')
+        ).reset_index().sort_values('survival_rate', ascending=False)
+
+        surviving_concepts = stats_by_concept[stats_by_concept['survival_rate'] > 0.0]
+
+        stats.append(
+            {
+                'train_year': train_year,
+                'test_year': test_year,
+                'results': res,
+                'model_results': model_res,
+                'full_pair_df': full_pair_df,
+                'sae_list': sae_list,
+                'stats_by_concept': stats_by_concept,
+                'surviving_concepts_first_sae': surviving_concepts,
+                'num_surviving_concepts_first_sae': len(surviving_concepts),
+                'mean_num_surviving_concepts': mean_surviving_concepts
+            }
+        )
+
+        print(f'{(mean_surviving_concepts * 100):.2f}% Surviving concepts found ({num_surviving_concepts}/{len(full_pair_df)} pairs)')
+    
+    return pd.DataFrame(stats)
+        

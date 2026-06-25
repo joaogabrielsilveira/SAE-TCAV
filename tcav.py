@@ -77,7 +77,7 @@ def get_tcav_scores(cavs: list[dict], grads: np.ndarray) -> dict[int, float]:
     return scores
 
 def extract_rule_conditions(path: str):
-    print(path)
+    # print(path)
     conds_list = []
     conditions = path.split(' AND ')
     for condition in conditions:
@@ -96,6 +96,10 @@ def extract_rule_conditions(path: str):
         elif '<' in condition:
             feat, thresh = condition.split(' < ')
             op = '<'
+        else:
+            print(condition)
+            input()
+            continue
         thresh = float(thresh.strip())
         conds_list.append((feat.strip(), op, thresh))
     
@@ -399,14 +403,14 @@ def compute_feature_associations(concept_activations: np.ndarray, X_features: np
     df = df.sort_values('cohens_d', key=lambda s: np.abs(s), ascending=False).reset_index(drop=True)
     return df, high_idx, low_idx
 
-def run_feature_association_dual_split(significant_factors: dict[int], tcav_eval_concept_activations: np.ndarray,
+def run_feature_association_dual_split(significant_factors: pd.DataFrame, tcav_eval_concept_activations: np.ndarray,
                                        held_out_concept_activations: np.ndarray, X_tcav_eval: np.ndarray, X_held_out: np.ndarray,
                                        feature_cols: list[str], quantile: float=0.1):
     fa_results_eval = {}
     fa_results_held_out = {}
     consistency_rows = []
 
-    for factor in significant_factors:
+    for factor in significant_factors['Factor']:
         print(f'Factor {factor}')
         factor_activations_tcav = tcav_eval_concept_activations[:, factor]
         df_fa_eval, _, _ = compute_feature_associations(concept_activations=factor_activations_tcav, X_features=X_tcav_eval, feature_names=feature_cols, quantile=quantile)
@@ -492,7 +496,7 @@ def evaluate_sparse_readout(sparse_result: dict[str], X_features: np.ndarray, co
 
     return {'r2': r2, 'correlation': corr}
 
-def run_sparse_readout_dual_split(significant_factors: dict[int], cav_train_concept_activations: np.ndarray,
+def run_sparse_readout_dual_split(significant_factors: pd.DataFrame, cav_train_concept_activations: np.ndarray,
                                   tcav_eval_concept_activations: np.ndarray, held_out_concept_activations: np.ndarray,
                                   X_cav_train: np.ndarray, X_tcav_eval: np.ndarray, X_held_out: np.ndarray,
                                   feature_cols: list[str], cv: int, overfit_drop_warn_threshold: float):
@@ -500,7 +504,7 @@ def run_sparse_readout_dual_split(significant_factors: dict[int], cav_train_conc
     sparse_readout_validation = {}
     summary_rows = []
 
-    for factor in significant_factors:
+    for factor in significant_factors['Factor']:
         cav_train_sparse_readout = sparse_readout(
             concept_activations=cav_train_concept_activations[:, factor],
             X_features=X_cav_train, feature_names=feature_cols, cv=cv
@@ -544,7 +548,7 @@ def run_sparse_readout_dual_split(significant_factors: dict[int], cav_train_conc
             }
         )
 
-    summary_df = pd.DataFrame(summary_rows).sort_values('concept').reset_index(drop=True)
+    summary_df = pd.DataFrame(summary_rows).sort_values('concept').reset_index()
     return sparse_readout_results, sparse_readout_validation, summary_df
 
 

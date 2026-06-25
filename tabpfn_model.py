@@ -138,11 +138,15 @@ def make_dist_tensor(dist_dom_np, model_add_x_device, example_add_shape):
 def walkforward_evaluate_tabpfn(drift_model: TabPFNClassifier, test_rows: pd.DataFrame,
                                 top_k_events: list[str], model_add_x_device: torch.device | str,
                                 train_years: list[int], batch_size_predict:int = 512,
-                                example_add_shape: Optional[Tuple[int, ...]] = None
+                                example_add_shape: Optional[Tuple[int, ...]] = None, use_cache: bool = True, test_years: list[int] | None = None
                                 ) -> dict[str, Any]:
     test_rows = ensure_test_feature_columns(test_rows, top_k_events)
 
     combined_years = sorted(set(train_years).union(set(test_rows['year'].astype(int).unique().tolist())))
+    if test_years is not None:
+        print(len(test_rows))
+        test_rows = test_rows[test_rows['year'].isin(test_years)]
+        print(len(test_rows))
     year_to_domain_combined = {y: i for i, y in enumerate(combined_years)}
     
     results_per_year: list[dict[str, Any]] = []
@@ -168,7 +172,7 @@ def walkforward_evaluate_tabpfn(drift_model: TabPFNClassifier, test_rows: pd.Dat
 
         preds_list = []
         t0_year = time.perf_counter()
-        if os.path.exists(year_file):
+        if use_cache and os.path.exists(year_file):
             print('Carregando resultados do arquivo salvo')
             with open(year_file, 'rb') as f:
                 results = load(f)
@@ -206,7 +210,6 @@ def walkforward_evaluate_tabpfn(drift_model: TabPFNClassifier, test_rows: pd.Dat
                         additional_x={"dist_shift_domain": dist_dom_t}
                     )
 
-
             if isinstance(preds_batch, torch.Tensor):
                 preds_batch = preds_batch.detach().cpu().numpy()
 
@@ -231,12 +234,14 @@ def walkforward_evaluate_tabpfn(drift_model: TabPFNClassifier, test_rows: pd.Dat
                 'infer_time_sec': float(t_infer_year)
             }
         print(f'Positivos: {np.mean(y_pred) * 100}%')
-        with open(year_file, 'wb') as f:
-            dump(results, f)
-            for i in range(min(5, len(preds_proba))):
-                print(results['y_pred_proba'][i], preds_proba[i], y_pred[i])
-        print(f'f1_macro: {results["f1_macro"]}, f1_pos: {results["f1_pos"]}')
-        print(f'Resultados de {eval_year} salvos em {year_file}')
+        if use_cache:
+            with open(year_file, 'wb') as f:
+                dump(results, f)
+                for i in range(min(5, len(preds_proba))):
+                    print(results['y_pred_proba'][i], preds_proba[i], y_pred[i])
+
+                print(f'f1_macro: {results["f1_macro"]}, f1_pos: {results["f1_pos"]}')
+                print(f'Resultados de {eval_year} salvos em {year_file}')
         preds_per_year.append((eval_year, results.pop('y_pred_proba')))
         results_per_year.append(results)
     return {
@@ -266,10 +271,10 @@ def batch_get_embeddings(model: TabPFNClassifier, X_all: np.ndarray, dist_full: 
             model_add_x_device=device,
             example_add_shape=example_add_shape
         )
-
+        
         try:
             emb_b = model.get_embeddings(xb, additional_x={'dist_shift_domain': dist_t})
-        except Exception:
+        except Exception as e:
             emb_b = model.get_embeddings(xb)
 
         if isinstance(emb_b, torch.Tensor):
@@ -345,13 +350,29 @@ def load_or_extract_embeddings(model: TabPFNClassifier, X_train_np: np.ndarray, 
                                embeddings_dir: str | Path, cfg:EmbeddingExtractConfig = EmbeddingExtractConfig(),
                                device: torch.device | str = 'cpu', example_add_shape: Optional[Tuple[int, ...]] = None
                                ) -> dict[str, np.ndarray]:
-    embeddings_dir = get_env_path(embeddings_dir)
+    if embeddings_dir is not None:
+        embeddings_dir = get_env_path(embeddings_dir)
 
-    p_train = TRAINING_EMBEDDING_FILE
-    p_test = TEST_EMBEDDING_FILE
-    # p_train_flat = embeddings_dir / "dr_tabpfn_train_emb_flat.npy"
-    # p_test_flat = embeddings_dir / "dr_tabpfn_test_emb_flat.npy"
-    # print(p_train, p_test)
+    if embeddings_dir is None or embeddings_dir == '':
+        p_train = TRAINING_EMBEDDING_FILE
+        p_test = TEST_EMBEDDING_FILE
+    else:
+        train_years, test_years = np.unique(years_train), np.unique(years_test)
+        if len(train_years) == 1:
+            train_year_str = f'{train_years[0]}'
+        else:
+            train_year_str = f'{np.min(train_years)}-{np.max(train_years)}'
+        
+        p_train = get_env_path(f'models/tabpfn/dr_tabpfn_train_emb({train_year_str}).npy')
+        
+        if len(test_years) == 1:
+            test_year_str = f'{test_years[0]}'
+        else:
+            test_year_str = f'{np.min(test_years)}-{np.max(test_years)}'
+        
+        p_test = get_env_path(f'models/tabpfn/dr_tabpfn_test_emb({test_year_str}).npy')
+
+    print(p_train, p_test)
     if cfg.use_cache and os.path.exists(p_train):
         train_emb = np.load(p_train)
     else:

@@ -4,21 +4,18 @@ import numpy as np
 from dotenv import load_dotenv
 load_dotenv()
 import torch
-from database import open_feather, get_vars, RENAL_DB_PATH, prepare_database, get_tabpfn_arrays, scale_df_data
+from database import open_feather, get_vars, RENAL_DB_PATH, prepare_database, get_tabpfn_arrays, scale_df_data, compare_distributions
 from sae import train_sae_model
 from tabpfn_model import fit_dr_tabpfn, walkforward_evaluate_tabpfn, TabPFNEvalConfig, load_or_extract_embeddings, \
     EmbeddingExtractConfig, scale_embeddings, scale_embeddings_l2, temporal_test_subsplits, TRAINING_EMBEDDING_FILE, TEST_EMBEDDING_FILE, PRED_PROB_FILE
-from decision_tree import train_binary_trees, get_binary_targets, extrair_regras_resumidas
+from decision_tree import train_binary_trees, get_binary_targets, extrair_regras_resumidas, get_rules_forced
 from tcav import train_cavs_from_rules, get_model_gradients, get_tcav_scores, robust_tcav_significance_test, run_feature_association_dual_split, run_sparse_readout_dual_split
 from filepaths import get_env_path
 from pickle import dump, load
 import os
 import pandas as pd
 from tabpfn import TabPFNClassifier
-from sklearn import tree as sktree
-from decision_tree import extrair_regras_positivas
 from results import cid10_dict, translate_event_name, events_dict, tcav_result_df_from_concepts, translate_event_names
-# from TCAV.renal_framework.src.tabpfn_pipeline.evaluation import walkforward_evaluate_tabpfn
 
 PREPARED_DB_PATH = get_env_path('data/renal/prep.pkl')
 
@@ -48,17 +45,47 @@ if __name__ == '__main__':
     y_test_np = tabpfn_arrays['y_test']
     years_test_np = tabpfn_arrays['years_test']
 
+    cut_features = False
+    
+    feature_cols = list(np.asarray(top_k_events))
+    X_train_df = train_rows[feature_cols].copy()
+    X_test_df = test_rows[feature_cols].copy()
+
+    data_shift_df, features_to_keep, features_to_keep_name = compare_distributions(x_i=X_train_np, x_j=X_test_np, top_k_events=top_k_events)
+    
+    X_train_start = train_rows[train_rows['year'] == 2000][feature_cols].to_numpy()
+    X_train_end = train_rows[train_rows['year'] == max(years_train_np)][feature_cols].to_numpy()
+
+    data_shift_train, _, _ = compare_distributions(X_train_start, X_train_end, top_k_events)
+
+    X_test_start = test_rows[test_rows['year'] == min(years_test_np)][feature_cols].to_numpy()
+    X_test_end = test_rows[test_rows['year'] == max(years_test_np)][feature_cols].to_numpy()
+
+    data_shift_test, _, _ = compare_distributions(X_test_start, X_test_end, top_k_events)
+
+    data_shift_df.to_csv('data_shift.csv')
+    data_shift_train.to_csv('data_shift_train.csv')
+    data_shift_test.to_csv('data_shift_test.csv')
+
+    if not cut_features:
+        features_to_keep = np.ones(len(top_k_events), dtype=bool)
+        features_to_keep_name = top_k_events
+    
+    X_train_np = X_train_np[:, features_to_keep]
+    X_test_np = X_test_np[:, features_to_keep]
+
+    train_rows = train_rows[features_to_keep_name + ['patient_id', 'year', 'DEATH']]
+    test_rows = test_rows[features_to_keep_name + ['patient_id', 'year', 'DEATH']]
+
     # print(f'years_train: {years_train_np.shape}')
     # print(f'years_test: {years_test_np.shape}')
-
-    #print("train_rows:", train_rows.shape)
-    #print("test_rows :", test_rows.shape)
-    #print("n top_k_events:", len(top_k_events))
-    #print("train_years:", np.unique(years_train_np))
-    #print("test_years :", np.unique(years_test_np))
-
-    #print("X_train_np:", X_train_np.shape)
-    #print("y_train_np:", y_train_np.shape, "| pos_ratio:", y_train_np.mean())
+    # print("train_rows:", train_rows.shape)
+    # print("test_rows :", test_rows.shape)
+    # print("n top_k_events:", len(top_k_events))
+    # print("train_years:", np.unique(years_train_np))
+    # print("test_years :", np.unique(years_test_np))
+    # print("X_train_np:", X_train_np.shape)
+    # print("y_train_np:", y_train_np.shape, "| pos_ratio:", y_train_np.mean())
 
     eval_cfg = TabPFNEvalConfig()
     fit_out = fit_dr_tabpfn(X_train_np, y_train_np, years_train_np, eval_cfg)
@@ -79,21 +106,16 @@ if __name__ == '__main__':
         model_add_x_device=model_add_x_device,
         batch_size_predict=512,
         example_add_shape=example_add_shape,
+        use_cache=True
     )
 
     results_per_year = wf["results_per_year"]
     year_to_domain_combined = wf["year_to_domain_combined"]
-    test_rows_checked = wf["test_rows_checked"]
+    # test_rows_checked = wf["test_rows_checked"]
+    test_rows_checked = test_rows
 
-    results_df = pd.DataFrame(results_per_year).sort_values("year").reset_index(drop=True)
+    # results_df = pd.DataFrame(results_per_year).sort_values("year").reset_index(drop=True)
     # print(results_df)
-
-    feature_cols = list(top_k_events)
-    X_train_df = train_rows[feature_cols].copy()
-    X_test_df = test_rows[feature_cols].copy()
-
-    # print(f'X_train_df: {X_train_df.shape}')
-    # print(f'X_test_df : {X_test_df.shape}')
 
     scaler, X_train_df, X_test_df = scale_df_data(
         X_train_df, X_test_df, feature_cols
@@ -110,21 +132,48 @@ if __name__ == '__main__':
         years_train=years_train_np,
         years_test=years_test_np,
         year_to_domain_map=year_to_domain_combined,
-        embeddings_dir="",
+        embeddings_dir=None,
         cfg=emb_cfg,
         device=model_add_x_device,
         example_add_shape=example_add_shape,
     )
 
+    embedding_info = {
+        'model': drift_model,
+        'X_test_df': test_rows,
+        'ytd_map': year_to_domain_combined,
+        'years_test_np': years_test_np,
+        'device': model_add_x_device,
+        'example_add_shape': example_add_shape, 
+        'cfg': emb_cfg
+    }
+
     train_emb = emb_out['train_emb_flat'].astype(np.float32)
     test_emb = emb_out['test_emb_flat'].astype(np.float32)
+
+    mean_train = np.mean(train_emb, axis=0)
+    std_train = np.std(train_emb, axis=0)
+
+    mean_test = np.mean(test_emb, axis=0)
+    std_test = np.std(test_emb, axis=0)
+
+    rows = []
+    for idx in range(train_emb.shape[1]):
+        rows.append({
+            'Factor index': idx,
+            'Mean diff': abs(mean_train[idx] - mean_test[idx]),
+            'Std diff': abs(std_train[idx] - std_test[idx]),
+            'Training mean': mean_train[idx], 'Training std': std_test[idx],
+            'Test mean': mean_test[idx], 'Test std': std_test[idx]
+        })
+    data_shift_df = pd.DataFrame(rows)
+    with open('embeddings_shift.csv', 'wb') as f:
+        data_shift_df.to_csv(f)
 
     #print(np.mean(train_emb), np.mean(test_emb))
 
     #train_emb_scaled, test_emb_scaled = scale_embeddings_l2(train_emb, test_emb)
     train_emb_scaled, test_emb_scaled = scale_embeddings(train_emb, test_emb)
-    # print(train_emb_scaled.dtype, train_emb_scaled.mean(), train_emb_scaled.var())
-    # print(test_emb_scaled.mean(), test_emb_scaled.var())
 
     y_test = (test_rows["DEATH"] > 0).astype(int).to_numpy(copy=True)
     split_idx = temporal_test_subsplits(
@@ -155,29 +204,107 @@ if __name__ == '__main__':
     emb_tcav_eval = test_emb_scaled[idx_test_tcav_eval]
     emb_discovery = test_emb_scaled[idx_test_discover]
 
-    from sae_compare import run_sae_random_comparison, plot_run_results
+    from sae_compare import run_sae_random_comparison, plot_run_results, run_random_comparison_year_differences
     import matplotlib.pyplot as plt
     inputs = emb_discovery
     pair_criteria = 'cos_sim'
+    model_type = 'ReLU'
     model_n = range(3, 15)
-    alphas = [1e-1, 3e-1, 5e-1, 1]
+    alphas = [1.0]
+    ks = [8]
     scaling_factors = [1.5]
-    res, model_res = run_sae_random_comparison(
+    run_random_comparison_year_differences(
         model_nums=model_n,
-        alphas=alphas,
+        hyper_params=alphas if model_type == 'ReLU' else ks,
+        scaling_factors=scaling_factors,
+        embedding_info=embedding_info,
+        model_type=model_type,
+        feature_cols=feature_cols,
+        years=years_test_np
+    )
+    exit()
+    res, model_res, full_pair_df, sae_list = run_sae_random_comparison(
+        model_nums=model_n,
+        hyper_params=alphas if model_type == 'ReLU' else ks,
         embs=inputs, 
         scaling_factors=scaling_factors, 
-        model_type='ReLU',
-        pair_criteria=pair_criteria    
+        model_type=model_type,
+        pair_criteria=pair_criteria,
     )
+    pd.set_option('display.max_rows', 20)
+    full_pair_df['is_relevant_pair'] = full_pair_df[pair_criteria] >= 0.7
+    original_sae_df = full_pair_df[full_pair_df['sae_i_idx'] == 0].copy()
 
-    for alpha in alphas:
-        plot_run_results(full_results=res, model_results=model_res, alpha=alpha,
-                         scaling_factors=scaling_factors, model_n=model_n, pair_criteria=pair_criteria)
+    stats_by_concept = original_sae_df.groupby('original_concept').agg(
+        survival_rate=('is_relevant_pair', 'mean'),
+        mean_cos_sim=('cos_sim', 'mean'),
+        mean_overlap=('overlap', 'mean')
+    ).reset_index().sort_values('survival_rate', ascending=False)
 
-    exit()
-    sae_codes_train = sae.encode(torch.tensor(emb_discovery)).cpu().detach().numpy()
-    sae_codes_test = sae.encode(torch.tensor(test_emb_scaled[idx_test_cav_train])).cpu().detach().numpy()
+    surviving_concepts = stats_by_concept[stats_by_concept['survival_rate'] > 0.0]
+
+    if pair_criteria == 'overlap':
+        stats_sorted = stats_by_concept.sort_values('mean_overlap', ascending=True)
+        print(stats_sorted)
+        x = range(len(stats_sorted))
+        y = stats_sorted['mean_cos_sim'].tolist()
+
+        fig, ax = plt.subplots(figsize=(7, 7))
+        ax.plot(x, y)
+        ax.set_title('Mean cos_sim by concepts (ordered by overlap)')
+        ax.set_xlabel('Higher overlap ---->')
+        with open('cos_sim_graph.png', 'wb') as f:
+            plt.savefig(f)
+    else:
+        stats_sorted = stats_by_concept.sort_values('mean_cos_sim', ascending=True)
+        print(stats_sorted)
+        x = range(len(stats_sorted))
+        y = stats_sorted['mean_overlap'].tolist()
+        fig, ax = plt.subplots(figsize=(7, 7))
+        ax.plot(x, y)
+        ax.set_title('Mean overlap by concepts (ordered by cos_sim)')
+        ax.set_xlabel('Higher cos_sim ---->')
+        with open('overlap_graph.png', 'wb') as f:
+            plt.savefig(f)
+
+    pair_sae_idx = 1
+    original_sae_first_pairing_df = original_sae_df[original_sae_df['sae_j_idx'] == pair_sae_idx].copy()
+
+    first_pairing_survivors = original_sae_first_pairing_df[original_sae_first_pairing_df['is_relevant_pair'] == True]
+    original_survivors = first_pairing_survivors['original_concept'].tolist()
+    pairs = first_pairing_survivors['best_pair'].tolist()
+
+    with open(f'surviving_concepts_{model_type}_sae.pkl', 'wb') as out:
+        dump(surviving_concepts, out)
+    if model_type == 'ReLU':
+        for alpha in alphas:
+            plot_run_results(full_results=res, model_results=model_res, hyper_param=alpha,
+                            scaling_factors=scaling_factors, model_n=model_n, pair_criteria=pair_criteria, model_type=model_type)
+    if model_type == 'TopK':
+        for k in ks:
+            plot_run_results(full_results=res, model_results=model_res, hyper_param=k,
+                            scaling_factors=scaling_factors, model_n=model_n, pair_criteria=pair_criteria, model_type=model_type)
+            
+    sae = sae_list[0]['model']
+    codes_train_tensor = []
+    codes_test_tensor = []
+    for s in sae_list:
+        model = s['model']
+        if model_type == 'TopK':
+            sae_codes_train = model.encode(x=torch.tensor(inputs))[1].cpu().detach().numpy()
+            sae_codes_test = model.encode(torch.tensor(test_emb_scaled[idx_test_cav_train]))[1].cpu().detach().numpy()
+        else:
+            sae_codes_train = model.encode(x=torch.tensor(inputs)).cpu().detach().numpy()
+            sae_codes_test = model.encode(torch.tensor(test_emb_scaled[idx_test_cav_train])).cpu().detach().numpy()
+        
+        codes_train_tensor.append(sae_codes_train)
+        codes_test_tensor.append(sae_codes_test)
+    
+    codes_train_tensor = np.asarray(codes_train_tensor, dtype=np.float32)
+    codes_test_tensor = np.asarray(codes_test_tensor, dtype=np.float32)
+
+    sae_codes_train = codes_train_tensor[0]
+    sae_codes_test = codes_test_tensor[0]
 
     sparsity_level = (sae_codes_train <= 1e-5).mean()
     active_per_sample = (sae_codes_train > 1e-5).sum(axis=1).mean()
@@ -201,12 +328,47 @@ if __name__ == '__main__':
     X_feat_tree_train = X_cav_train_df.iloc[idx_tree_train].copy().to_numpy()
     X_cav_final_df = X_cav_train_df.iloc[idx_cav_final_train].reset_index(drop=True)
 
-    # print("X_feat_dt_train:", X_feat_tree_train.shape)
-    # print("codes_dt_train:", embeddings_dt.shape)
-    
-    tree_rules = train_binary_trees(embeddings_dt, X_feat_tree_train, feature_cols)
+    tree_rules = train_binary_trees(embeddings_dt, X_feat_tree_train, feature_cols, model_type=model_type)
     best_p = max(tree_rules.keys(), key=lambda p: len(tree_rules[p]))
     rules_df = pd.DataFrame(tree_rules[best_p])
+
+    forced_rules = get_rules_forced(train_activations=embeddings_dt,
+                                    X=X_feat_tree_train,
+                                    surviving_concepts=original_survivors, 
+                                    tree_rules_df=rules_df, 
+                                    perc=best_p, feature_names=feature_cols, model_type=model_type
+                                )
+
+    original_concept_rules = pd.DataFrame(forced_rules)[['Factor', 'Rule', 'Precision', 'Recall']]
+    print(original_concept_rules)
+    original_concept_rules = original_concept_rules.rename(columns={'Factor': 'original_concept', 'Rule': 'original_rule', 'Precision': 'original_prec', 'Recall': 'original_rec'})
+    original_concept_rules = pd.merge(
+        left=original_concept_rules,
+        right=original_sae_first_pairing_df[['original_concept', 'cos_sim', 'overlap']],
+        how='inner',
+        on='original_concept'
+    )
+
+    pair_concept_rules = pd.DataFrame(get_rules_forced(train_activations=(codes_test_tensor[pair_sae_idx])[idx_tree_train], X=X_feat_tree_train, surviving_concepts=pairs, tree_rules_df=None, perc=best_p, feature_names=feature_cols, model_type=model_type))
+    pair_concept_rules = pair_concept_rules[['Factor', 'Rule', 'Precision', 'Recall']]
+    pair_concept_rules = pair_concept_rules.rename(columns={'Factor': 'pair_concept', 'Rule': 'pair_rule', 'Precision': 'pair_prec', 'Recall': 'pair_rec'})
+
+    rules_paired_df = pd.concat([original_concept_rules, pair_concept_rules], axis=1).dropna()
+    rules_paired_df['original_rule'] = [translate_event_names(full_text=rule, cid_dict=cid) for rule in rules_paired_df['original_rule']]
+    rules_paired_df['pair_rule'] = [translate_event_names(full_text=rule, cid_dict=cid) for rule in rules_paired_df['pair_rule']]
+
+    with open(f'paired_rules_{model_type}_sae.pkl', 'wb') as out:
+        dump(rules_paired_df, out)
+    print(rules_paired_df)
+
+    forced_rules_df = pd.DataFrame(forced_rules)
+
+    with open(f'forced_rules_{model_type}_sae.pkl', 'wb') as out:
+        dump(forced_rules_df, out)
+
+    all_rules_df = pd.concat([rules_df, forced_rules_df])
+    for info in forced_rules:
+        tree_rules[best_p].append(info)
 
     embeddings_cav = test_emb_scaled[idx_test_cav_train]
     embeddings_cav_training = embeddings_cav[idx_cav_final_train]
@@ -222,6 +384,7 @@ if __name__ == '__main__':
                                  cav_train_emb_encoded=embeddings_cav_training_encoded, y_cav_train=y_cav_training,
                                  feature_cols=feature_cols, emb_scaler=scaler, high_quantile=high_quantile, min_pos_samples=50, random_state=42)
     tcav_scores = get_tcav_scores(cavs=cavs.values(), grads=grads)
+
     for cav in cavs.values():
         idx = cav['Factor']
         cav['TCAV_score'] = tcav_scores[idx]
@@ -243,9 +406,6 @@ if __name__ == '__main__':
             sample_fraction=1.0, rng_seed=42
         )
         robust_tcav_results[idx] = robust_result
-        if robust_result['is_significant']:
-            # print(f'Factor {idx}: p={robust_result["p_value"]}, t={robust_result["t_stat"]}')
-            pass
     
     significant_concepts = {}
     for idx in cavs:
@@ -255,20 +415,43 @@ if __name__ == '__main__':
             significant_concepts[idx]['t_stat'] = robust_tcav_results[idx]['t_stat']
             significant_concepts[idx]['Precision'] = cavs[idx]['Precision']
             significant_concepts[idx]['Recall'] = cavs[idx]['Recall']
-
-    for idx, info in significant_concepts.items():
-        # print(f'Factor {idx} (TCAV = {info["TCAV_score"]}): {info["Rule"]}')
-        # print(f'p={robust_tcav_results[idx]["p_value"]}, t={robust_tcav_results[idx]["t_stat"]}')
-        continue
     
+    significant_df = pd.DataFrame([val for _, val in significant_concepts.items()])
+
+    significant_concepts = pd.merge(
+        significant_df,
+        stats_by_concept,
+        left_on='Factor',
+        right_on='original_concept',
+        how='inner'
+    )
+    significant_concepts['translated_rule'] = [translate_event_names(full_text=rule, cid_dict=cid) for rule in significant_concepts['Rule']]
+
     print(f'Total de fatores significativos encontrados: {len(significant_concepts)}')
-    for idx, info in significant_concepts.items():
-        print(f'Factor {info["Factor"]}: Precision={info["Precision"]:.4f}, Recall={info["Recall"]:.4f}')
-        print(f'TCAV_score={info["TCAV_score"]:.2f} ({"PREVENÇÃO" if info["TCAV_score"] < 0.4 else "RISCO"}), p_value={info["p_value"]:.4f}, t_stat={info["t_stat"]:.4f}')
-        print(f'Rule: {translate_event_names(full_text=info["Rule"], cid_dict=cid)}')
+    for idx, row in significant_concepts.iterrows():
+        print(f'Factor {row["Factor"]}: Precision={row["Precision"]:.4f}, Recall={row["Recall"]:.4f}')
+        print(f'TCAV_score={row["TCAV_score"]:.2f} ({"PREVENÇÃO" if row["TCAV_score"] < 0.4 else "RISCO"}), p_value={row["p_value"]:.4f}, t_stat={row["t_stat"]:.4f}')
+        print(f'Survival rate: {(row["survival_rate"] * 100):.2f}%')
+        print(f'Mean cosine similarity: {row["mean_cos_sim"]:.4f}, Mean overlap: {row["mean_overlap"]:.4f}')
+        print(f'Rule: {row["translated_rule"]}')
         print()
-    # tcav_df = tcav_result_df_from_concepts(significant_concepts)
-    # print(tcav_df)
+    
+    graph_columns = ['Factor', 'Precision', 'Recall', 'TCAV_score', 'survival_rate', 'mean_cos_sim', 'mean_overlap', 'translated_rule']
+    with open(f'significant_factors_{model_type}_sae.pkl', 'wb') as out:
+        dump(significant_concepts[graph_columns], out)
+    
+    num_latents = int(192 * max(scaling_factors))
+    non_zero_concept_mask = ~(np.all(sae_codes_train <= 1e-5, axis=0))
+    remaining_concepts = [i for i in range(num_latents) if (i not in significant_concepts['Factor']) and (i not in surviving_concepts) and (non_zero_concept_mask[i] == True)]
+    np.random.seed(42)
+    random_concepts = np.random.choice(remaining_concepts, size=len(original_survivors), replace=False)
+    forced_random_rules = get_rules_forced(train_activations=embeddings_dt, X=X_feat_tree_train, surviving_concepts=random_concepts,
+                                           tree_rules_df=None, perc=best_p, feature_names=feature_cols, model_type=model_type)
+
+    print(pd.DataFrame(forced_random_rules))
+    print(f'Regras geradas por conceitos aleatorios: {len(forced_random_rules)}/{len(random_concepts)}')
+    print(f'Regras geradas por conceitos pareados  : {len(original_concept_rules)}/{len(original_survivors)}')
+    exit()
 
     tcav_eval_t = torch.tensor(test_emb_scaled[idx_test_tcav_eval])
     tcav_eval_concept_activations = sae.encode(tcav_eval_t).detach().cpu().numpy()
@@ -283,10 +466,6 @@ if __name__ == '__main__':
     X_tcav_eval = X_test_df.to_numpy()[idx_test_tcav_eval]
     X_held_out = X_test_df.to_numpy()[idx_test_held_out]
     X_cav_train = X_test_df.to_numpy()[idx_test_cav_train]
-
-    # print("tcav_eval_concept_activations:", tcav_eval_concept_activations.shape)
-    # print("held_out_concept_activations :", held_out_concept_activations.shape)
-    # print("cav_train_concept_activations:", cav_train_concept_activations.shape)
 
     fa_results_eval, fa_results_held_out, consistency_df = run_feature_association_dual_split(
         significant_factors=significant_concepts,
