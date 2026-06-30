@@ -1,4 +1,4 @@
-from sae import train_sae_model
+from sae import SAE, train_sae_model
 import torch
 import numpy as np
 import pandas as pd
@@ -235,7 +235,7 @@ def run_sae_random_comparison(model_nums: list[int], hyper_params: list[int | fl
                 sae_list = train_all_saes(num_models=max(model_nums), embs=embs, k=a, k_aux=4*a, scaling_factor=m, model_type=model_type)
             match_matrix = get_all_pairwise_matchings(num_models=max(model_nums), sae_list=sae_list, pair_criteria=pair_criteria)
             for n in model_nums:
-                print(f'Calculating matching stats for the first {n} models')
+                # print(f'Calculating matching stats for the first {n} models')
                 full_df = get_full_run_df(match_matrix=match_matrix, n_models=n)
                 run_stats = get_matching_stats(full_df, pair_criteria=pair_criteria, relevant_pair_threshold=relevant_pair_threshold)
                 model_stats = get_model_stats(sae_list)
@@ -366,56 +366,66 @@ def plot_run_results(full_results: dict[tuple[int, int, int]], model_results: di
         plt.savefig(f'stats/sae/{model_type}/good_pairs_{pair_criteria}[{hyper}={hyper_param}].png', bbox_inches='tight')
     
 
-def run_random_comparison_year_differences(model_nums: list[int], hyper_params: list[int | float], scaling_factors: list[float], pair_criteria: str='cos_sim', relevant_pair_threshold: float=0.7, model_type: str='ReLU',
-                                            embedding_info: dict[str] = None, years: list[int] | np.ndarray = None, feature_cols: list[str] = None):
+def run_random_comparison_year_differences(model_nums: list[int], hyper_param: int | float, scaling_factor: float, pair_criteria: str='cos_sim', relevant_pair_threshold: float=0.7, model_type: str='ReLU',
+                                            embedding_info: dict[str] = None, years: np.ndarray | np.ndarray = None, feature_cols: list[str] = None):
     
     X_test_df = embedding_info['X_test_df']
     ytd_map = embedding_info['ytd_map']
 
     years_unique = np.unique(years)
     train_year = years_unique[0]
-    # eval_cfg = TabPFNEvalConfig()
-    # fit_out = fit_dr_tabpfn(X_test_df[X_test_df['year'] == train_year][feature_cols], np.asarray((X_test_df[X_test_df['year'] == train_year])['DEATH'] > 0, dtype=np.int32), train_years=years[X_test_df['year'] == train_year], eval_cfg=eval_cfg)
-    # drift_model: TabPFNClassifier = fit_out["model"]
-    # model_add_x_device = fit_out["model_add_x_device"]
-    # example_add_shape = fit_out["example_add_shape"]
 
-    drift_model = embedding_info['model']
-    model_add_x_device = embedding_info['device']
-    example_add_shape = embedding_info['example_add_shape']
+    X_train_df = X_test_df[X_test_df['year'] == train_year]
 
-    stats = []
+    pos_samples = X_train_df[X_train_df['DEATH'] > 0]
+    neg_cases = X_train_df[X_train_df['DEATH'] == 0]
+
+    neg_samples = neg_cases.sample(n=len(pos_samples), random_state=42)
+    X_train_balanced = pd.concat([pos_samples, neg_samples], axis=0).sample(frac=1, random_state=42)
+
+    y_train_balanced = np.asarray(X_train_balanced['DEATH'] > 0, dtype=np.int32)
+    X_train_np = np.asarray(X_train_balanced[feature_cols])
+    years_train = years[X_train_balanced.index]
+
+    eval_cfg = TabPFNEvalConfig()
+    fit_out = fit_dr_tabpfn(X_train_balanced[feature_cols], y_train_balanced, train_years=years_train, eval_cfg=eval_cfg)
+    drift_model: TabPFNClassifier = fit_out["model"]
+    model_add_x_device = fit_out["model_add_x_device"]
+    example_add_shape = fit_out["example_add_shape"]
+
+    concept_stats = []
+    eval_stats = []
+    baseline_comparison = []
+    baseline_model: SAE = None
     for dist, year in enumerate(years_unique):
         test_year = train_year + dist
-        print(f'Extracting embeddings for training: {train_year}, test: {test_year}')
+        print(f'Extracting stats for training: {train_year}, test: {test_year}')
 
-        X_train_np = X_test_df[X_test_df['year'] == train_year][feature_cols]
         X_test_np = X_test_df[X_test_df['year'] == test_year][feature_cols]
-
-        assert(len(X_train_np) == (X_test_df['year'] == train_year).sum())
         assert(len(X_test_np) == (X_test_df['year'] == test_year).sum())
 
         years_train = years[X_test_df['year'] == train_year]
         years_test = years[X_test_df['year'] == test_year]
 
-        wf = walkforward_evaluate_tabpfn(
-            drift_model=drift_model,
-            test_rows=X_test_df,
-            test_years = [test_year],
-            top_k_events=feature_cols,
-            train_years=years_train,
-            model_add_x_device=model_add_x_device,
-            batch_size_predict=512,
-            example_add_shape=example_add_shape,
-            use_cache=False
-        )
+        # wf = walkforward_evaluate_tabpfn(
+        #     drift_model=drift_model,
+        #     test_rows=X_test_df,
+        #     test_years=[test_year],
+        #     top_k_events=feature_cols,
+        #     train_years=[train_year],
+        #     model_add_x_device=model_add_x_device,
+        #     batch_size_predict=512,
+        #     example_add_shape=example_add_shape,
+        #     use_cache=False
+        # )
 
-        input()
-        results_per_year = wf["results_per_year"]
-        results_df = pd.DataFrame(results_per_year).sort_values("year").drop('y_pred_bin', axis=1).reset_index(drop=True)
-        print(results_df)
+        # results_per_year = wf["results_per_year"]
+        # results_df = pd.DataFrame(results_per_year).sort_values("year").drop('y_pred_bin', axis=1).reset_index(drop=True)
+        # eval_stats.append(results_df)
+        # print(results_df)
 
         emb_cfg = EmbeddingExtractConfig()
+        emb_cfg.use_cache = True
         emb_out = load_or_extract_embeddings(
             model=drift_model,
             X_train_np=X_train_np,
@@ -426,33 +436,49 @@ def run_random_comparison_year_differences(model_nums: list[int], hyper_params: 
             embeddings_dir='test',
             cfg=emb_cfg,
             device=model_add_x_device,
-            example_add_shape=example_add_shape
+            example_add_shape=example_add_shape,
         )
 
         train_emb = emb_out['train_emb_flat'].astype(np.float32)
         test_emb = emb_out['test_emb_flat'].astype(np.float32)
 
-        train_emb_scaled, test_emb_scaled = scale_embeddings(train_emb, test_emb)
-        y_test = ((X_test_df[X_test_df['year'] == test_year])["DEATH"] > 0).astype(int).to_numpy(copy=True)
-        split_idx = temporal_test_subsplits(
-            y_test,
-            42
-        )
+        train_emb_scaled, test_emb_scaled = scale_embeddings(train_emb, test_emb, fit_test=True)
 
-        idx_test_discover = split_idx["idx_test_discover"]
-        emb_discovery = test_emb_scaled[idx_test_discover]
-        embs = emb_discovery
-
+        print(f'Embs: mean={test_emb_scaled.mean()}, Std={test_emb_scaled.std()}')
         res, model_res, full_pair_df, sae_list = run_sae_random_comparison(
             model_nums=model_nums,
-            hyper_params=hyper_params,
-            embs=embs, 
-            scaling_factors=scaling_factors, 
+            hyper_params=[hyper_param],
+            embs=test_emb_scaled, 
+            scaling_factors=[scaling_factor], 
             model_type=model_type,
             pair_criteria=pair_criteria,
         )
 
-        pd.set_option('display.max_rows', 20)
+        if dist == 0:
+            # modelo treinado com dados do primeiro ano do período
+            baseline_model = sae_list[0]['model']
+            model_device = next(baseline_model.parameters()).device
+
+        embs_t = torch.tensor(test_emb_scaled, dtype=torch.float32, device=model_device)
+        year_codes = baseline_model.encode(embs_t)
+        year_mse = torch.nn.functional.mse_loss(baseline_model.decode(year_codes), embs_t).item()
+        dead_neurons = ((year_codes <= 1e-5).all(dim=0).sum().item())
+        dead_neurons_perc = dead_neurons / year_codes.shape[1]
+        active_per_sample = ((year_codes > 1e-5).to(dtype=torch.float32)).sum(dim=1).mean().item()
+        sparsity = ((year_codes <= 1e-5).to(dtype=torch.float32)).mean().item()
+        total_latents = embs_t.shape[1] * scaling_factor
+        # weights = sae_list[0]['encoder_weights']
+
+        print(f'MSE (SAE: {train_year}, Embeddings: {year}): {year_mse:.4f}')
+        baseline_comparison.append({
+            'sae_train_year': train_year,
+            'sae_codes_year': year,
+            'mse': year_mse,
+            'dead_neurons': dead_neurons_perc,
+            'active_per_sample': active_per_sample,
+            'sparsity': sparsity
+        })
+
         full_pair_df['is_relevant_pair'] = full_pair_df[pair_criteria] >= 0.7
         num_surviving_concepts = full_pair_df['is_relevant_pair'].sum()
         mean_surviving_concepts = full_pair_df['is_relevant_pair'].mean()
@@ -467,7 +493,7 @@ def run_random_comparison_year_differences(model_nums: list[int], hyper_params: 
 
         surviving_concepts = stats_by_concept[stats_by_concept['survival_rate'] > 0.0]
 
-        stats.append(
+        concept_stats.append(
             {
                 'train_year': train_year,
                 'test_year': test_year,
@@ -475,14 +501,21 @@ def run_random_comparison_year_differences(model_nums: list[int], hyper_params: 
                 'model_results': model_res,
                 'full_pair_df': full_pair_df,
                 'sae_list': sae_list,
+                'train_emb': train_emb_scaled,
+                'test_emb': test_emb_scaled,
+                'test_emb_code': embs_t,
                 'stats_by_concept': stats_by_concept,
                 'surviving_concepts_first_sae': surviving_concepts,
                 'num_surviving_concepts_first_sae': len(surviving_concepts),
-                'mean_num_surviving_concepts': mean_surviving_concepts
+                'mean_fraction_surviving_concepts': mean_surviving_concepts,
+                'true_retention_rate': mean_surviving_concepts * total_latents / (total_latents - dead_neurons),
             }
         )
 
         print(f'{(mean_surviving_concepts * 100):.2f}% Surviving concepts found ({num_surviving_concepts}/{len(full_pair_df)} pairs)')
     
-    return pd.DataFrame(stats)
+    if eval_stats:
+        return pd.DataFrame(concept_stats), pd.concat(eval_stats, axis=0), pd.DataFrame(baseline_comparison)
+    else:
+        return pd.DataFrame(concept_stats), None, pd.DataFrame(baseline_comparison)
         

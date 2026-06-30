@@ -173,7 +173,7 @@ if __name__ == '__main__':
     #print(np.mean(train_emb), np.mean(test_emb))
 
     #train_emb_scaled, test_emb_scaled = scale_embeddings_l2(train_emb, test_emb)
-    train_emb_scaled, test_emb_scaled = scale_embeddings(train_emb, test_emb)
+    train_emb_scaled, test_emb_scaled = scale_embeddings(train_emb, test_emb, fit_test=False)
 
     y_test = (test_rows["DEATH"] > 0).astype(int).to_numpy(copy=True)
     split_idx = temporal_test_subsplits(
@@ -213,16 +213,7 @@ if __name__ == '__main__':
     alphas = [1.0]
     ks = [8]
     scaling_factors = [1.5]
-    run_random_comparison_year_differences(
-        model_nums=model_n,
-        hyper_params=alphas if model_type == 'ReLU' else ks,
-        scaling_factors=scaling_factors,
-        embedding_info=embedding_info,
-        model_type=model_type,
-        feature_cols=feature_cols,
-        years=years_test_np
-    )
-    exit()
+
     res, model_res, full_pair_df, sae_list = run_sae_random_comparison(
         model_nums=model_n,
         hyper_params=alphas if model_type == 'ReLU' else ks,
@@ -328,6 +319,63 @@ if __name__ == '__main__':
     X_feat_tree_train = X_cav_train_df.iloc[idx_tree_train].copy().to_numpy()
     X_cav_final_df = X_cav_train_df.iloc[idx_cav_final_train].reset_index(drop=True)
 
+    concept_retention_stats, eval_stats, baseline_comparison = run_random_comparison_year_differences(
+        model_nums=model_n,
+        hyper_param=alphas[0] if model_type == 'ReLU' else ks[0],
+        scaling_factor=scaling_factors[0],
+        embedding_info=embedding_info,
+        model_type=model_type,
+        feature_cols=feature_cols,
+        years=years_test_np
+    )
+
+    filtered_retention = concept_retention_stats[['train_year', 'test_year', 'mean_fraction_surviving_concepts', 'true_retention_rate']]
+    filtered_baseline = baseline_comparison[['sae_codes_year', 'mse', 'dead_neurons', 'active_per_sample', 'sparsity']]
+
+    full_drift_df = pd.merge(
+        left=filtered_retention,
+        right=filtered_baseline,
+        how='left',
+        left_on='test_year',
+        right_on='sae_codes_year'
+    )
+    print(full_drift_df)
+    for idx, row in concept_retention_stats.iterrows():
+        surviving_concepts = row['surviving_concepts_first_sae'].copy()
+        input('shape embs: ', (row['test_emb_code']).shape)
+        year = int(row['test_year'])
+        forced_rules = get_rules_forced(train_activations=row['test_emb_code'],
+                                    X=X_test_np[test_rows['year'] == year],
+                                    surviving_concepts=surviving_concepts['original_concept'].tolist(), 
+                                    tree_rules_df=None, 
+                                    perc=90, feature_names=feature_cols, model_type=model_type
+                                )
+        print(forced_rules)
+        with open(f'concept_rules_{year}.pkl', 'wb') as f:
+            dump(forced_rules, f)
+
+    with open('concept_retention_per_year.pkl', 'wb') as f:
+        dump(full_drift_df, f)
+    with open('model_performance_per_year.pkl', 'wb') as f:
+        dump(eval_stats, f)
+    
+    fig, ax = plt.subplots()
+    ax.plot(np.unique(years_test_np).tolist(), concept_retention_stats['mean_fraction_surviving_concepts'].tolist())
+    ax.set_title(f'Retention on concepts learned with drifting data for SAE trained with {full_drift_df["train_year"].astype(int).max()} data', wrap=True)
+    plt.savefig('retention_over_time.png')
+
+    # if eval_stats is not None:
+    #     ax.plot(np.unique(years_test_np).tolist(), eval_stats['f1_macro'].tolist())
+    #     ax.plot(np.unique(years_test_np).tolist(), eval_stats['f1_pos'].tolist())
+
+    fig, ax = plt.subplots()
+    ax.plot(np.unique(years_test_np).tolist(), baseline_comparison['mse'].tolist())
+    ax.set_title(f'Reconstruction error for drifting data', wrap=True)
+    plt.savefig('reconstruction_loss_over_time.png')
+    fig, ax = plt.subplots()
+    ax.plot(np.unique(years_test_np).tolist(), baseline_comparison['dead_neurons'].tolist())
+    plt.savefig('dead_neurons_over_time.png')
+    exit()
     tree_rules = train_binary_trees(embeddings_dt, X_feat_tree_train, feature_cols, model_type=model_type)
     best_p = max(tree_rules.keys(), key=lambda p: len(tree_rules[p]))
     rules_df = pd.DataFrame(tree_rules[best_p])

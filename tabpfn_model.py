@@ -416,11 +416,12 @@ def load_or_extract_embeddings(model: TabPFNClassifier, X_train_np: np.ndarray, 
         "test_emb_flat": test_emb_flat,
     }
 
-def scale_embeddings(emb_train: np.ndarray, emb_test: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def scale_embeddings(emb_train: np.ndarray, emb_test: np.ndarray, fit_test:bool = False) -> tuple[np.ndarray, np.ndarray]:
     scaler = StandardScaler()
     scaler.fit(emb_train)
     emb_train_new = scaler.transform(emb_train)
-    # scaler.fit(emb_test)
+    if fit_test:
+        scaler.fit(emb_test)
     emb_test_new = scaler.transform(emb_test)
 
     return emb_train_new, emb_test_new
