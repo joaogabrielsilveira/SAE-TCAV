@@ -63,9 +63,9 @@ if __name__ == '__main__':
 
     data_shift_test, _, _ = compare_distributions(X_test_start, X_test_end, top_k_events)
 
-    data_shift_df.to_csv('data_shift.csv')
-    data_shift_train.to_csv('data_shift_train.csv')
-    data_shift_test.to_csv('data_shift_test.csv')
+    data_shift_df.to_csv('stats/data_shift.csv')
+    data_shift_train.to_csv('stats/data_shift_train.csv')
+    data_shift_test.to_csv('stats/data_shift_test.csv')
 
     if not cut_features:
         features_to_keep = np.ones(len(top_k_events), dtype=bool)
@@ -111,7 +111,7 @@ if __name__ == '__main__':
 
     results_per_year = wf["results_per_year"]
     year_to_domain_combined = wf["year_to_domain_combined"]
-    # test_rows_checked = wf["test_rows_checked"]
+    test_rows_checked = wf["test_rows_checked"]
     test_rows_checked = test_rows
 
     # results_df = pd.DataFrame(results_per_year).sort_values("year").reset_index(drop=True)
@@ -125,6 +125,7 @@ if __name__ == '__main__':
     # print(f'X_test_df_norm : {X_test_df.shape}')
 
     emb_cfg = EmbeddingExtractConfig()
+    emb_cfg.use_cache = True
     emb_out = load_or_extract_embeddings(
         model=drift_model,
         X_train_np=X_train_np,
@@ -140,9 +141,9 @@ if __name__ == '__main__':
 
     embedding_info = {
         'model': drift_model,
-        'X_test_df': test_rows,
+        'X_train_np': X_train_np,
         'ytd_map': year_to_domain_combined,
-        'years_test_np': years_test_np,
+        'years_train': years_train_np,
         'device': model_add_x_device,
         'example_add_shape': example_add_shape, 
         'cfg': emb_cfg
@@ -150,6 +151,18 @@ if __name__ == '__main__':
 
     train_emb = emb_out['train_emb_flat'].astype(np.float32)
     test_emb = emb_out['test_emb_flat'].astype(np.float32)
+    train_emb_scaled, test_emb_scaled, scaler_emb = scale_embeddings(train_emb, test_emb, fit_test=False)
+
+    from sae_compare import calculate_concept_correlation_drift, plotar_termometro_drift
+    full_df, dist_df = calculate_concept_correlation_drift(
+        X_test_df=test_rows,
+        test_embs=test_emb_scaled,
+        test_years_np=years_test_np,
+        features=feature_cols,
+        alpha=1.0
+    )
+    plotar_termometro_drift(dist_df)
+    exit()
 
     mean_train = np.mean(train_emb, axis=0)
     std_train = np.std(train_emb, axis=0)
@@ -167,13 +180,8 @@ if __name__ == '__main__':
             'Test mean': mean_test[idx], 'Test std': std_test[idx]
         })
     data_shift_df = pd.DataFrame(rows)
-    with open('embeddings_shift.csv', 'wb') as f:
+    with open('stats/embeddings_shift.csv', 'wb') as f:
         data_shift_df.to_csv(f)
-
-    #print(np.mean(train_emb), np.mean(test_emb))
-
-    #train_emb_scaled, test_emb_scaled = scale_embeddings_l2(train_emb, test_emb)
-    train_emb_scaled, test_emb_scaled = scale_embeddings(train_emb, test_emb, fit_test=False)
 
     y_test = (test_rows["DEATH"] > 0).astype(int).to_numpy(copy=True)
     split_idx = temporal_test_subsplits(
@@ -210,7 +218,7 @@ if __name__ == '__main__':
     pair_criteria = 'cos_sim'
     model_type = 'ReLU'
     model_n = range(3, 15)
-    alphas = [1.0]
+    alphas = [0.1, 0.5, 1.0]
     ks = [8]
     scaling_factors = [1.5]
 
@@ -234,30 +242,6 @@ if __name__ == '__main__':
 
     surviving_concepts = stats_by_concept[stats_by_concept['survival_rate'] > 0.0]
 
-    if pair_criteria == 'overlap':
-        stats_sorted = stats_by_concept.sort_values('mean_overlap', ascending=True)
-        print(stats_sorted)
-        x = range(len(stats_sorted))
-        y = stats_sorted['mean_cos_sim'].tolist()
-
-        fig, ax = plt.subplots(figsize=(7, 7))
-        ax.plot(x, y)
-        ax.set_title('Mean cos_sim by concepts (ordered by overlap)')
-        ax.set_xlabel('Higher overlap ---->')
-        with open('cos_sim_graph.png', 'wb') as f:
-            plt.savefig(f)
-    else:
-        stats_sorted = stats_by_concept.sort_values('mean_cos_sim', ascending=True)
-        print(stats_sorted)
-        x = range(len(stats_sorted))
-        y = stats_sorted['mean_overlap'].tolist()
-        fig, ax = plt.subplots(figsize=(7, 7))
-        ax.plot(x, y)
-        ax.set_title('Mean overlap by concepts (ordered by cos_sim)')
-        ax.set_xlabel('Higher cos_sim ---->')
-        with open('overlap_graph.png', 'wb') as f:
-            plt.savefig(f)
-
     pair_sae_idx = 1
     original_sae_first_pairing_df = original_sae_df[original_sae_df['sae_j_idx'] == pair_sae_idx].copy()
 
@@ -265,7 +249,7 @@ if __name__ == '__main__':
     original_survivors = first_pairing_survivors['original_concept'].tolist()
     pairs = first_pairing_survivors['best_pair'].tolist()
 
-    with open(f'surviving_concepts_{model_type}_sae.pkl', 'wb') as out:
+    with open(f'stats/concepts/surviving_concepts_{model_type}_sae.pkl', 'wb') as out:
         dump(surviving_concepts, out)
     if model_type == 'ReLU':
         for alpha in alphas:
@@ -319,63 +303,6 @@ if __name__ == '__main__':
     X_feat_tree_train = X_cav_train_df.iloc[idx_tree_train].copy().to_numpy()
     X_cav_final_df = X_cav_train_df.iloc[idx_cav_final_train].reset_index(drop=True)
 
-    concept_retention_stats, eval_stats, baseline_comparison = run_random_comparison_year_differences(
-        model_nums=model_n,
-        hyper_param=alphas[0] if model_type == 'ReLU' else ks[0],
-        scaling_factor=scaling_factors[0],
-        embedding_info=embedding_info,
-        model_type=model_type,
-        feature_cols=feature_cols,
-        years=years_test_np
-    )
-
-    filtered_retention = concept_retention_stats[['train_year', 'test_year', 'mean_fraction_surviving_concepts', 'true_retention_rate']]
-    filtered_baseline = baseline_comparison[['sae_codes_year', 'mse', 'dead_neurons', 'active_per_sample', 'sparsity']]
-
-    full_drift_df = pd.merge(
-        left=filtered_retention,
-        right=filtered_baseline,
-        how='left',
-        left_on='test_year',
-        right_on='sae_codes_year'
-    )
-    print(full_drift_df)
-    for idx, row in concept_retention_stats.iterrows():
-        surviving_concepts = row['surviving_concepts_first_sae'].copy()
-        input('shape embs: ', (row['test_emb_code']).shape)
-        year = int(row['test_year'])
-        forced_rules = get_rules_forced(train_activations=row['test_emb_code'],
-                                    X=X_test_np[test_rows['year'] == year],
-                                    surviving_concepts=surviving_concepts['original_concept'].tolist(), 
-                                    tree_rules_df=None, 
-                                    perc=90, feature_names=feature_cols, model_type=model_type
-                                )
-        print(forced_rules)
-        with open(f'concept_rules_{year}.pkl', 'wb') as f:
-            dump(forced_rules, f)
-
-    with open('concept_retention_per_year.pkl', 'wb') as f:
-        dump(full_drift_df, f)
-    with open('model_performance_per_year.pkl', 'wb') as f:
-        dump(eval_stats, f)
-    
-    fig, ax = plt.subplots()
-    ax.plot(np.unique(years_test_np).tolist(), concept_retention_stats['mean_fraction_surviving_concepts'].tolist())
-    ax.set_title(f'Retention on concepts learned with drifting data for SAE trained with {full_drift_df["train_year"].astype(int).max()} data', wrap=True)
-    plt.savefig('retention_over_time.png')
-
-    # if eval_stats is not None:
-    #     ax.plot(np.unique(years_test_np).tolist(), eval_stats['f1_macro'].tolist())
-    #     ax.plot(np.unique(years_test_np).tolist(), eval_stats['f1_pos'].tolist())
-
-    fig, ax = plt.subplots()
-    ax.plot(np.unique(years_test_np).tolist(), baseline_comparison['mse'].tolist())
-    ax.set_title(f'Reconstruction error for drifting data', wrap=True)
-    plt.savefig('reconstruction_loss_over_time.png')
-    fig, ax = plt.subplots()
-    ax.plot(np.unique(years_test_np).tolist(), baseline_comparison['dead_neurons'].tolist())
-    plt.savefig('dead_neurons_over_time.png')
-    exit()
     tree_rules = train_binary_trees(embeddings_dt, X_feat_tree_train, feature_cols, model_type=model_type)
     best_p = max(tree_rules.keys(), key=lambda p: len(tree_rules[p]))
     rules_df = pd.DataFrame(tree_rules[best_p])
@@ -405,13 +332,13 @@ if __name__ == '__main__':
     rules_paired_df['original_rule'] = [translate_event_names(full_text=rule, cid_dict=cid) for rule in rules_paired_df['original_rule']]
     rules_paired_df['pair_rule'] = [translate_event_names(full_text=rule, cid_dict=cid) for rule in rules_paired_df['pair_rule']]
 
-    with open(f'paired_rules_{model_type}_sae.pkl', 'wb') as out:
+    with open(f'stats/concepts/paired_rules_{model_type}_sae.pkl', 'wb') as out:
         dump(rules_paired_df, out)
     print(rules_paired_df)
 
     forced_rules_df = pd.DataFrame(forced_rules)
 
-    with open(f'forced_rules_{model_type}_sae.pkl', 'wb') as out:
+    with open(f'stats/concepts/forced_rules_{model_type}_sae.pkl', 'wb') as out:
         dump(forced_rules_df, out)
 
     all_rules_df = pd.concat([rules_df, forced_rules_df])
@@ -485,7 +412,7 @@ if __name__ == '__main__':
         print()
     
     graph_columns = ['Factor', 'Precision', 'Recall', 'TCAV_score', 'survival_rate', 'mean_cos_sim', 'mean_overlap', 'translated_rule']
-    with open(f'significant_factors_{model_type}_sae.pkl', 'wb') as out:
+    with open(f'stats/concepts/significant_factors_{model_type}_sae.pkl', 'wb') as out:
         dump(significant_concepts[graph_columns], out)
     
     num_latents = int(192 * max(scaling_factors))

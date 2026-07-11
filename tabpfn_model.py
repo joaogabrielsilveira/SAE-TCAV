@@ -39,7 +39,6 @@ def infer_model_additional_x_info(model):
     example_add_shape = None
     try:
         if hasattr(model, "additional_x_") and model.additional_x_ is not None and 'dist_shift_domain' in model.additional_x_:
-            print("add x tudo certo")
             v = model.additional_x_['dist_shift_domain']
             if isinstance(v, torch.Tensor):
                 device = v.device
@@ -87,11 +86,9 @@ def fit_dr_tabpfn(X_train: np.ndarray, y_train: np.ndarray, train_years: np.ndar
             drift_model.show_progress = False
         if hasattr(drift_model, "seed"):
             drift_model.seed = eval_cfg.rng_seed
-            print(f'Seed: {eval_cfg.rng_seed}')
 
     except Exception:
         drift_model = TabPFNClassifier(device='auto')
-        print('sujo fi')
 
     t0 = time.perf_counter()
     drift_model = drift_model.fit(
@@ -375,7 +372,7 @@ def load_or_extract_embeddings(model: TabPFNClassifier, X_train_np: np.ndarray, 
     print(p_train, p_test)
     if cfg.use_cache and os.path.exists(p_train):
         train_emb = np.load(p_train)
-    else:
+    elif X_train_np is not None:
         train_emb = extract_embeddings_robust(
             model=model,
             X=X_train_np,
@@ -387,10 +384,12 @@ def load_or_extract_embeddings(model: TabPFNClassifier, X_train_np: np.ndarray, 
             ctx_idx=None,
             example_add_shape=example_add_shape
         )
+    else:
+        train_emb = None
 
     if cfg.use_cache and os.path.exists(p_test):
         test_emb = np.load(p_test)
-    else:
+    elif X_test_np is not None:
         test_emb = extract_embeddings_robust(
             model=model,
             X=X_test_np,
@@ -402,12 +401,20 @@ def load_or_extract_embeddings(model: TabPFNClassifier, X_train_np: np.ndarray, 
             ctx_idx=None,
             example_add_shape=example_add_shape
         )
+    else:
+        test_emb = None
+    
+    if train_emb is not None:
+        np.save(p_train, train_emb)
+        train_emb_flat = flatten_embeddings(train_emb)
+    else:
+        train_emb_flat = None
 
-    np.save(p_train, train_emb)
-    np.save(p_test, test_emb)
-
-    train_emb_flat = flatten_embeddings(train_emb)
-    test_emb_flat = flatten_embeddings(test_emb)
+    if test_emb is not None:
+        np.save(p_test, test_emb)
+        test_emb_flat = flatten_embeddings(test_emb)
+    else:
+        test_emb_flat = None
 
     return {
         "train_emb": train_emb,
@@ -416,7 +423,7 @@ def load_or_extract_embeddings(model: TabPFNClassifier, X_train_np: np.ndarray, 
         "test_emb_flat": test_emb_flat,
     }
 
-def scale_embeddings(emb_train: np.ndarray, emb_test: np.ndarray, fit_test:bool = False) -> tuple[np.ndarray, np.ndarray]:
+def scale_embeddings(emb_train: np.ndarray, emb_test: np.ndarray, fit_test:bool = False) -> tuple[np.ndarray, np.ndarray, StandardScaler]:
     scaler = StandardScaler()
     scaler.fit(emb_train)
     emb_train_new = scaler.transform(emb_train)
@@ -424,7 +431,7 @@ def scale_embeddings(emb_train: np.ndarray, emb_test: np.ndarray, fit_test:bool 
         scaler.fit(emb_test)
     emb_test_new = scaler.transform(emb_test)
 
-    return emb_train_new, emb_test_new
+    return emb_train_new, emb_test_new, scaler
 
 def temporal_test_subsplits(y_test: np.ndarray, rng_seed: int = 42) -> dict[str, np.ndarray]:
     y_test = np.asarray(y_test)

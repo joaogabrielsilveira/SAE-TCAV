@@ -344,7 +344,7 @@ def plot_feature_importance(top_k_events: pd.DataFrame, num_features: int = 15, 
     ax.set_ylabel('Feature')
     ax.bar_label(bars, padding=5)
     ax.set_title(f'Most important events in {data_source} data')
-    plt.savefig(f'top_k_events_{data_source}.png')
+    plt.savefig(f'graphs/top_k_events_{data_source}.png')
 
 from scipy.stats import levene
 def compare_distributions(x_i: np.ndarray, x_j: np.ndarray, top_k_events: list[str]):

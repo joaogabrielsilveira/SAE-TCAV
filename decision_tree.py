@@ -335,7 +335,7 @@ def get_rules_forced(train_activations: np.ndarray, X: np.ndarray, surviving_con
 
     valid_rules = []
     for concept, target in bin_targets:
-        concept_activations = train_activations[:, concept]
+        concept_activations = np.asarray(train_activations[:, concept], dtype=np.float32)
 
         y_high = (concept_activations >= target)
         n_high = y_high.sum()

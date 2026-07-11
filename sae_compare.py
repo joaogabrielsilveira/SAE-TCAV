@@ -5,6 +5,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.optimize import linear_sum_assignment
 from matplotlib.ticker import PercentFormatter
+from pickle import dump, load
 from tabpfn_model import load_or_extract_embeddings, scale_embeddings, temporal_test_subsplits, fit_dr_tabpfn, walkforward_evaluate_tabpfn, TabPFNClassifier, TabPFNEvalConfig, EmbeddingExtractConfig
 
 def activation_threshold(concept: np.ndarray, perc: int=90):
@@ -87,7 +88,7 @@ def overlap_matrix(sae_i: dict[str], sae_j: dict[str]) -> np.ndarray:
     # print(f'overlap_matrix: {matrix.shape}')
     return matrix
 
-def train_all_saes(num_models: int, embs: np.ndarray, alpha: float=1e-1, scaling_factor: float=1.5, model_type: str='ReLU', k:int=16, k_aux:int=64) -> list[dict[str]]:
+def train_all_saes(num_models: int, embs: np.ndarray, alpha: float=1e-1, scaling_factor: float=1.5, model_type: str='ReLU', k:int=16, k_aux:int=64, universal_embs: np.ndarray = None) -> list[dict[str]]:
     sae_list = []
     for i in range(num_models):
 
@@ -98,13 +99,20 @@ def train_all_saes(num_models: int, embs: np.ndarray, alpha: float=1e-1, scaling
             current_seed = 10 * (i ** 2) + 50 * i + 75
     
         sae = train_sae_model(inputs=torch.tensor(embs), type=model_type, alpha=alpha, scaling_factor=scaling_factor, save_data=False, use_decoder_bias=True, use_cache=False, rng_seed=current_seed, epochs=1000, k=k, k_aux=k_aux)
+        codes_universal = None
 
         if model_type == 'ReLU':
             weights = sae.encoder.weight.cpu().detach().numpy()
             codes = sae.encode(x=torch.tensor(embs)).cpu().detach().numpy()
+            if universal_embs is not None:
+                codes_universal = sae.encode(x=torch.tensor(universal_embs)).cpu().detach().numpy()
+
         elif model_type == 'TopK':
             weights = sae.decoder.weight.T.cpu().detach().numpy()
             codes = sae.encode(x=torch.tensor(embs))[1].cpu().detach().numpy()
+            if universal_embs is not None:
+                codes_universal = sae.encode(x=torch.tensor(universal_embs))[1].cpu().detach().numpy()
+            
             
         sparsity = (codes <= 1e-5).mean()
         dead_neurons = np.all(codes <= 1e-5, axis=0).sum().item()
@@ -113,7 +121,7 @@ def train_all_saes(num_models: int, embs: np.ndarray, alpha: float=1e-1, scaling
 
         # matriz binária. cada (i, j) representa se o conceito j teve ativação
         # alta (acima do percentil perc de ativações positivas) na amostra i
-        high_act_matrix = high_activation_matrix(codes, perc=90)
+        high_act_matrix = high_activation_matrix(codes if codes_universal is None else codes_universal, perc=90)
 
         sae_list.append({
             'idx': i,
@@ -137,8 +145,8 @@ def get_overlap(sae_i: dict[str], idx_i: int, sae_j: dict[str], idx_j: int) -> f
         return 0.0
     
     return float(intersection / union)
-def get_concepts_matching(sae_i: dict[str], sae_j: dict[str], pair_criteria: str='cos_sim'):
-    if sae_i['idx'] == sae_j['idx']:
+def get_concepts_matching(sae_i: dict[str], sae_j: dict[str], pair_criteria: str='cos_sim', allow_repeat: bool=False):
+    if not allow_repeat and sae_i['idx'] == sae_j['idx']:
         return None
     
     cos_sim_matrix = cosine_similarity_matrix(sae_i, sae_j)
@@ -518,4 +526,410 @@ def run_random_comparison_year_differences(model_nums: list[int], hyper_param: i
         return pd.DataFrame(concept_stats), pd.concat(eval_stats, axis=0), pd.DataFrame(baseline_comparison)
     else:
         return pd.DataFrame(concept_stats), None, pd.DataFrame(baseline_comparison)
+
+from sklearn.preprocessing import StandardScaler
+def UNUSED_run_concept_drift_test(model_info: dict[str], X_test_df: pd.DataFrame, years_test: np.ndarray, features: list[str], scaler: StandardScaler, alpha: float = 1.0, num_models:int = 15, match_method: str = 'hungarian'):
+    drift_model: TabPFNClassifier = model_info['model']
+    ytd_map = model_info['ytd_map']
+    cfg = model_info['cfg']
+    cfg.use_cache = True
+    example_add_shape = model_info['example_add_shape']
+    device = model_info['device']
+
+    years = np.unique(years_test)
+    sae_lists = {y: [] for y in years}
+
+    X_test_np = np.asarray(X_test_df[features], dtype=np.float32)
+    years_test_np = years_test
+    full_emb_out = load_or_extract_embeddings(
+                model=drift_model,
+                X_train_np=None,
+                X_test_np=X_test_np,
+                years_train=None,
+                years_test=years_test_np,
+                year_to_domain_map=ytd_map,
+                cfg=cfg,
+                example_add_shape=example_add_shape,
+                device=device,
+                embeddings_dir='test'
+            )
+    full_emb_np = np.asarray(full_emb_out['test_emb_flat'], dtype=np.float32)
+    full_emb_np_scaled = scaler.transform(full_emb_np)
+
+    for year in years:
+        X_test_year = X_test_df[X_test_df['year'] == year][features]
+        X_test_np = np.asarray(X_test_year, dtype=np.float32)
+        years_test_np = np.asarray(years_test[X_test_df['year'] == year], dtype=np.int32)
+
+        assert(len(X_test_np) == len(years_test_np))
+
+        emb_out_year = load_or_extract_embeddings(
+                model=drift_model,
+                X_train_np=None,
+                X_test_np=X_test_np,
+                years_train=None,
+                years_test=years_test_np,
+                year_to_domain_map=ytd_map,
+                cfg=cfg,
+                example_add_shape=example_add_shape,
+                device=device,
+                embeddings_dir='test'
+            )
+        embs_year_np = np.asarray(emb_out_year['test_emb_flat'], dtype=np.float32)
+        embs_year_scaled = scaler.transform(embs_year_np)
+
+        sae_lists[year] = train_all_saes(num_models, embs_year_scaled, alpha=alpha, scaling_factor=1.5, model_type='ReLU', universal_embs=full_emb_np_scaled)
+    rows = []
+    for i, year_i in enumerate(years):
+        for j, year_j in enumerate(years[i:]):
+            sae_list_i = sae_lists[year_i]
+            sae_list_j = sae_lists[year_j]
+
+            assert(len(sae_list_i) == len(sae_list_j))
+
+            results = []
+            print(f'Comparing {year_i} and {year_j}')
+            for s_i in range(len(sae_list_i)):
+                for s_j in range(len(sae_list_j)):
+
+                    if s_i == s_j:
+                        continue
+
+                    model_i = sae_list_i[s_i]
+                    model_j = sae_list_j[s_j]
+
+                    codes_i = model_i['model'].encode(torch.tensor(full_emb_np_scaled, dtype=torch.float32))
+                    codes_j = model_j['model'].encode(torch.tensor(full_emb_np_scaled, dtype=torch.float32))
+
+                    is_active_i = ((codes_i > 1e-5).sum(dim=0) > 0).cpu().numpy()
+                    is_active_j = ((codes_j > 1e-5).sum(dim=0) > 0).cpu().numpy()
+
+                    cos_sim_matrix = cosine_similarity_matrix(model_i, model_j)
+                    masked_cos_sim_matrix = cos_sim_matrix.copy()
+                    masked_cos_sim_matrix[:, ~is_active_j] = -np.inf
+
+                    if match_method == 'hungarian':
+                        rows_idx, cols_idx = linear_sum_assignment(masked_cos_sim_matrix, maximize=True)
+                    elif match_method == 'maxcos':
+                        rows_idx = range(masked_cos_sim_matrix.shape[0])
+                        cols_idx = np.argmax(masked_cos_sim_matrix, axis=1)
+
+                    for a, b in zip(rows_idx, cols_idx):
+                        overlap = get_overlap(sae_i=model_i, idx_i=a, sae_j=model_j, idx_j=b)
+
+                        results.append({
+                            'seed_idx_i': model_i['idx'],
+                            'seed_idx_j': model_j['idx'],
+                            'year_sae_i': year_i,
+                            'year_sae_j': year_j,
+                            'original_concept': a,
+                            'best_pair': b,
+                            'cos_sim': cos_sim_matrix[a][b],
+                            'overlap': overlap,
+                            'is_active_base': is_active_i[a],
+                            'is_active_pair': is_active_j[b]
+                        })
+
+            year_pair_stats = pd.DataFrame(results)
+
+            both_active_mask = (year_pair_stats['is_active_base']) & (year_pair_stats['is_active_pair'])
+            total_active_base = year_pair_stats['is_active_base'].sum()
+            survivors = ((year_pair_stats['cos_sim'] > 0.7) &
+                         (year_pair_stats['is_active_base'] == True) &
+                         (year_pair_stats['is_active_pair'] == True)).sum()
+
+            true_survival_rate = survivors / total_active_base if total_active_base > 0 else 0.0
+            print(f'Sobreviventes: {survivors}, conceitos ativos: {total_active_base}')
+
+            true_mean_cos_sim = year_pair_stats[both_active_mask]['cos_sim'].mean()
+
+            true_overlap = year_pair_stats[both_active_mask]['overlap'].mean()
+            
+            year_stats_acc = pd.DataFrame([{
+                # 'mean_cos_sim': year_pair_stats['cos_sim'].mean(),
+                # 'mean_overlap': year_pair_stats['overlap'].mean(),
+                'mean_cos_sim': true_mean_cos_sim,
+                'mean_overlap': true_overlap,
+                'survival_rate': true_survival_rate,
+                # 'survival_rate': ((year_pair_stats['cos_sim'] > 0.7).mean()),
+                'year_a': year_i,
+                'year_b': year_j
+            }])
         
+            rows.append(year_stats_acc)
+
+    full_stats = pd.concat(rows, axis=0)
+    full_stats['dist'] = full_stats['year_b'] - full_stats['year_a']
+    dist_stats = full_stats.groupby(by='dist').agg(
+        mean_cos_sim=('mean_cos_sim', 'mean'),
+        std_cos_sim=('mean_cos_sim', 'std'),
+        mean_overlap=('mean_overlap', 'mean'),
+        std_overlap=('mean_overlap', 'std'),
+        mean_survival_rate=('survival_rate', 'mean'),
+        std_survival_rate=('survival_rate', 'std')
+    )
+    with open(f'stats/concepts/temporal_distance_stats[a={alpha}].pkl', 'wb') as out:
+        from pickle import dump
+        dump(dist_stats, out)
+    with open(f'stats/concepts/full_temp_dist_df[a={alpha}].pkl', 'wb') as out:
+        from pickle import dump
+        dump(full_stats, out)
+
+    return full_stats, dist_stats
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+from tabpfn import TabPFNClassifier
+from tabpfn_model import fit_dr_tabpfn, TabPFNEvalConfig, make_dist_tensor
+def calculate_concept_correlation_drift(X_test_df: pd.DataFrame, test_embs: np.ndarray, test_years_np: np.ndarray, features: list[str], alpha: float = 1.0):
+    import warnings
+    warnings.filterwarnings('ignore', category=RuntimeWarning, module='numpy.lib.function_base')
+
+    test_embs = torch.tensor(test_embs, dtype=torch.float32)
+    unique_years = np.unique(test_years_np)
+    year_to_domain_combined = {y: i for i, y in enumerate(unique_years)}
+    y_test_np = np.asarray(X_test_df['DEATH'] > 0, dtype=bool)
+
+    results = []
+    for reference_year in unique_years:
+        reference_year_mask = (X_test_df['year'] == reference_year).astype(bool)
+        X_reference_df: pd.DataFrame = X_test_df[reference_year_mask][features]
+        embs_reference = test_embs[reference_year_mask]
+        y_ref = y_test_np[reference_year_mask]
+        years_ref = test_years_np[reference_year_mask]
+
+        embs_ref_train, embs_ref_test, X_ref_df_train, X_ref_df_test, y_ref_train, y_ref_test, years_ref_train, years_ref_test = \
+        train_test_split(embs_reference, X_reference_df, y_ref, years_ref, test_size=0.3, random_state=42, stratify=y_ref)
+
+        baseline_sae = train_sae_model(inputs=embs_ref_train, alpha=1.0, scaling_factor=1.5, type='ReLU', rng_seed=42, save_data=False)
+        with torch.no_grad():
+            codes_ref, reconstruction_reference = baseline_sae(embs_ref_train)
+        
+        active_features_mask_reference = (codes_ref > 1e-5).sum(dim=0) > 0
+        active_indices_reference = torch.where(active_features_mask_reference)[0].cpu().numpy()
+
+        pos_idx = np.where(y_ref_train == 1)[0]
+        neg_idx = np.where(y_ref_train == 0)[0]
+
+        if len(pos_idx) > 0 and len(neg_idx) > 0:
+            min_size = min(len(pos_idx), len(neg_idx))
+            pos_sample = np.random.choice(pos_idx, size=min_size, replace=False)
+            neg_sample = np.random.choice(neg_idx, size=min_size, replace=False)
+            all_samples = np.concatenate([pos_sample, neg_sample])
+            np.random.shuffle(all_samples)
+
+            X_ref_train_bal = X_ref_df_train.iloc[all_samples]
+            y_ref_train_bal = y_ref_train[all_samples]
+            years_ref_train_bal = years_ref_train[all_samples]
+        else:
+            X_ref_train_bal, y_ref_train_bal, years_ref_train_bal = X_ref_df_train, y_ref_train, years_ref_train
+
+        tabpfn_fit_out = fit_dr_tabpfn(
+            X_train=X_ref_train_bal,
+            y_train=y_ref_train_bal,
+            train_years=years_ref_train_bal,
+            eval_cfg=TabPFNEvalConfig()
+        )
+
+        baseline_tabpfn = tabpfn_fit_out['model']
+        model_add_x_device = tabpfn_fit_out['model_add_x_device']
+        example_add_shape = tabpfn_fit_out['example_add_shape']
+
+        reference_associations = []
+        for feat in range(codes_ref.shape[1]):
+            if feat in active_indices_reference:
+                corr_matrix = X_ref_df_train.corrwith(pd.Series(codes_ref[:, feat].cpu().numpy(), index=X_ref_df_train.index)).fillna(0)
+                reference_associations.append(corr_matrix.values)
+            else:
+                reference_associations.append(np.zeros(X_reference_df.shape[1], dtype=np.float32))
+        reference_associations = np.asarray(reference_associations, dtype=np.float32)
+
+        for test_year in unique_years:
+            if test_year < reference_year:
+                continue
+
+            test_year_mask = (X_test_df['year'] == test_year).astype(bool)
+            if test_year == reference_year:
+                embs_test = embs_ref_test
+                X_tests_df = X_ref_df_test
+                y_test = y_ref_test
+                years_test = years_ref_test
+            else:
+                embs_test = test_embs[test_year_mask]
+                X_tests_df = X_test_df[test_year_mask][features]
+                y_test = y_test_np[test_year_mask]
+                years_test = test_years_np[test_year_mask]
+
+            with torch.no_grad():
+                codes_test, reconstruction_test = baseline_sae(embs_test)
+            
+            year_mse = torch.nn.functional.mse_loss(reconstruction_test, embs_test).item()
+            concepts_per_patient = (codes_test > 1e-5).float().sum(dim=1).mean().item()
+            
+            test_associations = []
+            for feat in range(codes_ref.shape[1]):
+                if feat in active_indices_reference:
+                    corr_matrix = X_tests_df.corrwith(pd.Series(codes_test[:, feat].cpu().numpy(), index=X_tests_df.index)).fillna(0)
+                    test_associations.append(corr_matrix.values)
+                else:
+                    test_associations.append(np.zeros(X_tests_df.shape[1], dtype=np.float32))
+
+            test_associations = np.asarray(test_associations, dtype=np.float32)
+
+            ref_tensor = torch.tensor(reference_associations, dtype=torch.float32)
+            test_tensor = torch.tensor(test_associations, dtype=torch.float32)
+            
+            cos_sim_vector = torch.nn.functional.cosine_similarity(ref_tensor[active_indices_reference], test_tensor[active_indices_reference], dim=1)
+            mean_cos_sim = cos_sim_vector.mean().item()
+
+            active_features_mask_test = (codes_test > 1e-5).sum(dim=0) > 0
+            active_indices_test = torch.where(active_features_mask_test)[0].cpu().numpy()
+
+            reference_active = (active_features_mask_reference).sum().item()
+            both_active = (active_features_mask_reference & active_features_mask_test).sum().item()
+
+            survival_rate = both_active / reference_active if reference_active > 0 else 0.0
+
+            preds = []
+            for start in range(0, len(X_tests_df), 512):
+                end = min(start+512, len(X_tests_df))
+                dist_dom = np.asarray([year_to_domain_combined[int(y)] for y in years_test[start:end]], dtype=np.int64)
+                dist_dom_t = make_dist_tensor(
+                    dist_dom_np=dist_dom,
+                    model_add_x_device=model_add_x_device,
+                    example_add_shape=example_add_shape,
+                )
+
+                y_pred = baseline_tabpfn.predict_proba(X=X_tests_df.iloc[start:end].values.astype(np.float32),
+                                                       additional_x={"dist_shift_domain": dist_dom_t})
+                
+                preds.append(y_pred)
+            
+            y_pred_total = np.vstack(preds)
+            y_pred_proba = y_pred_total[:, 1]
+            y_pred_bin = np.argmax(y_pred_total, axis=1)
+
+            acc = accuracy_score(y_true=y_test, y_pred=y_pred_bin)
+            f1_macro = f1_score(y_true=y_test, y_pred=y_pred_bin, average='macro')
+            f1_pos = f1_score(y_true=y_test, y_pred=y_pred_bin)
+            roc_auc = roc_auc_score(y_true=y_test, y_score=y_pred_proba)
+
+            results.append({
+                'train_year': reference_year,
+                'test_year': test_year,
+                'mse': year_mse,
+                'active_per_sample': concepts_per_patient,
+                'mean_cos_sim': mean_cos_sim,
+                'survival_rate': survival_rate,
+                'accuracy': acc,
+                'f1_macro': f1_macro,
+                'f1_pos': f1_pos,
+                'roc_auc_score': roc_auc
+            })
+    
+    results = pd.DataFrame(results)
+    results['dist'] = results['test_year'] - results['train_year']
+
+    results_agg = results.groupby(by='dist').agg(
+        mean_cos_sim=('mean_cos_sim', 'mean'),
+        std_cos_sim=('mean_cos_sim', 'std'),
+        mean_active=('active_per_sample', 'mean'),
+        std_active=('active_per_sample', 'std'),
+        mean_mse=('mse', 'mean'),
+        std_mse=('mse', 'std'),
+        mean_survival_rate=('survival_rate', 'mean'),
+        std_survival_rate=('survival_rate', 'std'),
+        mean_f1_macro=('f1_macro', 'mean'),
+        std_f1_macro=('f1_macro', 'std'),
+        mean_f1_pos=('f1_pos', 'mean'),
+        std_f1_pos=('f1_pos', 'std'),
+        mean_accuracy=('accuracy', 'mean'),
+        std_accuracy=('accuracy', 'std'),
+        mean_rocauc=('roc_auc_score', 'mean'),
+        std_rocauc=('roc_auc_score', 'std')
+    )
+
+    cols = results_agg.columns.tolist()
+    display_cols = [col for col in cols if 'std' not in col]
+    with open(f'stats/concept_drift.pkl', 'wb') as out:
+        dump(results_agg, out)
+    return results, results_agg
+
+def plotar_termometro_drift(df_agg: pd.DataFrame):
+    """
+    Plota as 4 métricas de Concept Drift num único gráfico.
+    Assume que df_agg possui colunas com os prefixos 'mean_' e 'std_' para:
+    cos_sim, survival_rate, f1_pos e mse.
+    """
+    
+    # Garantir que 'dist' existe como coluna a partir do index
+    if 'dist' not in df_agg.columns:
+        df_agg['dist'] = df_agg.index
+        
+    dist = df_agg['dist']
+    
+    # Criar a figura
+    fig, ax1 = plt.subplots(figsize=(12, 7))
+
+    # Eixo 1 (Esquerda): Porcentagens (Semântica, Sobrevivência e F1-Score)
+    ax1.set_xlabel('Distância Temporal ($\Delta t$ em anos)', fontsize=12, fontweight='bold')
+    ax1.set_ylabel('Taxa / Desempenho (%)', fontsize=12, color='black', fontweight='bold')
+    
+    # Eixo 2 (Direita): Erro de Reconstrução (MSE)
+    ax2 = ax1.twinx()
+    ax2.set_ylabel('Erro OOD (MSE)', fontsize=12, color='tab:red', fontweight='bold')
+
+    # Multiplicador para converter em percentagem
+    pct = 100.0
+
+    # 1. Estabilidade Semântica (Cos Sim)
+    std_cos = df_agg['std_cos_sim'].fillna(0)
+    p1, = ax1.plot(dist, df_agg['mean_cos_sim'] * pct, color='tab:blue', linewidth=2.5, marker='o', label='Estabilidade Semântica (Cos)')
+    ax1.fill_between(dist, (df_agg['mean_cos_sim'] - std_cos) * pct, 
+                     (df_agg['mean_cos_sim'] + std_cos) * pct, color='tab:blue', alpha=0.15)
+
+    # 2. Sobrevivência Funcional
+    std_surv = df_agg['std_survival_rate'].fillna(0)
+    p2, = ax1.plot(dist, df_agg['mean_survival_rate'] * pct, color='tab:green', linewidth=2.5, marker='s', linestyle='--', label='Sobrevivência Funcional')
+    ax1.fill_between(dist, (df_agg['mean_survival_rate'] - std_surv) * pct, 
+                     (df_agg['mean_survival_rate'] + std_surv) * pct, color='tab:green', alpha=0.15)
+
+    # 3. F1-Score (Classe Positiva)
+    std_f1 = df_agg['std_f1_pos'].fillna(0)
+    p3, = ax1.plot(dist, df_agg['mean_f1_pos'] * pct, color='tab:purple', linewidth=2.5, marker='D', label='F1-Score (Classe Positiva)')
+    ax1.fill_between(dist, (df_agg['mean_f1_pos'] - std_f1) * pct, 
+                     (df_agg['mean_f1_pos'] + std_f1) * pct, color='tab:purple', alpha=0.15)
+
+    # 4. Erro OOD (MSE)
+    std_mse = df_agg['std_mse'].fillna(0)
+    p4, = ax2.plot(dist, df_agg['mean_mse'], color='tab:red', linewidth=2.5, marker='^', label='Erro OOD (MSE)')
+    ax2.fill_between(dist, df_agg['mean_mse'] - std_mse, 
+                     df_agg['mean_mse'] + std_mse, color='tab:red', alpha=0.15)
+
+    # Colorir os ticks e labels dos eixos
+    ax1.tick_params(axis='y', labelcolor='black')
+    ax2.tick_params(axis='y', labelcolor='tab:red')
+    
+    # Ajustar limites do Eixo 1 (0 a 105% para ter uma margem no topo)
+    ax1.set_ylim(bottom=0, top=105)
+    
+    # Ajustar limites do Eixo 2 para que as margens do MSE não ultrapassem o gráfico
+    max_mse_with_error = (df_agg['mean_mse'] + std_mse).max()
+    ax2.set_ylim(bottom=0, top=max_mse_with_error * 1.2)
+
+    # Grid focado apenas no eixo X
+    ax1.grid(True, axis='x', linestyle='--', alpha=0.5)
+    ax1.set_xticks(dist.unique())
+
+    # Consolidar legendas abaixo do gráfico
+    linhas = [p1, p2, p3, p4]
+    ax1.legend(linhas, [l.get_label() for l in linhas], loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=4, frameon=False)
+
+    plt.title('Erosão Estrutural vs Desempenho Preditivo (Concept Drift)', fontsize=14, pad=20, fontweight='bold')
+    
+    # Linha de base vertical (dt = 0)
+    ax1.axvline(x=0, color='gray', linestyle=':', alpha=0.5)
+    
+    # bbox_inches='tight' garante que a legenda não seja cortada ao salvar a imagem
+    plt.savefig('graphs/sae_drift.png', bbox_inches='tight')
+    plt.close()
