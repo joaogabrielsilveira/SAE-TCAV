@@ -679,9 +679,10 @@ def UNUSED_run_concept_drift_test(model_info: dict[str], X_test_df: pd.DataFrame
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+from sklearn.preprocessing import StandardScaler
 from tabpfn import TabPFNClassifier
 from tabpfn_model import fit_dr_tabpfn, TabPFNEvalConfig, make_dist_tensor
-def calculate_concept_correlation_drift(X_test_df: pd.DataFrame, test_embs: np.ndarray, test_years_np: np.ndarray, features: list[str], alpha: float = 1.0):
+def calculate_concept_correlation_drift(X_test_df: pd.DataFrame, test_embs: np.ndarray, test_years_np: np.ndarray, features: list[str], alpha: float = 1.0, undersample: bool = True):
     import warnings
     warnings.filterwarnings('ignore', category=RuntimeWarning, module='numpy.lib.function_base')
 
@@ -698,36 +699,50 @@ def calculate_concept_correlation_drift(X_test_df: pd.DataFrame, test_embs: np.n
         y_ref = y_test_np[reference_year_mask]
         years_ref = test_years_np[reference_year_mask]
 
-        embs_ref_train, embs_ref_test, X_ref_df_train, X_ref_df_test, y_ref_train, y_ref_test, years_ref_train, years_ref_test = \
-        train_test_split(embs_reference, X_reference_df, y_ref, years_ref, test_size=0.3, random_state=42, stratify=y_ref)
+        emb_scaler = StandardScaler()
+        data_scaler = StandardScaler()
+        
+        embs_reference = torch.tensor(emb_scaler.fit_transform(embs_reference.numpy()), dtype=torch.float32)
+        X_reference_df = pd.DataFrame(data_scaler.fit_transform(X_reference_df), index=X_reference_df.index, columns=X_reference_df.columns)
 
-        baseline_sae = train_sae_model(inputs=embs_ref_train, alpha=1.0, scaling_factor=1.5, type='ReLU', rng_seed=42, save_data=False)
+        baseline_sae = train_sae_model(inputs=embs_reference, alpha=1.0, scaling_factor=1.5, type='ReLU', rng_seed=42, save_data=False)
         with torch.no_grad():
-            codes_ref, reconstruction_reference = baseline_sae(embs_ref_train)
+            codes_ref, reconstruction_reference = baseline_sae(embs_reference)
+        
+        nan_tensor = torch.tensor(float('nan'), dtype=codes_ref.dtype, device=codes_ref.device)
+        codes_ref_pos = torch.where(codes_ref > 0, codes_ref, nan_tensor)
+        medians = torch.nanquantile(input=codes_ref_pos, q=torch.tensor(0.5), dim=0)
+        above_thresh_mask_reference = (codes_ref >= medians)
+        high_activations_reference = torch.sum(above_thresh_mask_reference, dim=0)
+        high_activations_sum_reference = torch.sum(above_thresh_mask_reference * codes_ref, dim=0)
+        high_activations_mean_reference = high_activations_sum_reference / torch.clamp(high_activations_reference, 1)
         
         active_features_mask_reference = (codes_ref > 1e-5).sum(dim=0) > 0
         active_indices_reference = torch.where(active_features_mask_reference)[0].cpu().numpy()
 
-        pos_idx = np.where(y_ref_train == 1)[0]
-        neg_idx = np.where(y_ref_train == 0)[0]
+        if undersample:
+            pos_idx = np.where(y_ref == 1)[0]
+            neg_idx = np.where(y_ref == 0)[0]
 
-        if len(pos_idx) > 0 and len(neg_idx) > 0:
-            min_size = min(len(pos_idx), len(neg_idx))
-            pos_sample = np.random.choice(pos_idx, size=min_size, replace=False)
-            neg_sample = np.random.choice(neg_idx, size=min_size, replace=False)
-            all_samples = np.concatenate([pos_sample, neg_sample])
-            np.random.shuffle(all_samples)
+            if len(pos_idx) > 0 and len(neg_idx) > 0:
+                min_size = min(len(pos_idx), len(neg_idx))
+                pos_sample = np.random.choice(pos_idx, size=min_size, replace=False)
+                neg_sample = np.random.choice(neg_idx, size=min_size, replace=False)
+                all_samples = np.concatenate([pos_sample, neg_sample])
+                np.random.shuffle(all_samples)
 
-            X_ref_train_bal = X_ref_df_train.iloc[all_samples]
-            y_ref_train_bal = y_ref_train[all_samples]
-            years_ref_train_bal = years_ref_train[all_samples]
+                X_ref_bal = X_reference_df.iloc[all_samples]
+                y_ref_bal = y_ref[all_samples]
+                years_ref_bal = years_ref[all_samples]
+            else:
+                X_ref_bal, y_ref_bal, years_ref_bal = X_reference_df, y_ref, years_ref
         else:
-            X_ref_train_bal, y_ref_train_bal, years_ref_train_bal = X_ref_df_train, y_ref_train, years_ref_train
+                X_ref_bal, y_ref_bal, years_ref_bal = X_reference_df, y_ref, years_ref
 
         tabpfn_fit_out = fit_dr_tabpfn(
-            X_train=X_ref_train_bal,
-            y_train=y_ref_train_bal,
-            train_years=years_ref_train_bal,
+            X_train=X_ref_bal,
+            y_train=y_ref_bal,
+            train_years=years_ref_bal,
             eval_cfg=TabPFNEvalConfig()
         )
 
@@ -738,7 +753,7 @@ def calculate_concept_correlation_drift(X_test_df: pd.DataFrame, test_embs: np.n
         reference_associations = []
         for feat in range(codes_ref.shape[1]):
             if feat in active_indices_reference:
-                corr_matrix = X_ref_df_train.corrwith(pd.Series(codes_ref[:, feat].cpu().numpy(), index=X_ref_df_train.index)).fillna(0)
+                corr_matrix = X_reference_df.corrwith(pd.Series(codes_ref[:, feat].cpu().numpy(), index=X_reference_df.index)).fillna(0)
                 reference_associations.append(corr_matrix.values)
             else:
                 reference_associations.append(np.zeros(X_reference_df.shape[1], dtype=np.float32))
@@ -750,19 +765,35 @@ def calculate_concept_correlation_drift(X_test_df: pd.DataFrame, test_embs: np.n
 
             test_year_mask = (X_test_df['year'] == test_year).astype(bool)
             if test_year == reference_year:
-                embs_test = embs_ref_test
-                X_tests_df = X_ref_df_test
-                y_test = y_ref_test
-                years_test = years_ref_test
+                embs_test = embs_reference
+                X_tests_df = X_reference_df
+                y_test = y_ref
+                years_test = years_ref
             else:
                 embs_test = test_embs[test_year_mask]
                 X_tests_df = X_test_df[test_year_mask][features]
                 y_test = y_test_np[test_year_mask]
                 years_test = test_years_np[test_year_mask]
-
+                embs_test = torch.tensor(emb_scaler.transform(embs_test.numpy()), dtype=torch.float32)
+                X_tests_df = pd.DataFrame(data_scaler.transform(X_tests_df), index=X_tests_df.index, columns=X_tests_df.columns)
+            
             with torch.no_grad():
                 codes_test, reconstruction_test = baseline_sae(embs_test)
-            
+           
+            above_thresh_mask_test = (codes_test >= medians)
+            high_activations_test = torch.sum(above_thresh_mask_test, dim=0)
+            high_activations_sum_test = torch.sum(above_thresh_mask_test* codes_test, dim=0)
+            high_activations_mean_test = high_activations_sum_test / torch.clamp(high_activations_test, 1)
+
+            mean_act_ratio = high_activations_mean_test[active_features_mask_reference] / high_activations_mean_reference[active_features_mask_reference]
+            mean_magnitude_ratio = mean_act_ratio.mean().item()
+
+            high_act_ratio = high_activations_test[active_features_mask_reference] / high_activations_reference[active_features_mask_reference]
+            num_active_concepts = active_features_mask_reference.sum().item()
+            dead_concepts = (high_act_ratio < 0.1).sum().item() / num_active_concepts
+            stable_concepts = ((high_act_ratio >= 0.75) & (high_act_ratio <= 1.5)).sum().item() / num_active_concepts
+            overused_concepts = (high_act_ratio > 2).sum().item() / num_active_concepts
+
             year_mse = torch.nn.functional.mse_loss(reconstruction_test, embs_test).item()
             concepts_per_patient = (codes_test > 1e-5).float().sum(dim=1).mean().item()
             
@@ -824,7 +855,11 @@ def calculate_concept_correlation_drift(X_test_df: pd.DataFrame, test_embs: np.n
                 'accuracy': acc,
                 'f1_macro': f1_macro,
                 'f1_pos': f1_pos,
-                'roc_auc_score': roc_auc
+                'roc_auc_score': roc_auc,
+                'dead_concepts': dead_concepts,
+                'stable_concepts': stable_concepts,
+                'overused_concepts': overused_concepts,
+                'high_activation_ratio': mean_magnitude_ratio
             })
     
     results = pd.DataFrame(results)
@@ -846,18 +881,35 @@ def calculate_concept_correlation_drift(X_test_df: pd.DataFrame, test_embs: np.n
         mean_accuracy=('accuracy', 'mean'),
         std_accuracy=('accuracy', 'std'),
         mean_rocauc=('roc_auc_score', 'mean'),
-        std_rocauc=('roc_auc_score', 'std')
+        std_rocauc=('roc_auc_score', 'std'),
+        mean_stable_concepts=('stable_concepts', 'mean'),
+        std_stable_concepts=('stable_concepts', 'std'),
+        # mean_dead_concepts=('dead_concepts', 'mean'),
+        # std_dead_concepts=('dead_concepts', 'std'),
+        # mean_overused_concepts=('overused_concepts', 'mean'),
+        # std_overused_concepts=('overused_concepts', 'std'),
+        mean_activation_ratio=('high_activation_ratio', 'mean'),
+        std_activation_ratio=('high_activation_ratio', 'std')
     )
 
     cols = results_agg.columns.tolist()
-    display_cols = [col for col in cols if 'std' not in col]
+    with open(f'stats/concept_drift_full.pkl', 'wb') as out:
+        dump(results, out)
     with open(f'stats/concept_drift.pkl', 'wb') as out:
         dump(results_agg, out)
+    pd.set_option('display.max_columns', None)
+    display_cols = [col for col in cols if 'std' not in col]
+    print(results_agg[display_cols])
     return results, results_agg
+
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
 
 def plotar_termometro_drift(df_agg: pd.DataFrame):
     """
-    Plota as 4 métricas de Concept Drift num único gráfico.
+    Plota as 4 métricas de Concept Drift num único gráfico normalizado.
+    Todas as métricas são escaladas de forma que o seu valor máximo seja 100%.
     Assume que df_agg possui colunas com os prefixos 'mean_' e 'std_' para:
     cos_sim, survival_rate, f1_pos e mse.
     """
@@ -868,68 +920,64 @@ def plotar_termometro_drift(df_agg: pd.DataFrame):
         
     dist = df_agg['dist']
     
+    # Função auxiliar para normalizar as métricas e seus respectivos desvios padrão
+    def normalizar(mean_col, std_col):
+        max_val = df_agg[mean_col].max()
+        if max_val == 0 or pd.isna(max_val):
+            return df_agg[mean_col] * 0, df_agg[std_col].fillna(0) * 0
+        
+        norm_mean = (df_agg[mean_col] / max_val) * 100
+        norm_std = (df_agg[std_col].fillna(0) / max_val) * 100
+        return norm_mean, norm_std
+
+    # Normalização das 4 métricas usando o prefixo exigido
+    mean_cos, std_cos = normalizar('mean_cos_sim', 'std_cos_sim')
+    mean_surv, std_surv = normalizar('mean_survival_rate', 'std_survival_rate')
+    mean_f1, std_f1 = normalizar('mean_f1_pos', 'std_f1_pos')
+    mean_mse, std_mse = normalizar('mean_mse', 'std_mse')
+
     # Criar a figura
     fig, ax1 = plt.subplots(figsize=(12, 7))
 
-    # Eixo 1 (Esquerda): Porcentagens (Semântica, Sobrevivência e F1-Score)
+    # Eixo Único (Esquerda): Proporção do Máximo (0-100%)
     ax1.set_xlabel('Distância Temporal ($\Delta t$ em anos)', fontsize=12, fontweight='bold')
-    ax1.set_ylabel('Taxa / Desempenho (%)', fontsize=12, color='black', fontweight='bold')
-    
-    # Eixo 2 (Direita): Erro de Reconstrução (MSE)
-    ax2 = ax1.twinx()
-    ax2.set_ylabel('Erro OOD (MSE)', fontsize=12, color='tab:red', fontweight='bold')
-
-    # Multiplicador para converter em percentagem
-    pct = 100.0
+    ax1.set_ylabel('Proporção do Valor Máximo (%)', fontsize=12, color='black', fontweight='bold')
 
     # 1. Estabilidade Semântica (Cos Sim)
-    std_cos = df_agg['std_cos_sim'].fillna(0)
-    p1, = ax1.plot(dist, df_agg['mean_cos_sim'] * pct, color='tab:blue', linewidth=2.5, marker='o', label='Estabilidade Semântica (Cos)')
-    ax1.fill_between(dist, (df_agg['mean_cos_sim'] - std_cos) * pct, 
-                     (df_agg['mean_cos_sim'] + std_cos) * pct, color='tab:blue', alpha=0.15)
+    p1, = ax1.plot(dist, mean_cos, color='tab:blue', linewidth=2.5, marker='o', label='Estabilidade Semântica (Cos)')
+    # ax1.fill_between(dist, mean_cos - std_cos, mean_cos + std_cos, color='tab:blue', alpha=0.15)
 
     # 2. Sobrevivência Funcional
-    std_surv = df_agg['std_survival_rate'].fillna(0)
-    p2, = ax1.plot(dist, df_agg['mean_survival_rate'] * pct, color='tab:green', linewidth=2.5, marker='s', linestyle='--', label='Sobrevivência Funcional')
-    ax1.fill_between(dist, (df_agg['mean_survival_rate'] - std_surv) * pct, 
-                     (df_agg['mean_survival_rate'] + std_surv) * pct, color='tab:green', alpha=0.15)
+    p2, = ax1.plot(dist, mean_surv, color='tab:green', linewidth=2.5, marker='s', linestyle='--', label='Sobrevivência Funcional')
+    # ax1.fill_between(dist, mean_surv - std_surv, mean_surv + std_surv, color='tab:green', alpha=0.15)
 
     # 3. F1-Score (Classe Positiva)
-    std_f1 = df_agg['std_f1_pos'].fillna(0)
-    p3, = ax1.plot(dist, df_agg['mean_f1_pos'] * pct, color='tab:purple', linewidth=2.5, marker='D', label='F1-Score (Classe Positiva)')
-    ax1.fill_between(dist, (df_agg['mean_f1_pos'] - std_f1) * pct, 
-                     (df_agg['mean_f1_pos'] + std_f1) * pct, color='tab:purple', alpha=0.15)
+    p3, = ax1.plot(dist, mean_f1, color='tab:purple', linewidth=2.5, marker='D', label='F1-Score (Classe Positiva)')
+    # ax1.fill_between(dist, mean_f1 - std_f1, mean_f1 + std_f1, color='tab:purple', alpha=0.15)
 
     # 4. Erro OOD (MSE)
-    std_mse = df_agg['std_mse'].fillna(0)
-    p4, = ax2.plot(dist, df_agg['mean_mse'], color='tab:red', linewidth=2.5, marker='^', label='Erro OOD (MSE)')
-    ax2.fill_between(dist, df_agg['mean_mse'] - std_mse, 
-                     df_agg['mean_mse'] + std_mse, color='tab:red', alpha=0.15)
+    p4, = ax1.plot(dist, mean_mse, color='tab:red', linewidth=2.5, marker='^', label='Erro OOD (MSE)')
+    # ax1.fill_between(dist, mean_mse - std_mse, mean_mse + std_mse, color='tab:red', alpha=0.15)
 
-    # Colorir os ticks e labels dos eixos
+    # Colorir os ticks e labels do eixo
     ax1.tick_params(axis='y', labelcolor='black')
-    ax2.tick_params(axis='y', labelcolor='tab:red')
     
-    # Ajustar limites do Eixo 1 (0 a 105% para ter uma margem no topo)
+    # Ajustar limites do Eixo (0 a 105% para ter uma margem no topo)
     ax1.set_ylim(bottom=0, top=105)
-    
-    # Ajustar limites do Eixo 2 para que as margens do MSE não ultrapassem o gráfico
-    max_mse_with_error = (df_agg['mean_mse'] + std_mse).max()
-    ax2.set_ylim(bottom=0, top=max_mse_with_error * 1.2)
 
     # Grid focado apenas no eixo X
     ax1.grid(True, axis='x', linestyle='--', alpha=0.5)
     ax1.set_xticks(dist.unique())
 
-    # Consolidar legendas abaixo do gráfico
+    # Consolidar legendas dentro do gráfico (loc='best') para garantir que não sejam cortadas na visualização do seu IDE
     linhas = [p1, p2, p3, p4]
-    ax1.legend(linhas, [l.get_label() for l in linhas], loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=4, frameon=False)
+    ax1.legend(linhas, [l.get_label() for l in linhas], loc='best', frameon=True, framealpha=0.9, fontsize=10)
 
-    plt.title('Erosão Estrutural vs Desempenho Preditivo (Concept Drift)', fontsize=14, pad=20, fontweight='bold')
+    plt.title('Erosão Estrutural vs Desempenho Preditivo (Valores Normalizados)', fontsize=14, pad=20, fontweight='bold')
     
     # Linha de base vertical (dt = 0)
     ax1.axvline(x=0, color='gray', linestyle=':', alpha=0.5)
     
-    # bbox_inches='tight' garante que a legenda não seja cortada ao salvar a imagem
-    plt.savefig('graphs/sae_drift.png', bbox_inches='tight')
+    plt.tight_layout()
+    plt.savefig('graphs/sae_drift_normalizado.png')
     plt.close()

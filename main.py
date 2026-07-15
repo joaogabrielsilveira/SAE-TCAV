@@ -154,14 +154,19 @@ if __name__ == '__main__':
     train_emb_scaled, test_emb_scaled, scaler_emb = scale_embeddings(train_emb, test_emb, fit_test=False)
 
     from sae_compare import calculate_concept_correlation_drift, plotar_termometro_drift
+    # with open('stats/concept_drift.pkl','rb') as f:
+    #     dist_df = load(f)
+    # plotar_termometro_drift(dist_df)
+    # exit()
+
     full_df, dist_df = calculate_concept_correlation_drift(
         X_test_df=test_rows,
-        test_embs=test_emb_scaled,
+        test_embs=test_emb,
         test_years_np=years_test_np,
         features=feature_cols,
-        alpha=1.0
+        alpha=1.0,
+        undersample=True
     )
-    plotar_termometro_drift(dist_df)
     exit()
 
     mean_train = np.mean(train_emb, axis=0)
