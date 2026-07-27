@@ -13,6 +13,161 @@ Existing behavior remains authoritative for CAV construction:
 
 Semantic rule sets serve cross-run description and transfer only. They are recall-oriented OR-of-ANDs models and must not feed `train_cavs_from_rules`. Keeping both paths separate avoids contaminating CAV positives with broader, lower-precision semantic coverage.
 
+## Installation and required inputs
+
+Use Python 3.11 and Git. The repository depends on a pinned Drift-Resilient
+TabPFN fork because the current code uses its domain-shift, embedding, and
+gradient APIs; PyPI `tabpfn` is not a compatible substitute.
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements-semantic.txt
+python -m pytest -q
+```
+
+`requirements-semantic.txt` contains the complete direct Python dependency set
+for semantic comparison and the upstream SAE, tree, CAV/TCAV, and dataset code.
+The TabPFN Git dependency includes the checkpoint selected by
+`TabPFNEvalConfig`.
+
+Dependencies cannot supply experiment data. There are now two supported entry
+points:
+
+- `main-comparison.py` starts from the renal event Feather file and runs data
+  preparation, TabPFN, two SAE runs, geometric matching, the legacy
+  high-precision rule/CAV/TCAV path, and the complete semantic comparison.
+- `semantic_experiment.py` starts from already-computed, aligned SAE
+  activations. It is useful for rerunning only the semantic layer.
+
+The lower-level semantic CLI expects:
+
+- an aligned NPZ bundle containing raw tabular features, outcomes, patient IDs,
+  feature names, and activations from each already-trained SAE run;
+- a JSON list of one-to-one factor matches;
+- an optional external clinical-group mapping.
+
+The exact schemas and commands are documented below. `main.py` remains an
+unchanged, outdated research script. Its early `exit()` calls do not affect
+`main-comparison.py`, and they should not be commented out for the new
+workflow. A non-renal dataset must first be adapted to the runner's prepared
+data seam or directly to the semantic bundle contract.
+
+## Complete renal runner
+
+`main-comparison.py` is a thin command-line wrapper around the importable
+`comparison_runner.run_comparison` interface. The default configuration is
+`comparison_runner.example.json`.
+
+For a Feather file in the repository root:
+
+```bash
+python main-comparison.py \
+  --config comparison_runner.example.json \
+  --device cuda \
+  --data tidy_event_data.feather
+```
+
+`--device cuda` fails immediately if CUDA is unavailable, preventing an
+expensive run from silently falling back to CPU. Use `--device auto` or the
+configuration default when the same configuration must also work on
+CPU-only machines.
+
+The Feather file must use the current renal event schema: `patient_id`,
+`date`, and `event`, including an exact `DEATH` event. The preparation code
+builds patient-year count rows and derives the binary `DEATH` outcome.
+
+The default complete run:
+
+1. Prepares the renal train/test rows and fits Drift-Resilient TabPFN.
+2. Evaluates TabPFN by test year and extracts aligned train/test embeddings.
+3. Makes one patient-grouped four-way split of test records.
+4. Trains exactly two SAEs on `semantic_fit`, using seeds `42` and `135`.
+5. Re-encodes every test record through both frozen SAEs.
+6. Performs one-to-one Hungarian matching and keeps pairs with cosine at least
+   `0.7`.
+7. Learns the existing precision-first single rule for each selected factor,
+   constructs CAVs on `semantic_select`, and evaluates TCAV on `tcav_eval`.
+8. Learns recurrent recall-oriented semantic rule sets and evaluates pooled
+   and class-separated symmetric transfer on `semantic_final`.
+
+### GPU execution controls
+
+The complete runner uses the selected accelerator for TabPFN, SAE training,
+batched SAE activation encoding, and TCAV gradients. The example configuration
+starts with conservative settings suitable for a large GPU:
+
+```json
+{
+  "accelerator": {"device": "auto"},
+  "tabpfn": {"batch_size": 1024},
+  "sae": {"encoding_batch_size": 8192},
+  "functional": {"gradient_batch_size": 512}
+}
+```
+
+For the first GPU run, pass `--device cuda`. If CUDA runs out of memory,
+reduce the batch size for the failing stage; completed and failed stage names
+are persisted as described below. TCAV gradients remain
+FP32 because transfer scores depend on gradient/CAV dot-product signs.
+Mixed-precision and TF32 modes are intentionally not enabled in this initial
+optimization.
+
+`stage_metrics.json` is updated after every stage and records wall-clock
+seconds, resolved device, and—on CUDA—peak allocated and reserved VRAM. The
+same information, total timed seconds, GPU name, compute capability, CUDA
+version, and total GPU memory are copied into `runner_manifest.json`. This
+makes the first run a useful profiling run without requiring an external
+profiler.
+
+Stable randomized-tree discovery, CAV logistic regression, rule clustering,
+and tabular preparation remain CPU operations. A GPU therefore accelerates
+the neural stages but does not remove the need for later deterministic CPU
+parallelism when running millions of shallow tree fits.
+
+No stage imports or executes `main.py`. Use configuration fields rather than
+editing that file.
+
+Useful command-line overrides:
+
+```bash
+# Recompute even when a complete cached result exists.
+python main-comparison.py --force --data tidy_event_data.feather
+
+# Include every Hungarian assignment, regardless of cosine. This can be very
+# expensive with the standard bootstrap configuration.
+python main-comparison.py --all-pairs --data tidy_event_data.feather
+
+# Run geometry and stable semantic rules without rebuilding CAV/TCAV.
+python main-comparison.py --skip-functional --data tidy_event_data.feather
+```
+
+For a smaller first run, set `matching.max_pairs_per_run_pair` in
+`comparison_runner.example.json` and reduce `discovery.n_bootstraps` and
+`discovery.trees_per_bootstrap` in the semantic configuration. The runner
+prints the selected pair/factor count and estimated randomized-tree fits before
+semantic rule discovery.
+
+The runner creates a content-addressed directory below
+`<artifact_dir>/<runner_hash>/`. Its main outputs are:
+
+- `summary.json` and `runner_manifest.json`;
+- `prepared.pkl`, `embeddings.npz`, `activations.npz`, and `sae/run_<id>.pt`;
+- `splits.npz` and `semantic_inputs.npz`, preserving aligned records for audit
+  or lower-level reruns;
+- `matches_all.{json,csv}` and `matched_factors.{json,csv}`;
+- `high_precision_rules.jsonl`, `functional.json`,
+  `functional_cavs.npz`, and scoped decision-tree/gradient artifacts;
+- `semantic/<experiment_hash>/`, containing all semantic artifacts documented
+  later in this file, including `pair_metrics_by_class.csv`.
+
+The runner hash includes the dataset bytes, complete runner configuration,
+semantic-configuration bytes, external clinical-group mapping bytes, and
+relevant source files. A matching `summary.json` is a complete-result cache;
+inner embedding, SAE, gradient, and semantic artifacts provide additional
+stage-level reuse.
+
 ## Implemented modules
 
 ### `semantic_rules.py`
@@ -43,7 +198,7 @@ Outer bootstraps define recurrence. Multiple trees within one bootstrap improve 
 
 ### `semantic_config.py`
 
-Provides strict dataclass configuration for activation targets, constrained selection, discovery, runtime, artifacts, and clinical-group mapping. Unknown top-level keys fail early. `load_clinical_groups` accepts one-to-many feature mappings from JSON; unmapped features remain distinguishable singleton groups during discovery.
+Provides strict dataclass configuration for activation targets, constrained selection, discovery, runtime, additive class-separated evaluation, artifacts, and clinical-group mapping. `class_analysis.enabled` defaults to `true`; setting it to `false` omits class-specific evaluation while leaving pooled results unchanged. Unknown top-level keys and non-boolean class-analysis values fail early. `load_clinical_groups` accepts one-to-many feature mappings from JSON; unmapped features remain distinguishable singleton groups during discovery.
 
 ### `semantic_artifacts.py`
 
@@ -112,9 +267,23 @@ For factor `i` in run A and matched factor `j` in run B, at each activation targ
 - Report target-cohort Jaccard and selected-rule-cohort Jaccard.
 - Report exact input-feature and configured clinical-group set equality/Jaccard.
 - Join decoder cosine and high-activation overlap from existing matching.
-- Keep CAV/TCAV compatibility alongside semantic results. `compare_tcav_pair` computes it from legacy CAVs/gradients. Library callers may pass nested or keyed `functional_by_factor` entries containing `CAV`/`cav` and `TCAV_score`/`tcav_score`; pair results then include CAV cosine, TCAV scores/difference, and effect-sign agreement. CLI does not rebuild CAVs and retains precomputed pair metadata supplied as extra match fields.
+- Keep CAV/TCAV compatibility alongside semantic results. `compare_tcav_pair` computes it from legacy CAVs/gradients. Library callers may pass nested or keyed `functional_by_factor` entries containing `CAV`/`cav` and `TCAV_score`/`tcav_score`; pair results then include CAV cosine, TCAV scores/difference, and effect-sign agreement. The lower-level semantic CLI retains precomputed pair metadata; the complete renal runner rebuilds the high-precision rules and functional artifacts before invoking it.
 
 Directional values remain first-class. High `i_to_j` with low `j_to_i` can reveal semantic containment: run A's rule describes a subset of run B, while run B's broader rule does not isolate run A.
+
+### Additive evaluation by observed class
+
+When `class_analysis.enabled` is `true`, the pipeline also partitions `semantic_final` by the observed outcome supplied as `outcome_for_stratification`. It evaluates the same frozen activation cutoffs and rule sets on each class subset. It does not train more SAEs, refit rules, fit class-specific cutoffs, or expose final rows to model selection.
+
+The existing pooled `transfer` object remains unchanged. Every target-level pair result gains a sibling `class_analysis` list, ordered deterministically by class value. Each item records:
+
+- `class_value`, final-subset sample count, and positive-target counts for both matched factors;
+- `valid` plus explicit reasons when either factor has no positive activation targets in that class;
+- the same directional and symmetric transfer structure used by pooled analysis.
+
+Prevalence, precision, recall, F2, lift, WRAcc, coverage, target/prediction Jaccard, selected-cohort Jaccard, and activation-cohort Jaccard are recomputed from that class subset. Both directions use the same ordered held-out rows. Exact feature and clinical-group agreement remain pair-level properties because class analysis reuses the pooled frozen rule sets.
+
+Pair-level `class_threshold_stability` maps each serialized class value to its F2 minimum, maximum, and range across configured activation targets. This complements the existing pooled threshold-stability summary; it does not replace it. Geometry and CAV/TCAV fields also remain unchanged and pair-level.
 
 Pair artifacts retain structured comparison plus flat compatibility keys. Representative transfer fragment:
 
@@ -185,6 +354,7 @@ WoodTapper is a useful Python SIRUS implementation, but adds version/platform co
 - `discovery.positive_leaf_probability`, `min_positive_leaf_samples`
 - `discovery.max_candidates_per_bootstrap`, `min_family_recurrence`, `family_similarity_threshold`
 - `runtime.seed`, `n_jobs`, `cache`, `artifact_dir`
+- `class_analysis.enabled`: additive final evaluation by observed outcome class; defaults to `true`
 - `clinical_groups_path`
 
 Clinical group mappings live in external JSON, as shown by `clinical_groups.example.json`. One feature may belong to several groups. Unmapped features become singleton `feature:<name>` groups; manifest reports mapping count, coverage, and unmapped names. Production experiments should version this taxonomy with experiment configuration and record its content hash.
@@ -204,7 +374,8 @@ Bundle must contain `X`, `outcome`, `patient_ids`, `feature_names`, and at least
 
 Library callers can invoke `learn_factor_semantics` for one run/factor/threshold or `run_semantic_comparison` for the complete aligned experiment. Existing no-argument/notebook-style usage remains unaffected.
 
-`requirements-semantic.txt` lists additive NumPy, scikit-learn, and pytest bounds for this layer. It does not attempt to replace the existing TabPFN/PyTorch environment.
+`requirements-semantic.txt` installs both the semantic layer and its upstream
+TabPFN/PyTorch/data-science environment. Python 3.11 is the supported target.
 
 ## Artifacts
 
@@ -212,11 +383,12 @@ Semantic outputs belong under `<artifact_dir>/<experiment_hash>/`, separate from
 
 Written files:
 
-- `manifest.json`: schema, resolved configuration, experiment hash, tabular/activation/split/clinical-group fingerprints, environment versions, and record/pair counts.
+- `manifest.json`: schema, resolved configuration, experiment hash, tabular/activation/split/clinical-group fingerprints, environment versions, record/pair counts, and `class_analysis` metadata (`enabled`, deterministically ordered final class values, and final class support).
 - `splits.npz`: partition indices plus hashed record keys needed to prove cross-run alignment; avoid raw patient identifiers.
 - `semantic_rules.jsonl`: one run/factor/target record containing fitted cutoff, family recurrence/stability, representative rules, bootstrap seeds/diagnostics, and selection metrics/status.
-- `pair_results.jsonl`: complete directional pair records.
-- `pair_metrics.csv`: flattened analysis table.
+- `pair_results.jsonl`: complete pooled directional pair records plus additive target-level class analyses and pair-level class threshold stability when enabled.
+- `pair_metrics.csv`: existing pooled flattened analysis table; columns and one-row-per-pair/target behavior remain unchanged.
+- `pair_metrics_by_class.csv`: additive one-row-per-pair/target/class analysis table, written only when class analysis is enabled.
 - `result.json`: complete cached return payload, including manifest, semantic models, and pair results.
 
 Experiment hash includes resolved configuration, semantic source fingerprint, tabular data, stratification outcome, patient groups, optional record keys, aligned activation matrices, split indices, clinical-group mapping, match rows, and feature names. Activation bytes therefore identify effective SAE outputs even though SAE weight files are not CLI inputs. `--force` recomputes. Never reuse a cache solely because record count matches; optional legacy gradient-cache shape check is only a minimum guard.
@@ -245,7 +417,7 @@ Main cost scales with matched SAE runs, referenced factors, activation targets, 
 
 ## Failure behavior
 
-Dead factors, insufficient positive fitting samples, single-class bootstraps, empty candidate pools, no recurrent families, and no feasible constrained subset produce explicit invalid reasons/warnings plus empty rule sets. They do not silently relax constraints or fall back to final held-out data.
+Dead factors, insufficient positive fitting samples, single-class bootstraps, empty candidate pools, no recurrent families, and no feasible constrained subset produce explicit invalid reasons/warnings plus empty rule sets. A final class subset with no positive target for either matched factor retains its class-result shape but is marked invalid with explicit reasons. These cases do not silently relax constraints or fall back to final held-out data.
 
 ## Deferred extension points
 

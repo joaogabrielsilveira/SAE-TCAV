@@ -22,6 +22,7 @@ class TabPFNEvalConfig:
     tabpfn_model_name: str = 'tabpfn_dist_model_1'
     batch_size_predict: int = BATCH_SIZE
     run_id: str = "demo_tabpfn_step1"
+    device: str = "auto"
 
 class EmbeddingExtractConfig:
     batch_size = 512
@@ -79,7 +80,7 @@ def fit_dr_tabpfn(X_train: np.ndarray, y_train: np.ndarray, train_years: np.ndar
             model_type="single_fast",
             paths_config=model_path_config,
             debug=False,
-            device="auto",
+            device=eval_cfg.device,
         )
 
         if hasattr(drift_model, "show_progress"):
@@ -88,7 +89,7 @@ def fit_dr_tabpfn(X_train: np.ndarray, y_train: np.ndarray, train_years: np.ndar
             drift_model.seed = eval_cfg.rng_seed
 
     except Exception:
-        drift_model = TabPFNClassifier(device='auto')
+        drift_model = TabPFNClassifier(device=eval_cfg.device)
 
     t0 = time.perf_counter()
     drift_model = drift_model.fit(

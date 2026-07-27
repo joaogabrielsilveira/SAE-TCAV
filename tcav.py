@@ -15,13 +15,18 @@ from sklearn.model_selection import cross_val_score
 from scipy import stats
 import warnings
 from pathlib import Path
+from runtime_acceleration import resolve_torch_device
 
 CAVS_FILE = get_env_path('models/tcav/cavs.pkl')
 GRADS_FILE = get_env_path('models/tcav/grads.pkl')
 
 def get_model_gradients(model: TabPFNClassifier, dist_vec: np.ndarray, X: np.ndarray,
-                        cache_file: str | os.PathLike | None = None) -> np.ndarray:
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                        cache_file: str | os.PathLike | None = None,
+                        batch_size: int = 128,
+                        device: str = "auto") -> np.ndarray:
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    gradient_device = resolve_torch_device(device)
     gradients_file = str(cache_file) if cache_file is not None else GRADS_FILE
 
     if os.path.exists(gradients_file):
@@ -32,38 +37,48 @@ def get_model_gradients(model: TabPFNClassifier, dist_vec: np.ndarray, X: np.nda
             print(f'Carregando grads de {gradients_file}')
             return grads
 
-    model_decode_layer = model.model_processed_.decoder_dict['standard'].to(device)
-    BATCH_SIZE = 128
+    model_decode_layer = model.model_processed_.decoder_dict['standard']
+    original_device = next(model_decode_layer.parameters()).device
+    model_decode_layer.to(gradient_device)
     gradients = []
-    for s in range(0, X.shape[0], BATCH_SIZE):
-        e = min(s + BATCH_SIZE, X.shape[0])
+    try:
+        for s in range(0, X.shape[0], batch_size):
+            e = min(s + batch_size, X.shape[0])
 
-        print(f'Batch {s}-{e}')
-        x_batch = X[s:e].astype(np.float32)
-        dist_batch = dist_vec[s:e]
+            print(f'Batch {s}-{e}')
+            x_batch = X[s:e].astype(np.float32)
+            dist_batch = dist_vec[s:e]
 
-        dist_t = torch.tensor(dist_batch, dtype=torch.long, device='cpu').reshape(-1, 1, 1)
+            dist_t = torch.tensor(
+                dist_batch, dtype=torch.long, device='cpu'
+            ).reshape(-1, 1, 1)
 
-        with torch.enable_grad():
-            emb = model.get_embeddings(x_batch, additional_x={"dist_shift_domain": dist_t})
-            if emb.ndim == 3 and emb.shape[0] == 1:
-                emb = emb[0]
-            elif emb.ndim == 3 and emb.shape[1] == 1:
-                emb = emb.squeeze(1)
+            with torch.enable_grad():
+                emb = model.get_embeddings(
+                    x_batch,
+                    additional_x={"dist_shift_domain": dist_t},
+                )
+                if emb.ndim == 3 and emb.shape[0] == 1:
+                    emb = emb[0]
+                elif emb.ndim == 3 and emb.shape[1] == 1:
+                    emb = emb.squeeze(1)
 
-            emb_in = emb.clone().detach().to(device, dtype=torch.float32).requires_grad_(True)
-            emb_in.requires_grad = True
-            print(emb_in.shape)
+                emb_in = emb.clone().detach().to(
+                    gradient_device, dtype=torch.float32
+                ).requires_grad_(True)
+                print(emb_in.shape)
 
-            def single_pass(x_p):
-                out = model_decode_layer(x_p).unsqueeze(0)
-                if out.ndim == 3:
-                    out = out[0]
-                return out[0, 1]
+                def single_pass(x_p):
+                    out = model_decode_layer(x_p).unsqueeze(0)
+                    if out.ndim == 3:
+                        out = out[0]
+                    return out[0, 1]
 
-            batch_grad = vmap(grad(single_pass))(emb_in)
-            gradients.append(batch_grad.detach().cpu().numpy())
-            print(gradients[0].shape)
+                batch_grad = vmap(grad(single_pass))(emb_in)
+                gradients.append(batch_grad.detach().cpu().numpy())
+                print(gradients[0].shape)
+    finally:
+        model_decode_layer.to(original_device)
     
     Path(gradients_file).parent.mkdir(parents=True, exist_ok=True)
     with open(gradients_file, 'wb') as f:

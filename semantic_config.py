@@ -93,12 +93,33 @@ class RuntimeConfig:
 
 
 @dataclass(frozen=True)
+class ClassAnalysisConfig:
+    """Additive held-out evaluation stratified by observed outcome class."""
+
+    enabled: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError("class_analysis.enabled must be a boolean")
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "ClassAnalysisConfig":
+        if not isinstance(raw, Mapping):
+            raise ValueError("class_analysis must be a JSON object")
+        unknown = set(raw) - {"enabled"}
+        if unknown:
+            raise ValueError(f"Unknown class_analysis fields: {sorted(unknown)}")
+        return cls(enabled=raw.get("enabled", True))
+
+
+@dataclass(frozen=True)
 class SemanticExperimentConfig:
     schema_version: str = "1.0"
     activation_targets: ActivationTargetConfig = field(default_factory=ActivationTargetConfig)
     objective: RuleObjectiveConfig = field(default_factory=RuleObjectiveConfig)
     discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
+    class_analysis: ClassAnalysisConfig = field(default_factory=ClassAnalysisConfig)
     clinical_groups_path: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -112,6 +133,7 @@ class SemanticExperimentConfig:
             "objective",
             "discovery",
             "runtime",
+            "class_analysis",
             "clinical_groups_path",
         }
         unknown = set(raw) - known
@@ -123,6 +145,7 @@ class SemanticExperimentConfig:
             objective=RuleObjectiveConfig(**raw.get("objective", {})),
             discovery=DiscoveryConfig(**raw.get("discovery", {})),
             runtime=RuntimeConfig(**raw.get("runtime", {})),
+            class_analysis=ClassAnalysisConfig.from_dict(raw.get("class_analysis", {})),
             clinical_groups_path=raw.get("clinical_groups_path"),
         )
 

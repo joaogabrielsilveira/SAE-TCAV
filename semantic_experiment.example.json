@@ -34,5 +34,8 @@
     "cache": true,
     "artifact_dir": "stats/semantic"
   },
+  "class_analysis": {
+    "enabled": true
+  },
   "clinical_groups_path": "clinical_groups.example.json"
 }

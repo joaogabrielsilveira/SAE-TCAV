@@ -1,0 +1,42 @@
+{
+  "dataset_path": "data/renal/tidy_event_data.feather",
+  "semantic_config_path": "semantic_experiment.example.json",
+  "artifact_dir": "stats/comparison",
+  "use_cache": true,
+  "seed": 42,
+  "accelerator": {
+    "device": "auto"
+  },
+  "tabpfn": {
+    "model_name": "tabpfn_dist_model_1",
+    "batch_size": 1024,
+    "run_walkforward": true
+  },
+  "sae": {
+    "seeds": [42, 135],
+    "model_type": "ReLU",
+    "epochs": 1000,
+    "alpha": 0.1,
+    "scaling_factor": 1.5,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0,
+    "k": 16,
+    "k_aux": 64,
+    "encoding_batch_size": 8192
+  },
+  "matching": {
+    "scope": "all",
+    "criterion": "cos_sim",
+    "minimum_score": 0.7,
+    "max_pairs_per_run_pair": null
+  },
+  "functional": {
+    "enabled": true,
+    "tree_max_depth": 15,
+    "minimum_rule_samples": 50,
+    "minimum_cav_samples": 50,
+    "forced_rule_fallback": true,
+    "significance_runs": 15,
+    "gradient_batch_size": 512
+  }
+}

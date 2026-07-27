@@ -5,6 +5,7 @@ from torch import nn
 import torch.nn.functional as F
 from results import save_model_stats
 from filepaths import get_env_path
+from runtime_acceleration import resolve_torch_device
 
 SAE_MODEL_PATH = get_env_path('models')
 
@@ -95,24 +96,35 @@ class SAE(nn.Module):
 def train_sae_model(inputs: torch.Tensor, epochs:int=1000, learning_rate:float=1e-3, weight_decay:float=0.0,
                     alpha:float=1e-1, save_data=True, data_source:str = 'training', use_decoder_bias: bool = False,
                     rng_seed: int=42, use_cache: bool=False, scaling_factor: float=1.5, type: str='ReLU',
-                    k: int=12, k_aux:int=64) -> SAE:
+                    k: int=12, k_aux:int=64, data_dimension: int | None = None,
+                    device: str | None = None) -> SAE:
     """" Treina o Sparse AutoEncoder usando a entrada e os hiperparâmetros passados.
          O parâmetro alpha é a constante que controla a penalização por dados densos. """
+    if inputs.ndim != 2:
+        raise ValueError("inputs must be a two-dimensional tensor")
+    inferred_dimension = int(inputs.shape[1])
+    if data_dimension is None:
+        data_dimension = inferred_dimension
+    elif int(data_dimension) != inferred_dimension:
+        raise ValueError(
+            "data_dimension must match the final dimension of inputs"
+        )
+
     torch.manual_seed(rng_seed)
-    model = SAE(use_decoder_bias=use_decoder_bias, scaling_factor=scaling_factor, type=type, k=k, k_aux=k_aux)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    # device = 'cpu'
-    model.to(device)
-    inputs.to(device)
+    model = SAE(data_dimension=int(data_dimension), use_decoder_bias=use_decoder_bias,
+                scaling_factor=scaling_factor, type=type, k=k, k_aux=k_aux)
+    training_device = resolve_torch_device(device or "auto")
+    model.to(training_device)
 
     if use_cache and os.path.exists(SAE_MODEL_PATH + f'/{data_source}_sae.pth'):
         print(f'Carregando SAE do arquivo salvo')
         model.load_state_dict(torch.load(f=SAE_MODEL_PATH + f'/{data_source}_sae.pth'))
+        model.to('cpu')
         return model
 
     optimizer = torch.optim.Adam(params=model.parameters(), lr=learning_rate, weight_decay=weight_decay)    # original_sparsity = float((inputs <= 1e-5).float().mean().detach().cpu().item())
     # print(f'Original sparsity: {original_sparsity*100}%')
-    inputs = inputs.to(device, dtype=torch.float32)
+    inputs = inputs.to(training_device, dtype=torch.float32)
     losses = []
 
     for epoch in range(1, epochs + 1):

@@ -1,5 +1,25 @@
-# Additive dependencies for semantic rule discovery/tests. Existing pipeline
-# also requires its current TabPFN/PyTorch/data-science environment.
-numpy>=1.26,<3
-scikit-learn>=1.4,<2
+# Complete environment for semantic comparison plus its upstream
+# SAE, decision-tree, CAV/TCAV, and dataset-preparation code.
+#
+# Use Python 3.11. The pinned Drift-Resilient TabPFN fork requires Git during
+# installation and exposes APIs that are not compatible with PyPI `tabpfn`.
+
+# Numerical/data stack. Versions recover the environment previously recorded
+# in this repository and satisfy the pinned TabPFN fork.
+numpy==1.26.4
+pandas==2.3.3
+scipy==1.15.3
+scikit-learn==1.5.2
+imbalanced-learn==0.13.0
+matplotlib==3.10.9
+lightgbm==3.3.5
+pyarrow==24.0.0
+
+# SAE, TCAV, and Drift-Resilient TabPFN.
+torch==2.1.2
+typing-extensions==4.15.0
+python-dotenv==1.2.2
+drift-resilient-tabpfn @ git+https://github.com/automl/Drift-Resilient_TabPFN@a6e75afb82d13e7abb46deade3669c4106b3d636
+
+# Test suite.
 pytest>=8,<10

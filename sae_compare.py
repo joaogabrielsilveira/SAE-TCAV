@@ -6,7 +6,9 @@ import matplotlib.pyplot as plt
 from scipy.optimize import linear_sum_assignment
 from matplotlib.ticker import PercentFormatter
 from pickle import dump, load
+from typing import Sequence
 from tabpfn_model import load_or_extract_embeddings, scale_embeddings, temporal_test_subsplits, fit_dr_tabpfn, walkforward_evaluate_tabpfn, TabPFNClassifier, TabPFNEvalConfig, EmbeddingExtractConfig
+from runtime_acceleration import resolve_torch_device
 
 def activation_threshold(concept: np.ndarray, perc: int=90):
     pos_act = concept[concept > 0]
@@ -25,24 +27,71 @@ def high_activation_matrix(concepts: np.ndarray, perc: int=90):
     return np.asarray(matrix, dtype=bool).transpose()
 
 
-def encode_sae(sae_or_run, embeddings: np.ndarray) -> np.ndarray:
-    """Encode shared records through an already-trained SAE without refitting."""
+def encode_sae(
+    sae_or_run,
+    embeddings: np.ndarray,
+    *,
+    device: str = "auto",
+    batch_size: int | None = None,
+) -> np.ndarray:
+    """Encode shared records in bounded batches on the requested device."""
 
     model = sae_or_run.get('model') if isinstance(sae_or_run, dict) else sae_or_run
     model_type = sae_or_run.get('model_type') if isinstance(sae_or_run, dict) else None
-    with torch.no_grad():
-        encoded = model.encode(torch.as_tensor(embeddings, dtype=torch.float32))
-    if isinstance(encoded, tuple):
-        encoded = encoded[1]
     if model_type not in (None, 'ReLU', 'TopK'):
         raise ValueError(f'Unsupported SAE model type: {model_type}')
-    return encoded.detach().cpu().numpy()
+    values = np.asarray(embeddings)
+    if values.ndim != 2:
+        raise ValueError("embeddings must be a two-dimensional array")
+    if batch_size is None:
+        batch_size = max(len(values), 1)
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+
+    target_device = resolve_torch_device(device)
+    original_device = next(model.parameters()).device
+    was_training = model.training
+    encoded_batches: list[np.ndarray] = []
+    model.to(target_device)
+    model.eval()
+    try:
+        with torch.inference_mode():
+            for start in range(0, len(values), batch_size):
+                batch = torch.as_tensor(
+                    values[start : start + batch_size],
+                    dtype=torch.float32,
+                    device=target_device,
+                )
+                encoded = model.encode(batch)
+                if isinstance(encoded, tuple):
+                    encoded = encoded[1]
+                encoded_batches.append(encoded.cpu().numpy())
+    finally:
+        model.to(original_device)
+        model.train(was_training)
+    if not encoded_batches:
+        return np.empty((0, model.num_latents), dtype=np.float32)
+    return np.concatenate(encoded_batches, axis=0)
 
 
-def encode_sae_runs(sae_runs: list[dict], embeddings: np.ndarray) -> dict[int, np.ndarray]:
+def encode_sae_runs(
+    sae_runs: list[dict],
+    embeddings: np.ndarray,
+    *,
+    device: str = "auto",
+    batch_size: int | None = None,
+) -> dict[int, np.ndarray]:
     """Encode identical records through every configured SAE run."""
 
-    return {int(run['idx']): encode_sae(run, embeddings) for run in sae_runs}
+    return {
+        int(run['idx']): encode_sae(
+            run,
+            embeddings,
+            device=device,
+            batch_size=batch_size,
+        )
+        for run in sae_runs
+    }
 
 def max_activation_overlap(sae_i: dict[str], concept:int, sae_j: dict[str], perc: int = 90):
     overlaps = []
@@ -108,30 +157,71 @@ def overlap_matrix(sae_i: dict[str], sae_j: dict[str]) -> np.ndarray:
     # print(f'overlap_matrix: {matrix.shape}')
     return matrix
 
-def train_all_saes(num_models: int, embs: np.ndarray, alpha: float=1e-1, scaling_factor: float=1.5, model_type: str='ReLU', k:int=16, k_aux:int=64, universal_embs: np.ndarray = None) -> list[dict[str]]:
+def train_all_saes(num_models: int, embs: np.ndarray, alpha: float=1e-1,
+                   scaling_factor: float=1.5, model_type: str='ReLU',
+                   k:int=16, k_aux:int=64,
+                   universal_embs: np.ndarray = None,
+                   seeds: Sequence[int] | None = None,
+                   epochs: int = 1000,
+                   learning_rate: float = 1e-3,
+                   weight_decay: float = 0.0,
+                   device: str = "auto",
+                   encoding_batch_size: int = 4096) -> list[dict[str]]:
+    if seeds is not None and len(seeds) != num_models:
+        raise ValueError("seeds must contain exactly num_models entries")
+    if encoding_batch_size < 1:
+        raise ValueError("encoding_batch_size must be positive")
+
     sae_list = []
     for i in range(num_models):
 
-        if i == 0:
+        if seeds is not None:
+            current_seed = int(seeds[i])
+        elif i == 0:
             # primeira seed fixada igual à usada na análise do pipeline para ter uma base
             current_seed = 42
         else:
             current_seed = 10 * (i ** 2) + 50 * i + 75
     
-        sae = train_sae_model(inputs=torch.tensor(embs), type=model_type, alpha=alpha, scaling_factor=scaling_factor, save_data=False, use_decoder_bias=True, use_cache=False, rng_seed=current_seed, epochs=1000, k=k, k_aux=k_aux)
-        codes_universal = None
+        sae = train_sae_model(
+            inputs=torch.tensor(embs),
+            type=model_type,
+            alpha=alpha,
+            scaling_factor=scaling_factor,
+            save_data=False,
+            use_decoder_bias=True,
+            use_cache=False,
+            rng_seed=current_seed,
+            epochs=epochs,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            k=k,
+            k_aux=k_aux,
+            device=device,
+        )
+        run_for_encoding = {"model": sae, "model_type": model_type}
+        codes = encode_sae(
+            run_for_encoding,
+            embs,
+            device=device,
+            batch_size=encoding_batch_size,
+        )
+        codes_universal = (
+            encode_sae(
+                run_for_encoding,
+                universal_embs,
+                device=device,
+                batch_size=encoding_batch_size,
+            )
+            if universal_embs is not None
+            else None
+        )
 
         if model_type == 'ReLU':
             weights = sae.encoder.weight.cpu().detach().numpy()
-            codes = sae.encode(x=torch.tensor(embs)).cpu().detach().numpy()
-            if universal_embs is not None:
-                codes_universal = sae.encode(x=torch.tensor(universal_embs)).cpu().detach().numpy()
 
         elif model_type == 'TopK':
             weights = sae.decoder.weight.T.cpu().detach().numpy()
-            codes = sae.encode(x=torch.tensor(embs))[1].cpu().detach().numpy()
-            if universal_embs is not None:
-                codes_universal = sae.encode(x=torch.tensor(universal_embs))[1].cpu().detach().numpy()
             
             
         sparsity = (codes <= 1e-5).mean()
@@ -965,7 +1055,7 @@ def plotar_termometro_drift(df_agg: pd.DataFrame):
     fig, ax1 = plt.subplots(figsize=(12, 7))
 
     # Eixo Único (Esquerda): Proporção do Máximo (0-100%)
-    ax1.set_xlabel('Distância Temporal ($\Delta t$ em anos)', fontsize=12, fontweight='bold')
+    ax1.set_xlabel(r'Distância Temporal ($\Delta t$ em anos)', fontsize=12, fontweight='bold')
     ax1.set_ylabel('Proporção do Valor Máximo (%)', fontsize=12, color='black', fontweight='bold')
 
     # 1. Estabilidade Semântica (Cos Sim)

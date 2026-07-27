@@ -26,7 +26,9 @@ from semantic_artifacts import (
 from semantic_compare import (
     RuleFamily,
     RuleSimilarityConfig,
+    SemanticPairComparison,
     cluster_rule_families,
+    compare_rule_sets_by_class,
     compare_rule_sets_symmetric,
     recurrent_representatives,
 )
@@ -426,6 +428,45 @@ def _rule_set_groups(model: FactorSemanticRepresentation) -> set[str]:
     }
 
 
+def _transfer_row(transfer: SemanticPairComparison) -> dict[str, Any]:
+    """Preserve the existing flattened compatibility view of pair transfer."""
+
+    return {
+        **transfer.to_dict(),
+        "i_to_j": transfer.i_to_j.to_dict(),
+        "j_to_i": transfer.j_to_i.to_dict(),
+        "mean": transfer.mean,
+        "min": transfer.minimum,
+        "target_cohort_jaccard": transfer.target_cohort_jaccard,
+        "exact_feature_jaccard": transfer.exact_feature_agreement.jaccard,
+        "exact_feature_equal": transfer.exact_feature_equal,
+        "clinical_group_jaccard": transfer.clinical_group_agreement.jaccard,
+        "clinical_group_equal": transfer.clinical_group_equal,
+    }
+
+
+def _class_threshold_stability(
+    threshold_rows: Sequence[Mapping[str, Any]],
+) -> dict[str, dict[str, float]]:
+    """Summarize held-out transfer across thresholds for each outcome class."""
+
+    by_class: dict[str, list[float]] = {}
+    for threshold in threshold_rows:
+        for class_result in threshold.get("class_analysis", []):
+            key = str(class_result["class_value"])
+            by_class.setdefault(key, []).append(
+                float(class_result["transfer"]["mean"]["f2"])
+            )
+    return {
+        class_value: {
+            "transfer_f2_mean_min": min(values),
+            "transfer_f2_mean_max": max(values),
+            "transfer_f2_mean_range": max(values) - min(values),
+        }
+        for class_value, values in sorted(by_class.items())
+    }
+
+
 def run_semantic_comparison(
     *,
     X: np.ndarray,
@@ -489,6 +530,7 @@ def run_semantic_comparison(
     fit_indices = splits["idx_semantic_fit"]
     selection_indices = splits["idx_semantic_select"]
     final_indices = splits["idx_semantic_final"]
+    final_outcomes = y_stratify[final_indices]
     required: set[tuple[str, int]] = set()
     for pair in pairs:
         run_i, run_j, factor_i, factor_j = _pair_fields(pair)
@@ -541,20 +583,7 @@ def run_semantic_comparison(
                 factor_j_id=f"{run_j}:{factor_j}",
                 threshold_name=model_i.target.spec.name,
             )
-            transfer_dict = transfer.to_dict()
-            transfer_row = {
-                **transfer_dict,
-                "i_to_j": transfer.i_to_j.to_dict(),
-                "j_to_i": transfer.j_to_i.to_dict(),
-                "mean": transfer.mean,
-                "min": transfer.minimum,
-                "target_cohort_jaccard": transfer.target_cohort_jaccard,
-                "exact_feature_jaccard": transfer.exact_feature_agreement.jaccard,
-                "exact_feature_equal": transfer.exact_feature_equal,
-                "clinical_group_jaccard": transfer.clinical_group_agreement.jaccard,
-                "clinical_group_equal": transfer.clinical_group_equal,
-            }
-            threshold_rows.append({
+            threshold_row = {
                 "threshold_name": model_i.target.spec.name,
                 "positive_fraction": fraction,
                 "cutoff_i": model_i.target.cutoff if model_i.target.valid else None,
@@ -563,8 +592,33 @@ def run_semantic_comparison(
                 "model_j_valid": model_j.valid,
                 "model_i_reason": model_i.reason,
                 "model_j_reason": model_j.reason,
-                "transfer": transfer_row,
-            })
+                "transfer": _transfer_row(transfer),
+            }
+            if config.class_analysis.enabled:
+                class_comparisons = compare_rule_sets_by_class(
+                    model_i.selection.rule_set,
+                    target_i,
+                    model_j.selection.rule_set,
+                    target_j,
+                    X[final_indices],
+                    final_outcomes,
+                    factor_i_id=f"{run_i}:{factor_i}",
+                    factor_j_id=f"{run_j}:{factor_j}",
+                    threshold_name=model_i.target.spec.name,
+                )
+                threshold_row["class_analysis"] = [
+                    {
+                        "class_value": class_result.class_value,
+                        "n_samples": class_result.n_samples,
+                        "n_positive_i": class_result.left_target_positive_count,
+                        "n_positive_j": class_result.right_target_positive_count,
+                        "valid": class_result.valid,
+                        "reasons": list(class_result.reasons),
+                        "transfer": _transfer_row(class_result.comparison),
+                    }
+                    for class_result in class_comparisons
+                ]
+            threshold_rows.append(threshold_row)
         f2_values = [row["transfer"]["mean"]["f2"] for row in threshold_rows]
         result = {
             "pair_id": pair_index,
@@ -591,6 +645,10 @@ def run_semantic_comparison(
                 "factor_j_clinical_group_jaccard_min": _set_stability(models_j, _rule_set_groups),
             },
         }
+        if config.class_analysis.enabled:
+            result["class_threshold_stability"] = _class_threshold_stability(
+                threshold_rows
+            )
         pair_results.append(result)
 
     if record_keys is None:
@@ -621,6 +679,19 @@ def run_semantic_comparison(
         "n_records": len(X),
         "n_pairs": len(pairs),
     }
+    if config.class_analysis.enabled:
+        class_values, class_counts = np.unique(final_outcomes, return_counts=True)
+        manifest["class_analysis"] = {
+            "enabled": True,
+            "class_values": [
+                value.item() if isinstance(value, np.generic) else value
+                for value in class_values
+            ],
+            "class_support": {
+                str(value.item() if isinstance(value, np.generic) else value): int(count)
+                for value, count in zip(class_values, class_counts)
+            },
+        }
     store.write_json("manifest.json", manifest)
     store.write_npz(
         "splits.npz",
@@ -634,6 +705,10 @@ def run_semantic_comparison(
     store.write_jsonl("semantic_rules.jsonl", model_rows)
     store.write_jsonl("pair_results.jsonl", pair_results)
     _write_flat_pair_csv(store.root / "pair_metrics.csv", pair_results)
+    if config.class_analysis.enabled:
+        _write_flat_class_pair_csv(
+            store.root / "pair_metrics_by_class.csv", pair_results
+        )
     result = {
         "schema_version": config.schema_version,
         "experiment_hash": experiment_hash,
@@ -671,6 +746,62 @@ def _write_flat_pair_csv(path: Path, pairs: Sequence[Mapping[str, Any]]) -> None
                 "exact_feature_jaccard": transfer["exact_feature_jaccard"],
                 "clinical_group_jaccard": transfer["clinical_group_jaccard"],
             })
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _write_flat_class_pair_csv(
+    path: Path, pairs: Sequence[Mapping[str, Any]]
+) -> None:
+    """Write class-stratified metrics without changing the pooled CSV schema."""
+
+    rows: list[dict[str, Any]] = []
+    for pair in pairs:
+        for threshold in pair["thresholds"]:
+            for class_result in threshold.get("class_analysis", []):
+                transfer = class_result["transfer"]
+                rows.append({
+                    "pair_id": pair["pair_id"],
+                    "run_i": pair["run_i"],
+                    "run_j": pair["run_j"],
+                    "factor_i": pair["factor_i"],
+                    "factor_j": pair["factor_j"],
+                    "threshold_name": threshold["threshold_name"],
+                    "positive_fraction": threshold["positive_fraction"],
+                    "class_value": class_result["class_value"],
+                    "class_n_samples": class_result["n_samples"],
+                    "class_n_positive_i": class_result["n_positive_i"],
+                    "class_n_positive_j": class_result["n_positive_j"],
+                    "class_valid": class_result["valid"],
+                    "class_reasons": "|".join(class_result["reasons"]),
+                    "cos_sim": pair["geometry"].get("cos_sim"),
+                    "activation_overlap": pair["geometry"].get("overlap"),
+                    **{
+                        f"i_to_j_{key}": value
+                        for key, value in transfer["i_to_j"].items()
+                    },
+                    **{
+                        f"j_to_i_{key}": value
+                        for key, value in transfer["j_to_i"].items()
+                    },
+                    **{
+                        f"transfer_mean_{key}": value
+                        for key, value in transfer["mean"].items()
+                    },
+                    **{
+                        f"transfer_min_{key}": value
+                        for key, value in transfer["min"].items()
+                    },
+                    "target_cohort_jaccard": transfer["target_cohort_jaccard"],
+                    "selected_cohort_jaccard": transfer["selected_cohort_jaccard"],
+                    "exact_feature_jaccard": transfer["exact_feature_jaccard"],
+                    "clinical_group_jaccard": transfer["clinical_group_jaccard"],
+                })
     if not rows:
         path.write_text("", encoding="utf-8")
         return

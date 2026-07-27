@@ -3,6 +3,7 @@ import pytest
 
 from semantic_compare import (
     cluster_rule_families,
+    compare_rule_sets_by_class,
     compare_rule_sets_symmetric,
     recurrent_representatives,
     rule_similarity,
@@ -188,3 +189,93 @@ def test_identical_rules_and_targets_have_perfect_bidirectional_transfer():
     assert transfer.minimum["f2"] == 1.0
     assert transfer.target_cohort_jaccard == 1.0
     assert transfer.selected_cohort_jaccard == 1.0
+
+
+def test_class_comparison_is_deterministic_and_uses_local_metrics():
+    X_final = np.arange(8, dtype=float).reshape(-1, 1)
+    class_labels = np.array([2, 0, 1, 0, 2, 1, 2, 1])
+    broad_set = RuleSet((_rule("broad", threshold=2.5),), threshold_name="core")
+    narrow_set = RuleSet((_rule("narrow", threshold=4.5),), threshold_name="core")
+    target_i = np.array([0, 0, 0, 1, 1, 1, 1, 1], dtype=bool)
+    target_j = np.array([0, 0, 0, 0, 0, 1, 1, 0], dtype=bool)
+
+    by_class = compare_rule_sets_by_class(
+        broad_set,
+        target_i,
+        narrow_set,
+        target_j,
+        X_final,
+        class_labels,
+        factor_i_id="run-a:4",
+        factor_j_id="run-b:9",
+        threshold_name="core",
+    )
+
+    assert [item.class_value for item in by_class] == [0, 1, 2]
+    assert [item.n_samples for item in by_class] == [2, 3, 3]
+    class_one = by_class[1]
+    assert class_one.valid
+    assert class_one.left_target_positive_count == 2
+    assert class_one.right_target_positive_count == 1
+    assert class_one.comparison.left_to_right.source_factor_id == "run-a:4"
+    assert class_one.comparison.right_to_left.source_factor_id == "run-b:9"
+    assert class_one.comparison.left_to_right.metrics.prevalence == pytest.approx(
+        1.0 / 3.0
+    )
+    assert class_one.comparison.left_to_right.metrics.lift == pytest.approx(1.5)
+    assert (
+        class_one.comparison.left_to_right.metrics.f2
+        != class_one.comparison.right_to_left.metrics.f2
+    )
+    assert class_one.comparison.threshold_name == "core"
+
+
+def test_class_comparison_keeps_metrics_when_target_class_is_empty():
+    X_final = np.arange(6, dtype=float).reshape(-1, 1)
+    class_labels = np.array([0, 0, 0, 1, 1, 1])
+    rule_set = RuleSet((_rule("rule", threshold=2.5),))
+    target_i = np.array([0, 0, 0, 1, 1, 0], dtype=bool)
+    target_j = np.array([0, 0, 0, 0, 1, 1], dtype=bool)
+
+    by_class = compare_rule_sets_by_class(
+        rule_set, target_i, rule_set, target_j, X_final, class_labels
+    )
+
+    empty = by_class[0]
+    assert not empty.valid
+    assert empty.reasons == (
+        "left_target_has_no_positive_samples",
+        "right_target_has_no_positive_samples",
+    )
+    assert empty.comparison.n_samples == 3
+    assert empty.comparison.left_to_right.metrics.n_positive == 0
+    assert empty.comparison.right_to_left.metrics.n_positive == 0
+    assert empty.comparison.left_to_right.metrics.f2 == 0.0
+    serialized = empty.to_dict()
+    assert serialized["valid"] is False
+    assert serialized["comparison"]["left_to_right"]["metrics"]["f2"] == 0.0
+
+
+def test_class_comparison_requires_aligned_final_labels():
+    X_final = np.arange(6, dtype=float).reshape(-1, 1)
+    target = np.ones(6, dtype=bool)
+    rule_set = RuleSet((_rule("rule", threshold=2.5),))
+
+    with pytest.raises(ValueError, match="class_labels must be one-dimensional"):
+        compare_rule_sets_by_class(
+            rule_set,
+            target,
+            rule_set,
+            target,
+            X_final,
+            np.ones((6, 1)),
+        )
+    with pytest.raises(ValueError, match="identical records"):
+        compare_rule_sets_by_class(
+            rule_set,
+            target,
+            rule_set,
+            target,
+            X_final,
+            np.ones(5),
+        )

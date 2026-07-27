@@ -945,6 +945,30 @@ class SemanticPairComparison:
         )
 
 
+@dataclass(frozen=True)
+class ClassSemanticPairComparison:
+    """One frozen semantic comparison evaluated within an outcome class."""
+
+    class_value: object
+    n_samples: int
+    left_target_positive_count: int
+    right_target_positive_count: int
+    valid: bool
+    reasons: tuple[str, ...]
+    comparison: SemanticPairComparison
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "class_value": self.class_value,
+            "n_samples": self.n_samples,
+            "left_target_positive_count": self.left_target_positive_count,
+            "right_target_positive_count": self.right_target_positive_count,
+            "valid": self.valid,
+            "reasons": list(self.reasons),
+            "comparison": self.comparison.to_dict(),
+        }
+
+
 def compare_semantic_pair(
     left_rule_set: RuleSet,
     right_rule_set: RuleSet,
@@ -1054,7 +1078,86 @@ def compare_rule_sets_symmetric(
     )
 
 
+def compare_rule_sets_by_class(
+    rule_set_i: RuleSet,
+    target_i: np.ndarray,
+    rule_set_j: RuleSet,
+    target_j: np.ndarray,
+    X_final: np.ndarray,
+    class_labels: np.ndarray,
+    *,
+    factor_i_id: str = "i",
+    factor_j_id: str = "j",
+    threshold_name: str | None = None,
+) -> tuple[ClassSemanticPairComparison, ...]:
+    """Evaluate frozen rule sets and targets within each observed final class."""
+
+    first = np.asarray(target_i)
+    second = np.asarray(target_j)
+    array = np.asarray(X_final)
+    labels = np.asarray(class_labels)
+    if first.ndim != 1 or second.ndim != 1 or first.shape != second.shape:
+        raise ValueError("targets must be aligned one-dimensional arrays")
+    if array.ndim != 2 or array.shape[0] != first.shape[0]:
+        raise ValueError("X_final and targets must contain identical records")
+    if labels.ndim != 1:
+        raise ValueError("class_labels must be one-dimensional")
+    if labels.shape[0] != array.shape[0]:
+        raise ValueError(
+            "class_labels, X_final, and targets must contain identical records"
+        )
+
+    try:
+        class_values, class_indices = np.unique(labels, return_inverse=True)
+    except TypeError as error:
+        raise ValueError(
+            "class_labels must contain mutually comparable scalar values"
+        ) from error
+
+    results: list[ClassSemanticPairComparison] = []
+    for class_index, raw_class_value in enumerate(class_values):
+        class_mask = class_indices == class_index
+        class_first = first[class_mask].astype(bool, copy=False)
+        class_second = second[class_mask].astype(bool, copy=False)
+        left_positive_count = int(np.count_nonzero(class_first))
+        right_positive_count = int(np.count_nonzero(class_second))
+        reasons: list[str] = []
+        if left_positive_count == 0:
+            reasons.append("left_target_has_no_positive_samples")
+        if right_positive_count == 0:
+            reasons.append("right_target_has_no_positive_samples")
+
+        class_value = (
+            raw_class_value.item()
+            if isinstance(raw_class_value, np.generic)
+            else raw_class_value
+        )
+        comparison = compare_rule_sets_symmetric(
+            rule_set_i,
+            class_first,
+            rule_set_j,
+            class_second,
+            array[class_mask],
+            factor_i_id=factor_i_id,
+            factor_j_id=factor_j_id,
+            threshold_name=threshold_name,
+        )
+        results.append(
+            ClassSemanticPairComparison(
+                class_value=class_value,
+                n_samples=int(np.count_nonzero(class_mask)),
+                left_target_positive_count=left_positive_count,
+                right_target_positive_count=right_positive_count,
+                valid=not reasons,
+                reasons=tuple(reasons),
+                comparison=comparison,
+            )
+        )
+    return tuple(results)
+
+
 __all__ = [
+    "ClassSemanticPairComparison",
     "DirectionalTransfer",
     "DistributionSummary",
     "Recurrence",
@@ -1068,6 +1171,7 @@ __all__ = [
     "SymmetricMetric",
     "ThresholdVariability",
     "cluster_rule_families",
+    "compare_rule_sets_by_class",
     "compare_rule_sets_symmetric",
     "compare_semantic_pair",
     "recurrent_representatives",

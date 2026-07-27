@@ -15,6 +15,8 @@ from sklearn.tree import export_graphviz
 from results import translate_event_name
 import re
 import pandas as pd
+from typing import Sequence
+from pathlib import Path
 
 MIN_POSITIVE_SAMPLES = 50
 TREE_MODEL_PATH = get_env_path('models/trees/params')
@@ -244,15 +246,33 @@ def get_rules_from_text(text_rules: str) -> pd.DataFrame:
     return pd.DataFrame(tree_rules)
 
 def train_binary_trees(train_activations: np.ndarray, X: np.ndarray,
-                       feature_names: list[str], model_type: str='ReLU', max_depth:int=15)\
+                       feature_names: list[str], model_type: str='ReLU',
+                       max_depth:int=15,
+                       factor_ids: Sequence[int] | None = None,
+                       min_positive_samples: int = MIN_POSITIVE_SAMPLES)\
         -> list[dict[str, Any]]:
     warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
+    if min_positive_samples < 1:
+        raise ValueError("min_positive_samples must be positive")
+    selected_factors = None
+    if factor_ids is not None:
+        selected_factors = {int(factor_id) for factor_id in factor_ids}
+        invalid = [
+            factor_id for factor_id in selected_factors
+            if factor_id < 0 or factor_id >= train_activations.shape[1]
+        ]
+        if invalid:
+            raise IndexError(f"factor_ids outside activation matrix: {sorted(invalid)}")
 
     percentiles = [90, 80, 70, 60, 50]
     valid_rules = {p: [] for p in percentiles}
 
     for perc in percentiles:
         bin_targets = get_binary_targets(train_activations, perc, model_type)
+        if selected_factors is not None:
+            bin_targets = [
+                target for target in bin_targets if target[0] in selected_factors
+            ]
         for (idx, target) in bin_targets:
             cur_train_activations = train_activations[:, idx]
             n_positives = (cur_train_activations > 0).sum()
@@ -261,10 +281,10 @@ def train_binary_trees(train_activations: np.ndarray, X: np.ndarray,
             n_high = train_target_mask.sum()
             # print(f"Extracting rules for factor {idx} with {n_positives} non-zero activations...")
 
-            if n_high < MIN_POSITIVE_SAMPLES:
+            if n_high < min_positive_samples:
                 train_target_mask = (cur_train_activations > 0)
                 n_high = train_target_mask.sum()
-                if train_target_mask.sum() < MIN_POSITIVE_SAMPLES:
+                if train_target_mask.sum() < min_positive_samples:
                     continue
 
             clf = DecisionTreeClassifier(
@@ -321,7 +341,7 @@ def train_binary_trees(train_activations: np.ndarray, X: np.ndarray,
         print(f'Regras válidas encontradas com percentil {perc}: {len(valid_rules[perc])}')
     return valid_rules
 
-def get_rules_forced(train_activations: np.ndarray, X: np.ndarray, surviving_concepts: np.ndarray, tree_rules_df: pd.DataFrame,  perc: int, feature_names: list[str], model_type: str='ReLU', balanced:bool = False):
+def get_rules_forced(train_activations: np.ndarray, X: np.ndarray, surviving_concepts: np.ndarray, tree_rules_df: pd.DataFrame,  perc: int, feature_names: list[str], model_type: str='ReLU', balanced:bool = False, graph_output_dir: str | Path = TREE_GRAPH_PATH):
     if tree_rules_df is not None:
         surviving_concepts = np.asarray(surviving_concepts, dtype=np.int64)
         existing_rules = tree_rules_df['Factor'].tolist()
@@ -369,7 +389,9 @@ def get_rules_forced(train_activations: np.ndarray, X: np.ndarray, surviving_con
         best_precision = None
         num_true = None
 
-        export_graphviz(decision_tree=clf, out_file=f'models/trees/graphs/{concept}.dot', max_depth=clf.get_depth(), feature_names=feature_names)
+        graph_dir = Path(graph_output_dir)
+        graph_dir.mkdir(parents=True, exist_ok=True)
+        export_graphviz(decision_tree=clf, out_file=graph_dir / f'{concept}.dot', max_depth=clf.get_depth(), feature_names=feature_names)
 
         for idx, row in tree_rules_df.iterrows():
             # print(f'Concept {concept}, Row {idx}')
@@ -414,4 +436,4 @@ def get_rules_forced(train_activations: np.ndarray, X: np.ndarray, surviving_con
                 "Patients_concept": n_high
             })
 
-    return valid_rules    
+    return valid_rules
