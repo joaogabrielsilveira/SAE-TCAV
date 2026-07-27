@@ -400,7 +400,12 @@ def get_rules_forced(train_activations: np.ndarray, X: np.ndarray, surviving_con
 
         graph_dir = Path(graph_output_dir)
         graph_dir.mkdir(parents=True, exist_ok=True)
-        export_graphviz(decision_tree=clf, out_file=graph_dir / f'{concept}.dot', max_depth=clf.get_depth(), feature_names=feature_names)
+        export_graphviz(
+            decision_tree=clf,
+            out_file=str(graph_dir / f'{concept}.dot'),
+            max_depth=clf.get_depth(),
+            feature_names=feature_names,
+        )
 
         for idx, row in tree_rules_df.iterrows():
             # print(f'Concept {concept}, Row {idx}')
