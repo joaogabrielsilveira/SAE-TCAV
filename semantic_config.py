@@ -85,11 +85,16 @@ class RuntimeConfig:
     seed: int = 42
     n_jobs: int = 1
     cache: bool = True
+    show_progress: bool = True
     artifact_dir: str = "stats/semantic"
 
     def __post_init__(self) -> None:
         if self.n_jobs != 1:
             raise ValueError("Only n_jobs=1 is supported for deterministic v1 execution")
+        if not isinstance(self.cache, bool) or not isinstance(
+            self.show_progress, bool
+        ):
+            raise ValueError("runtime.cache and runtime.show_progress must be booleans")
 
 
 @dataclass(frozen=True)

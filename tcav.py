@@ -16,6 +16,7 @@ from scipy import stats
 import warnings
 from pathlib import Path
 from runtime_acceleration import resolve_torch_device
+from progress_utils import progress_iter
 
 CAVS_FILE = get_env_path('models/tcav/cavs.pkl')
 GRADS_FILE = get_env_path('models/tcav/grads.pkl')
@@ -23,7 +24,8 @@ GRADS_FILE = get_env_path('models/tcav/grads.pkl')
 def get_model_gradients(model: TabPFNClassifier, dist_vec: np.ndarray, X: np.ndarray,
                         cache_file: str | os.PathLike | None = None,
                         batch_size: int = 128,
-                        device: str = "auto") -> np.ndarray:
+                        device: str = "auto",
+                        show_progress: bool = False) -> np.ndarray:
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
     gradient_device = resolve_torch_device(device)
@@ -34,7 +36,6 @@ def get_model_gradients(model: TabPFNClassifier, dist_vec: np.ndarray, X: np.nda
             grads = load(f)
             if cache_file is not None and np.asarray(grads).shape[0] != X.shape[0]:
                 raise ValueError('Cached gradient count does not match requested records')
-            print(f'Carregando grads de {gradients_file}')
             return grads
 
     model_decode_layer = model.model_processed_.decoder_dict['standard']
@@ -42,10 +43,17 @@ def get_model_gradients(model: TabPFNClassifier, dist_vec: np.ndarray, X: np.nda
     model_decode_layer.to(gradient_device)
     gradients = []
     try:
-        for s in range(0, X.shape[0], batch_size):
+        batch_starts = range(0, X.shape[0], batch_size)
+        for s in progress_iter(
+            batch_starts,
+            enabled=show_progress,
+            desc="Computing TCAV gradients",
+            total=len(batch_starts),
+            unit="batch",
+            leave=False,
+        ):
             e = min(s + batch_size, X.shape[0])
 
-            print(f'Batch {s}-{e}')
             x_batch = X[s:e].astype(np.float32)
             dist_batch = dist_vec[s:e]
 
@@ -66,7 +74,6 @@ def get_model_gradients(model: TabPFNClassifier, dist_vec: np.ndarray, X: np.nda
                 emb_in = emb.clone().detach().to(
                     gradient_device, dtype=torch.float32
                 ).requires_grad_(True)
-                print(emb_in.shape)
 
                 def single_pass(x_p):
                     out = model_decode_layer(x_p).unsqueeze(0)
@@ -76,7 +83,6 @@ def get_model_gradients(model: TabPFNClassifier, dist_vec: np.ndarray, X: np.nda
 
                 batch_grad = vmap(grad(single_pass))(emb_in)
                 gradients.append(batch_grad.detach().cpu().numpy())
-                print(gradients[0].shape)
     finally:
         model_decode_layer.to(original_device)
     

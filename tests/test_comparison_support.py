@@ -74,6 +74,7 @@ def test_train_all_saes_forwards_explicit_training_controls(monkeypatch):
         weight_decay=0.04,
         device="cpu",
         encoding_batch_size=2,
+        show_progress=False,
     )
 
     assert [run["seed"] for run in runs] == [11, 22]
@@ -82,6 +83,7 @@ def test_train_all_saes_forwards_explicit_training_controls(monkeypatch):
     assert all(call["learning_rate"] == 0.02 for call in calls)
     assert all(call["weight_decay"] == 0.04 for call in calls)
     assert all(call["device"] == "cpu" for call in calls)
+    assert all(call["show_progress"] is False for call in calls)
 
 
 def test_train_all_saes_preserves_default_seed_schedule(monkeypatch):

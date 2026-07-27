@@ -40,6 +40,27 @@ def test_discovery_is_deterministic_including_provenance():
     assert first.bootstrap_diagnostics
 
 
+def test_progress_reporting_does_not_change_discovery_result():
+    rng = np.random.default_rng(18)
+    X = rng.normal(size=(60, 2))
+    y = (X[:, 0] > 0).astype(int)
+
+    quiet = discover_stable_rule_candidates(
+        X,
+        y,
+        ("signal", "noise"),
+        config=_config(show_progress=False),
+    )
+    visible = discover_stable_rule_candidates(
+        X,
+        y,
+        ("signal", "noise"),
+        config=_config(show_progress=True),
+    )
+
+    assert visible == quiet
+
+
 def test_group_bootstrap_keeps_group_level_oob_and_recurrence_provenance():
     # Equal-size groups make partial-group OOB leakage observable: every OOB
     # count must be divisible by rows per group.

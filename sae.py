@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from results import save_model_stats
 from filepaths import get_env_path
 from runtime_acceleration import resolve_torch_device
+from progress_utils import progress_iter
 
 SAE_MODEL_PATH = get_env_path('models')
 
@@ -97,7 +98,8 @@ def train_sae_model(inputs: torch.Tensor, epochs:int=1000, learning_rate:float=1
                     alpha:float=1e-1, save_data=True, data_source:str = 'training', use_decoder_bias: bool = False,
                     rng_seed: int=42, use_cache: bool=False, scaling_factor: float=1.5, type: str='ReLU',
                     k: int=12, k_aux:int=64, data_dimension: int | None = None,
-                    device: str | None = None) -> SAE:
+                    device: str | None = None, show_progress: bool = False,
+                    progress_desc: str | None = None) -> SAE:
     """" Treina o Sparse AutoEncoder usando a entrada e os hiperparâmetros passados.
          O parâmetro alpha é a constante que controla a penalização por dados densos. """
     if inputs.ndim != 2:
@@ -127,7 +129,15 @@ def train_sae_model(inputs: torch.Tensor, epochs:int=1000, learning_rate:float=1
     inputs = inputs.to(training_device, dtype=torch.float32)
     losses = []
 
-    for epoch in range(1, epochs + 1):
+    epochs_iter = progress_iter(
+        range(1, epochs + 1),
+        enabled=show_progress,
+        desc=progress_desc or "SAE epochs",
+        total=epochs,
+        unit="epoch",
+        leave=False,
+    )
+    for epoch in epochs_iter:
         # Treinamento do modelo e aplicação aos inputs
         model.train()
 

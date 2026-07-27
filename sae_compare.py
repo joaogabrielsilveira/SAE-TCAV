@@ -9,6 +9,7 @@ from pickle import dump, load
 from typing import Sequence
 from tabpfn_model import load_or_extract_embeddings, scale_embeddings, temporal_test_subsplits, fit_dr_tabpfn, walkforward_evaluate_tabpfn, TabPFNClassifier, TabPFNEvalConfig, EmbeddingExtractConfig
 from runtime_acceleration import resolve_torch_device
+from progress_utils import progress_iter
 
 def activation_threshold(concept: np.ndarray, perc: int=90):
     pos_act = concept[concept > 0]
@@ -80,6 +81,7 @@ def encode_sae_runs(
     *,
     device: str = "auto",
     batch_size: int | None = None,
+    show_progress: bool = False,
 ) -> dict[int, np.ndarray]:
     """Encode identical records through every configured SAE run."""
 
@@ -90,7 +92,13 @@ def encode_sae_runs(
             device=device,
             batch_size=batch_size,
         )
-        for run in sae_runs
+        for run in progress_iter(
+            sae_runs,
+            enabled=show_progress,
+            desc="Encoding SAE runs",
+            total=len(sae_runs),
+            unit="run",
+        )
     }
 
 def max_activation_overlap(sae_i: dict[str], concept:int, sae_j: dict[str], perc: int = 90):
@@ -166,14 +174,21 @@ def train_all_saes(num_models: int, embs: np.ndarray, alpha: float=1e-1,
                    learning_rate: float = 1e-3,
                    weight_decay: float = 0.0,
                    device: str = "auto",
-                   encoding_batch_size: int = 4096) -> list[dict[str]]:
+                   encoding_batch_size: int = 4096,
+                   show_progress: bool = False) -> list[dict[str]]:
     if seeds is not None and len(seeds) != num_models:
         raise ValueError("seeds must contain exactly num_models entries")
     if encoding_batch_size < 1:
         raise ValueError("encoding_batch_size must be positive")
 
     sae_list = []
-    for i in range(num_models):
+    for i in progress_iter(
+        range(num_models),
+        enabled=show_progress,
+        desc="Training SAE runs",
+        total=num_models,
+        unit="run",
+    ):
 
         if seeds is not None:
             current_seed = int(seeds[i])
@@ -198,6 +213,8 @@ def train_all_saes(num_models: int, embs: np.ndarray, alpha: float=1e-1,
             k=k,
             k_aux=k_aux,
             device=device,
+            show_progress=show_progress,
+            progress_desc=f"SAE {i + 1}/{num_models} epochs",
         )
         run_for_encoding = {"model": sae, "model_type": model_type}
         codes = encode_sae(

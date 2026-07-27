@@ -35,6 +35,19 @@ def test_class_analysis_enabled_is_strictly_boolean():
         SemanticExperimentConfig.from_dict({"class_analysis": False})
 
 
+def test_runtime_progress_defaults_enabled_and_is_strictly_boolean():
+    assert SemanticExperimentConfig.from_dict({}).runtime.show_progress is True
+    assert (
+        SemanticExperimentConfig.from_dict(
+            {"runtime": {"show_progress": False}}
+        ).runtime.show_progress
+        is False
+    )
+
+    with pytest.raises(ValueError, match="runtime.cache and runtime.show_progress"):
+        SemanticExperimentConfig.from_dict({"runtime": {"show_progress": 1}})
+
+
 def test_clinical_groups_are_external_and_many_to_many(tmp_path):
     path = tmp_path / "groups.json"
     path.write_text(json.dumps({"creatinine": ["renal", "laboratory"], "age": "demographic"}))

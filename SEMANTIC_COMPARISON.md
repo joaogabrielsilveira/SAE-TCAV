@@ -36,7 +36,7 @@ Dependencies cannot supply experiment data. There are now two supported entry
 points:
 
 - `main-comparison.py` starts from the renal event Feather file and runs data
-  preparation, TabPFN, two SAE runs, geometric matching, the legacy
+  preparation, TabPFN, the configured SAE runs, geometric matching, the legacy
   high-precision rule/CAV/TCAV path, and the complete semantic comparison.
 - `semantic_experiment.py` starts from already-computed, aligned SAE
   activations. It is useful for rerunning only the semantic layer.
@@ -83,8 +83,9 @@ The default complete run:
 1. Prepares the renal train/test rows and fits Drift-Resilient TabPFN.
 2. Evaluates TabPFN by test year and extracts aligned train/test embeddings.
 3. Makes one patient-grouped four-way split of test records.
-4. Trains exactly two SAEs on `semantic_fit`, using seeds `42` and `135`.
-5. Re-encodes every test record through both frozen SAEs.
+4. Trains one SAE per configured seed on `semantic_fit` (the example uses
+   seeds `42` and `135`).
+5. Re-encodes every test record through every frozen SAE.
 6. Performs one-to-one Hungarian matching and keeps pairs with cosine at least
    `0.7`.
 7. Learns the existing precision-first single rule for each selected factor,
@@ -126,6 +127,27 @@ and tabular preparation remain CPU operations. A GPU therefore accelerates
 the neural stages but does not remove the need for later deterministic CPU
 parallelism when running millions of shallow tree fits.
 
+### Progress reporting
+
+Progress bars are enabled by default with `"show_progress": true` in the
+complete runner and `"runtime": {"show_progress": true}` in the standalone
+semantic configuration. They track TabPFN years and embedding batches, SAE
+runs and epochs, geometric run pairs, high-precision tree fits, TCAV gradient
+batches and factors, semantic factor/threshold representations, rule
+bootstraps, and final pair evaluation. Nested bars are transient so completed
+runs leave a readable terminal history.
+
+Disable all progress bars for redirected logs or automated jobs:
+
+```bash
+python main-comparison.py --no-progress --data tidy_event_data.feather
+python semantic_experiment.py --no-progress --config ... --bundle ... --matches ...
+```
+
+Progress settings are presentation-only and are deliberately excluded from
+content-addressed experiment hashes. Turning bars on or off therefore reuses
+the same scientific artifacts.
+
 No stage imports or executes `main.py`. Use configuration fields rather than
 editing that file.
 
@@ -162,9 +184,10 @@ The runner creates a content-addressed directory below
 - `semantic/<experiment_hash>/`, containing all semantic artifacts documented
   later in this file, including `pair_metrics_by_class.csv`.
 
-The runner hash includes the dataset bytes, complete runner configuration,
-semantic-configuration bytes, external clinical-group mapping bytes, and
-relevant source files. A matching `summary.json` is a complete-result cache;
+The runner hash includes the dataset bytes, scientific runner configuration,
+scientific semantic configuration, external clinical-group mapping bytes, and
+relevant source files; the presentation-only progress toggle is excluded. A
+matching `summary.json` is a complete-result cache;
 inner embedding, SAE, gradient, and semantic artifacts provide additional
 stage-level reuse.
 

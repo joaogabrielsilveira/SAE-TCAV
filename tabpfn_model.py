@@ -14,6 +14,7 @@ from sklearn.metrics import f1_score
 from pathlib import Path
 import os
 from pickle import dump, load
+from progress_utils import progress_iter
 
 BATCH_SIZE = 512
 
@@ -23,11 +24,14 @@ class TabPFNEvalConfig:
     batch_size_predict: int = BATCH_SIZE
     run_id: str = "demo_tabpfn_step1"
     device: str = "auto"
+    show_progress: bool = False
 
 class EmbeddingExtractConfig:
     batch_size = 512
     max_extract: Optional[int] = None
     use_cache: bool = True
+    show_progress: bool = False
+    progress_desc: str = "Extracting embeddings"
 
 TRAINING_EMBEDDING_FILE = get_env_path('models/tabpfn/dr_tabpfn_train_emb.npy')
 TEST_EMBEDDING_FILE = get_env_path('models/tabpfn/dr_tabpfn_test_emb.npy')
@@ -84,7 +88,7 @@ def fit_dr_tabpfn(X_train: np.ndarray, y_train: np.ndarray, train_years: np.ndar
         )
 
         if hasattr(drift_model, "show_progress"):
-            drift_model.show_progress = False
+            drift_model.show_progress = eval_cfg.show_progress
         if hasattr(drift_model, "seed"):
             drift_model.seed = eval_cfg.rng_seed
 
@@ -136,7 +140,10 @@ def make_dist_tensor(dist_dom_np, model_add_x_device, example_add_shape):
 def walkforward_evaluate_tabpfn(drift_model: TabPFNClassifier, test_rows: pd.DataFrame,
                                 top_k_events: list[str], model_add_x_device: torch.device | str,
                                 train_years: list[int], batch_size_predict:int = 512,
-                                example_add_shape: Optional[Tuple[int, ...]] = None, use_cache: bool = True, test_years: list[int] | None = None
+                                example_add_shape: Optional[Tuple[int, ...]] = None,
+                                use_cache: bool = True,
+                                test_years: list[int] | None = None,
+                                show_progress: bool = False,
                                 ) -> dict[str, Any]:
     test_rows = ensure_test_feature_columns(test_rows, top_k_events)
 
@@ -151,8 +158,14 @@ def walkforward_evaluate_tabpfn(drift_model: TabPFNClassifier, test_rows: pd.Dat
     preds_per_year = []
     t_infer_total = 0.0
 
-    for eval_year in sorted(test_rows['year'].astype(int).unique()):
-        print(f'Inferencias do ano {eval_year}')
+    eval_years = sorted(test_rows['year'].astype(int).unique())
+    for eval_year in progress_iter(
+        eval_years,
+        enabled=show_progress,
+        desc="TabPFN walk-forward",
+        total=len(eval_years),
+        unit="year",
+    ):
         # eventos do ano de teste
         df_year = test_rows[test_rows['year'] == eval_year].reset_index(drop=True)
         #print(df_year.columns)
@@ -179,9 +192,16 @@ def walkforward_evaluate_tabpfn(drift_model: TabPFNClassifier, test_rows: pd.Dat
                 results_per_year.append(results)
             continue
 
-        for start in range(0, n_samples, batch_size_predict):
+        batch_starts = range(0, n_samples, batch_size_predict)
+        for start in progress_iter(
+            batch_starts,
+            enabled=show_progress,
+            desc=f"Predicting {eval_year}",
+            total=len(batch_starts),
+            unit="batch",
+            leave=False,
+        ):
             end = min(start+batch_size_predict, n_samples)
-            print(f'Batch {start}-{end}')
 
             # entradas e domínios temporais para o batch atual
             Xb_np = df_year[top_k_events].iloc[start:end].values.astype(np.float32)
@@ -231,7 +251,6 @@ def walkforward_evaluate_tabpfn(drift_model: TabPFNClassifier, test_rows: pd.Dat
                 'f1_pos': float(f1_pos) if not np.isnan(f1_pos) else float('nan'),
                 'infer_time_sec': float(t_infer_year)
             }
-        print(f'Positivos: {np.mean(y_pred) * 100}%')
         if use_cache:
             with open(year_file, 'wb') as f:
                 dump(results, f)
@@ -252,15 +271,24 @@ def walkforward_evaluate_tabpfn(drift_model: TabPFNClassifier, test_rows: pd.Dat
 
 def batch_get_embeddings(model: TabPFNClassifier, X_all: np.ndarray, dist_full: np.ndarray, batch_size: int = 512,
                          device: torch.device | str = 'cpu',
-                         example_add_shape: Optional[Tuple[int, ...]] = None) -> tuple[np.ndarray, list]:
+                         example_add_shape: Optional[Tuple[int, ...]] = None,
+                         show_progress: bool = False,
+                         progress_desc: str = "Extracting embeddings") -> tuple[np.ndarray, list]:
     out_list = []
     tensors_list = []
 
     n = X_all.shape[0]
 
-    for start in range(0, n, batch_size):
+    batch_starts = range(0, n, batch_size)
+    for start in progress_iter(
+        batch_starts,
+        enabled=show_progress,
+        desc=progress_desc,
+        total=len(batch_starts),
+        unit="batch",
+        leave=False,
+    ):
         end = min(start + batch_size, n)
-        print(f'Batch {start}-{end}')
         xb = X_all[start:end].astype(np.float32)
         dist_b = dist_full[start:end].astype(np.int64)
 
@@ -325,7 +353,9 @@ def extract_embeddings_robust(model: TabPFNClassifier, X: np.ndarray, years: np.
         dist_full=dist_vec,
         batch_size=cfg.batch_size,
         device=device,
-        example_add_shape=example_add_shape
+        example_add_shape=example_add_shape,
+        show_progress=cfg.show_progress,
+        progress_desc=cfg.progress_desc,
     )
 
     return np.asarray(emb)

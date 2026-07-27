@@ -1,4 +1,5 @@
 import csv
+from dataclasses import replace
 
 import numpy as np
 
@@ -320,6 +321,31 @@ def test_class_analysis_is_additive_and_uses_only_final_class_rows(
     assert cached["cache_hit"] is True
     assert cached["pair_results"] == result["pair_results"]
     assert cached["manifest"]["class_analysis"] == result["manifest"]["class_analysis"]
+
+
+def test_progress_toggle_reuses_semantic_result_cache(monkeypatch, tmp_path):
+    _install_stable_discovery(monkeypatch)
+    inputs = _multiclass_inputs()
+    config = _small_config(tmp_path)
+    quiet_config = replace(
+        config,
+        runtime=replace(config.runtime, show_progress=False),
+    )
+
+    first = semantic_experiment.run_semantic_comparison(
+        **inputs,
+        config=quiet_config,
+    )
+    cached = semantic_experiment.run_semantic_comparison(
+        **inputs,
+        config=replace(
+            quiet_config,
+            runtime=replace(quiet_config.runtime, show_progress=True),
+        ),
+    )
+
+    assert cached["experiment_hash"] == first["experiment_hash"]
+    assert cached["cache_hit"] is True
 
 
 def test_disabling_class_analysis_preserves_pooled_output_and_omits_additions(

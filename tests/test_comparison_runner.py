@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 import runpy
 import sys
@@ -251,6 +252,10 @@ def test_config_defaults_and_strict_nested_validation():
     assert config.matching == MatchingRunnerConfig()
     assert config.functional == FunctionalRunnerConfig()
     assert config.functional.enabled is True
+    assert config.show_progress is True
+    assert ComparisonRunnerConfig.from_dict(
+        {"show_progress": False}
+    ).show_progress is False
 
     with pytest.raises(ValueError, match="Unknown comparison config fields"):
         ComparisonRunnerConfig.from_dict({"unexpected": True})
@@ -264,6 +269,8 @@ def test_config_defaults_and_strict_nested_validation():
         SAERunnerConfig(seeds=(42, 42))
     with pytest.raises(ValueError, match="must be a boolean"):
         ComparisonRunnerConfig.from_dict({"functional": {"enabled": 1}})
+    with pytest.raises(ValueError, match="must be booleans"):
+        ComparisonRunnerConfig.from_dict({"show_progress": 1})
 
 
 def test_config_json_resolves_all_paths_relative_to_config(tmp_path):
@@ -420,6 +427,28 @@ def test_complete_result_cache_avoids_all_adapter_stages(monkeypatch, tmp_path):
     assert cached == {**first, "cache_hit": True}
 
 
+def test_progress_toggle_reuses_complete_result_cache(monkeypatch, tmp_path):
+    config = replace(_config(tmp_path), show_progress=False)
+    monkeypatch.setattr(
+        comparison_runner,
+        "_runner_source_fingerprint",
+        lambda: "fixed-source",
+    )
+    monkeypatch.setattr(
+        "semantic_artifacts.environment_manifest",
+        lambda: {"python": "test"},
+    )
+    first = run_comparison(config, adapter=_FakeAdapter())
+
+    cached = run_comparison(
+        replace(config, show_progress=True),
+        adapter=_FailingAdapter(),
+    )
+
+    assert cached["runner_hash"] == first["runner_hash"]
+    assert cached["cache_hit"] is True
+
+
 def test_semantic_config_content_invalidates_complete_result_cache(
     monkeypatch, tmp_path
 ):
@@ -496,3 +525,4 @@ def test_main_comparison_help_does_not_load_pipeline(monkeypatch, capsys):
     assert "complete renal cross-run sae semantic comparison" in output.lower()
     assert "--device" in output
     assert "--skip-functional" in output
+    assert "--no-progress" in output

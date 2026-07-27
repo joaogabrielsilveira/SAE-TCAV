@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 from pathlib import Path
@@ -42,6 +42,7 @@ from semantic_rules import (
     select_rule_set,
 )
 from semantic_splits import semantic_test_subsplits
+from progress_utils import progress_iter
 from stable_rule_backend import (
     CandidateRuleOccurrence,
     StableRuleBackendConfig,
@@ -130,7 +131,12 @@ def _selection_config(config: SemanticExperimentConfig) -> RuleSetSelectionConfi
     )
 
 
-def _backend_config(config: SemanticExperimentConfig, seed: int) -> StableRuleBackendConfig:
+def _backend_config(
+    config: SemanticExperimentConfig,
+    seed: int,
+    *,
+    progress_desc: str,
+) -> StableRuleBackendConfig:
     discovery = config.discovery
     return StableRuleBackendConfig(
         n_bootstraps=discovery.n_bootstraps,
@@ -143,6 +149,8 @@ def _backend_config(config: SemanticExperimentConfig, seed: int) -> StableRuleBa
         min_positive_leaf_samples=discovery.min_positive_leaf_samples,
         bootstrap_unit="group",
         random_state=seed,
+        show_progress=config.runtime.show_progress,
+        progress_desc=progress_desc,
     )
 
 
@@ -240,7 +248,11 @@ def learn_factor_semantics(
         feature_names,
         groups=patient_groups_fit,
         clinical_group_map=clinical_groups,
-        config=_backend_config(config, seed),
+        config=_backend_config(
+            config,
+            seed,
+            progress_desc=f"Rules {run_name}:{factor_id} {spec.name}",
+        ),
     )
     occurrences = _cap_occurrences(
         discovery.occurrences, config.discovery.max_candidates_per_bootstrap
@@ -507,8 +519,10 @@ def run_semantic_comparison(
         for run, matrix in sorted(activations_by_run.items(), key=lambda item: str(item[0]))
     }
     source_fingerprint = _source_fingerprint()
+    hash_config = config.to_dict()
+    hash_config["runtime"].pop("show_progress", None)
     experiment_hash = stable_hash(
-        config.to_dict(),
+        hash_config,
         array_fingerprint(X),
         array_fingerprint(y_stratify),
         array_fingerprint(patients),
@@ -538,27 +552,44 @@ def run_semantic_comparison(
         required.add((str(run_j), factor_j))
 
     models: dict[tuple[str, int, float], FactorSemanticRepresentation] = {}
-    for run_id, factor_id in sorted(required):
+    model_tasks = [
+        (run_id, factor_id, fraction)
+        for run_id, factor_id in sorted(required)
+        for fraction in config.activation_targets.positive_fractions
+    ]
+    for run_id, factor_id, fraction in progress_iter(
+        model_tasks,
+        enabled=config.runtime.show_progress,
+        desc="Learning factor semantics",
+        total=len(model_tasks),
+        unit="target",
+    ):
         activations = _activation_matrix(activations_by_run, run_id)
         if not 0 <= factor_id < activations.shape[1]:
             raise IndexError(f"Factor {factor_id} outside activations for run {run_id}")
-        for fraction in config.activation_targets.positive_fractions:
-            models[(run_id, factor_id, fraction)] = learn_factor_semantics(
-                run_id=run_id,
-                factor_id=factor_id,
-                activation_fraction=fraction,
-                X_fit=X[fit_indices],
-                activations_fit=activations[fit_indices, factor_id],
-                patient_groups_fit=patients[fit_indices],
-                X_selection=X[selection_indices],
-                activations_selection=activations[selection_indices, factor_id],
-                feature_names=names,
-                clinical_groups=group_map,
-                config=config,
-            )
+        models[(run_id, factor_id, fraction)] = learn_factor_semantics(
+            run_id=run_id,
+            factor_id=factor_id,
+            activation_fraction=fraction,
+            X_fit=X[fit_indices],
+            activations_fit=activations[fit_indices, factor_id],
+            patient_groups_fit=patients[fit_indices],
+            X_selection=X[selection_indices],
+            activations_selection=activations[selection_indices, factor_id],
+            feature_names=names,
+            clinical_groups=group_map,
+            config=config,
+        )
 
     pair_results: list[dict[str, Any]] = []
-    for pair_index, pair in enumerate(pairs):
+    pair_iter = progress_iter(
+        enumerate(pairs),
+        enabled=config.runtime.show_progress,
+        desc="Evaluating semantic pairs",
+        total=len(pairs),
+        unit="pair",
+    )
+    for pair_index, pair in pair_iter:
         run_i, run_j, factor_i, factor_j = _pair_fields(pair)
         run_i, run_j = str(run_i), str(run_j)
         activation_i = _activation_matrix(activations_by_run, run_i)
@@ -840,10 +871,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--bundle", required=True, help="NPZ with X/outcome/patients/activations")
     parser.add_argument("--matches", required=True, help="JSON list of one-to-one matched factors")
     parser.add_argument("--force", action="store_true", help="Ignore matching result cache")
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable tqdm progress bars",
+    )
     args = parser.parse_args(argv)
 
     config_path = Path(args.config)
     config = SemanticExperimentConfig.from_json(config_path)
+    if args.no_progress:
+        config = replace(
+            config,
+            runtime=replace(config.runtime, show_progress=False),
+        )
     clinical_path = config.clinical_groups_path
     if clinical_path is not None and not Path(clinical_path).is_absolute():
         clinical_path = str(config_path.parent / clinical_path)
