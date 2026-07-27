@@ -1,0 +1,5 @@
+# Additive dependencies for semantic rule discovery/tests. Existing pipeline
+# also requires its current TabPFN/PyTorch/data-science environment.
+numpy>=1.26,<3
+scikit-learn>=1.4,<2
+pytest>=8,<10

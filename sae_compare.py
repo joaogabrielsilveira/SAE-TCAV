@@ -24,6 +24,26 @@ def high_activation_matrix(concepts: np.ndarray, perc: int=90):
     
     return np.asarray(matrix, dtype=bool).transpose()
 
+
+def encode_sae(sae_or_run, embeddings: np.ndarray) -> np.ndarray:
+    """Encode shared records through an already-trained SAE without refitting."""
+
+    model = sae_or_run.get('model') if isinstance(sae_or_run, dict) else sae_or_run
+    model_type = sae_or_run.get('model_type') if isinstance(sae_or_run, dict) else None
+    with torch.no_grad():
+        encoded = model.encode(torch.as_tensor(embeddings, dtype=torch.float32))
+    if isinstance(encoded, tuple):
+        encoded = encoded[1]
+    if model_type not in (None, 'ReLU', 'TopK'):
+        raise ValueError(f'Unsupported SAE model type: {model_type}')
+    return encoded.detach().cpu().numpy()
+
+
+def encode_sae_runs(sae_runs: list[dict], embeddings: np.ndarray) -> dict[int, np.ndarray]:
+    """Encode identical records through every configured SAE run."""
+
+    return {int(run['idx']): encode_sae(run, embeddings) for run in sae_runs}
+
 def max_activation_overlap(sae_i: dict[str], concept:int, sae_j: dict[str], perc: int = 90):
     overlaps = []
     matrix_i, matrix_j = sae_i['high_act_matrix'], sae_j['high_act_matrix']
@@ -125,11 +145,16 @@ def train_all_saes(num_models: int, embs: np.ndarray, alpha: float=1e-1, scaling
 
         sae_list.append({
             'idx': i,
+            'run_id': f'sae_{i}',
+            'seed': current_seed,
+            'model_type': model_type,
             'model': sae,
             'mse': mse,
             'encoded_embs': codes,
             'sparsity_level': sparsity,
             'encoder_weights': weights,
+            # Explicit name for new code; legacy key remains unchanged.
+            'decoder_directions': weights,
             'dead_neurons': dead_neurons,
             'high_activation_matrix': high_act_matrix
         })

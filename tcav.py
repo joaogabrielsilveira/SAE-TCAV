@@ -14,17 +14,22 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import cross_val_score
 from scipy import stats
 import warnings
+from pathlib import Path
 
 CAVS_FILE = get_env_path('models/tcav/cavs.pkl')
 GRADS_FILE = get_env_path('models/tcav/grads.pkl')
 
-def get_model_gradients(model: TabPFNClassifier, dist_vec: np.ndarray, X: np.ndarray) -> np.ndarray:
+def get_model_gradients(model: TabPFNClassifier, dist_vec: np.ndarray, X: np.ndarray,
+                        cache_file: str | os.PathLike | None = None) -> np.ndarray:
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    gradients_file = str(cache_file) if cache_file is not None else GRADS_FILE
 
-    if os.path.exists(GRADS_FILE):
-        with open(GRADS_FILE, 'rb') as f:
+    if os.path.exists(gradients_file):
+        with open(gradients_file, 'rb') as f:
             grads = load(f)
-            print(f'Carregando grads de {GRADS_FILE}')
+            if cache_file is not None and np.asarray(grads).shape[0] != X.shape[0]:
+                raise ValueError('Cached gradient count does not match requested records')
+            print(f'Carregando grads de {gradients_file}')
             return grads
 
     model_decode_layer = model.model_processed_.decoder_dict['standard'].to(device)
@@ -60,7 +65,8 @@ def get_model_gradients(model: TabPFNClassifier, dist_vec: np.ndarray, X: np.nda
             gradients.append(batch_grad.detach().cpu().numpy())
             print(gradients[0].shape)
     
-    with open(GRADS_FILE, 'wb') as f:
+    Path(gradients_file).parent.mkdir(parents=True, exist_ok=True)
+    with open(gradients_file, 'wb') as f:
         dump(np.vstack(gradients), f)
     return np.vstack(gradients)
 
@@ -75,6 +81,41 @@ def get_tcav_scores(cavs: list[dict], grads: np.ndarray) -> dict[int, float]:
         scores[idx] = calculate_tcav_score(v, grads)
     
     return scores
+
+
+def compare_tcav_pair(cav_i: np.ndarray, cav_j: np.ndarray,
+                      model_gradients: np.ndarray | None = None,
+                      neutral_band: float = 0.1) -> dict[str, Any]:
+    """Summarize CAV direction and optional TCAV effects for one factor pair."""
+
+    cav_i = np.asarray(cav_i, dtype=float)
+    cav_j = np.asarray(cav_j, dtype=float)
+    denominator = np.linalg.norm(cav_i) * np.linalg.norm(cav_j)
+    cosine = float(np.dot(cav_i, cav_j) / denominator) if denominator else 0.0
+    result: dict[str, Any] = {'cav_cosine': cosine}
+    if model_gradients is None:
+        return result
+
+    score_i = float(calculate_tcav_score(cav_i, model_gradients))
+    score_j = float(calculate_tcav_score(cav_j, model_gradients))
+
+    def effect_sign(score: float) -> int:
+        if score > 0.5 + neutral_band:
+            return 1
+        if score < 0.5 - neutral_band:
+            return -1
+        return 0
+
+    sign_i, sign_j = effect_sign(score_i), effect_sign(score_j)
+    result.update({
+        'tcav_i': score_i,
+        'tcav_j': score_j,
+        'tcav_abs_difference': abs(score_i - score_j),
+        'tcav_effect_sign_i': sign_i,
+        'tcav_effect_sign_j': sign_j,
+        'tcav_effect_sign_agreement': sign_i == sign_j,
+    })
+    return result
 
 def extract_rule_conditions(path: str):
     # print(path)
@@ -554,4 +595,3 @@ def run_sparse_readout_dual_split(significant_factors: pd.DataFrame, cav_train_c
 
 
         
-

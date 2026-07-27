@@ -1,0 +1,5 @@
+{
+  "AGE": ["demographics"],
+  "CREATININE": ["laboratory", "renal"],
+  "DIABETES": ["diagnosis", "metabolic"]
+}

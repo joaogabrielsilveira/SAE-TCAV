@@ -473,3 +473,21 @@ def temporal_test_subsplits(y_test: np.ndarray, rng_seed: int = 42) -> dict[str,
         "idx_test_tcav_eval": np.asarray(idx_tcav_eval),
         "idx_test_held_out": np.asarray(idx_held_out),
     }
+
+
+def semantic_test_subsplits(
+    y_test: np.ndarray,
+    patient_ids: np.ndarray,
+    rng_seed: int = 42,
+    fractions: tuple[float, float, float, float] = (0.33, 0.335, 0.1675, 0.1675),
+) -> dict[str, np.ndarray]:
+    """Deterministic patient-grouped split for semantic rule experiments.
+
+    Fractions correspond to rule fitting, rule selection, TCAV evaluation, and
+    final semantic evaluation.  Entire patient histories stay in one split.
+    The legacy row-level ``temporal_test_subsplits`` remains unchanged.
+    """
+
+    from semantic_splits import semantic_test_subsplits as grouped_split
+
+    return grouped_split(y_test, patient_ids, rng_seed=rng_seed, fractions=fractions)
