@@ -126,6 +126,7 @@ class ComparisonRunnerConfig:
     semantic_config_path: str = "semantic_experiment.example.json"
     artifact_dir: str = "stats/comparison"
     use_cache: bool = True
+    show_progress: bool = True
     seed: int = 42
     accelerator: AcceleratorRunnerConfig = field(
         default_factory=AcceleratorRunnerConfig
@@ -138,8 +139,10 @@ class ComparisonRunnerConfig:
     def __post_init__(self) -> None:
         if not self.dataset_path or not self.semantic_config_path or not self.artifact_dir:
             raise ValueError("dataset, semantic config, and artifact paths are required")
-        if not isinstance(self.use_cache, bool):
-            raise ValueError("use_cache must be a boolean")
+        if not isinstance(self.use_cache, bool) or not isinstance(
+            self.show_progress, bool
+        ):
+            raise ValueError("use_cache and show_progress must be booleans")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -153,6 +156,7 @@ class ComparisonRunnerConfig:
             "semantic_config_path",
             "artifact_dir",
             "use_cache",
+            "show_progress",
             "seed",
             "accelerator",
             "tabpfn",
@@ -170,6 +174,7 @@ class ComparisonRunnerConfig:
             ),
             artifact_dir=str(raw.get("artifact_dir", cls.artifact_dir)),
             use_cache=raw.get("use_cache", True),
+            show_progress=raw.get("show_progress", True),
             seed=int(raw.get("seed", 42)),
             accelerator=_nested_config(
                 AcceleratorRunnerConfig,
@@ -350,6 +355,7 @@ class DefaultComparisonAdapter:
         evaluation.tabpfn_model_name = config.tabpfn.model_name
         evaluation.batch_size_predict = config.tabpfn.batch_size
         evaluation.device = config.accelerator.device
+        evaluation.show_progress = config.show_progress
         fit = fit_dr_tabpfn(
             prepared.X_train,
             prepared.y_train,
@@ -377,6 +383,7 @@ class DefaultComparisonAdapter:
                 batch_size_predict=config.tabpfn.batch_size,
                 example_add_shape=fit["example_add_shape"],
                 use_cache=False,
+                show_progress=config.show_progress,
             )
             domain_map = {
                 int(year): int(index)
@@ -395,6 +402,8 @@ class DefaultComparisonAdapter:
             extraction = EmbeddingExtractConfig()
             extraction.batch_size = config.tabpfn.batch_size
             extraction.use_cache = False
+            extraction.show_progress = config.show_progress
+            extraction.progress_desc = "Extracting train embeddings"
             train_raw = flatten_embeddings(
                 extract_embeddings_robust(
                     model=model,
@@ -408,6 +417,7 @@ class DefaultComparisonAdapter:
                     example_add_shape=fit["example_add_shape"],
                 )
             )
+            extraction.progress_desc = "Extracting test embeddings"
             test_raw = flatten_embeddings(
                 extract_embeddings_robust(
                     model=model,
@@ -498,12 +508,14 @@ class DefaultComparisonAdapter:
             weight_decay=sae.weight_decay,
             device=config.accelerator.device,
             encoding_batch_size=sae.encoding_batch_size,
+            show_progress=config.show_progress,
         )
         activations = encode_sae_runs(
             runs,
             embeddings.test_scaled,
             device=config.accelerator.device,
             batch_size=sae.encoding_batch_size,
+            show_progress=config.show_progress,
         )
         _validate_activations(activations, runs, len(prepared.X_test))
         torch.save(runs, model_cache)
@@ -543,7 +555,15 @@ class DefaultComparisonAdapter:
         all_matches: list[dict[str, Any]] = []
         selected: list[dict[str, Any]] = []
         run_pairs = _run_pairs(len(sae_data.runs), config.matching.scope)
-        for left_index, right_index in run_pairs:
+        from progress_utils import progress_iter
+
+        for left_index, right_index in progress_iter(
+            run_pairs,
+            enabled=config.show_progress,
+            desc="Geometric run pairs",
+            total=len(run_pairs),
+            unit="pair",
+        ):
             frame = get_concepts_matching(
                 sae_data.runs[left_index],
                 sae_data.runs[right_index],
@@ -614,7 +634,16 @@ class DefaultComparisonAdapter:
         diagnostics: list[dict[str, Any]] = []
         cavs_by_run: dict[int, dict[int, dict[str, Any]]] = {}
 
-        for run_id, factor_ids in sorted(factors_by_run.items()):
+        from progress_utils import progress_iter
+
+        run_items = sorted(factors_by_run.items())
+        for run_id, factor_ids in progress_iter(
+            run_items,
+            enabled=config.show_progress,
+            desc="High-precision rules and CAVs",
+            total=len(run_items),
+            unit="run",
+        ):
             activations = sae_data.activations[run_id]
             rules_by_percentile = train_binary_trees(
                 activations[fit_indices],
@@ -624,6 +653,8 @@ class DefaultComparisonAdapter:
                 max_depth=config.functional.tree_max_depth,
                 factor_ids=sorted(factor_ids),
                 min_positive_samples=config.functional.minimum_rule_samples,
+                show_progress=config.show_progress,
+                progress_desc=f"Tree rules run {run_id}",
             )
             best_percentile = max(
                 rules_by_percentile,
@@ -737,6 +768,7 @@ class DefaultComparisonAdapter:
             cache_file=gradient_cache,
             batch_size=config.functional.gradient_batch_size,
             device=config.accelerator.device,
+            show_progress=config.show_progress,
         )
         functional: dict[str, dict[int, dict[str, Any]]] = {}
         cav_arrays: dict[str, np.ndarray] = {}
@@ -744,9 +776,24 @@ class DefaultComparisonAdapter:
             (int(row["run_id"]), int(row["factor_id"])): row
             for row in diagnostics
         }
-        for run_id, cavs in sorted(cavs_by_run.items()):
+        cav_items = sorted(cavs_by_run.items())
+        for run_id, cavs in progress_iter(
+            cav_items,
+            enabled=config.show_progress,
+            desc="TCAV scoring by run",
+            total=len(cav_items),
+            unit="run",
+        ):
             scores = get_tcav_scores(list(cavs.values()), gradients)
-            for factor_id, cav in sorted(cavs.items()):
+            factor_items = sorted(cavs.items())
+            for factor_id, cav in progress_iter(
+                factor_items,
+                enabled=config.show_progress,
+                desc=f"TCAV significance run {run_id}",
+                total=len(factor_items),
+                unit="factor",
+                leave=False,
+            ):
                 score = float(scores[factor_id])
                 entry: dict[str, Any] = {
                     "CAV": np.asarray(cav["CAV"]),
@@ -822,6 +869,7 @@ class DefaultComparisonAdapter:
                 seed=config.seed,
                 artifact_dir=str(workspace / "semantic"),
                 cache=config.use_cache,
+                show_progress=config.show_progress,
             ),
         )
         clinical_path = semantic.clinical_groups_path
@@ -866,11 +914,15 @@ def run_comparison(
     )
     dataset_hash = _file_fingerprint(dataset_path)
     semantic_dependencies = _semantic_dependency_fingerprints(semantic_path)
+    hash_semantic_dependencies = dict(semantic_dependencies)
+    hash_semantic_dependencies.pop("config_sha256", None)
     source_hash = _runner_source_fingerprint()
+    hash_config = config.to_dict()
+    hash_config.pop("show_progress", None)
     runner_hash = stable_hash(
-        config.to_dict(),
+        hash_config,
         dataset_hash,
-        semantic_dependencies,
+        hash_semantic_dependencies,
         source_hash,
     )[:20]
     workspace = Path(config.artifact_dir) / runner_hash
@@ -1133,8 +1185,14 @@ def _semantic_dependency_fingerprints(path: Path) -> dict[str, Any]:
     fingerprints: dict[str, Any] = {
         "config_path": str(path.resolve()),
         "config_sha256": _file_fingerprint(path),
+        "scientific_config_hash": None,
         "clinical_groups": None,
     }
+    scientific_raw = json.loads(json.dumps(raw))
+    runtime = scientific_raw.get("runtime")
+    if isinstance(runtime, dict):
+        runtime.pop("show_progress", None)
+    fingerprints["scientific_config_hash"] = stable_hash(scientific_raw)
     clinical_groups_path = raw.get("clinical_groups_path")
     if clinical_groups_path is None:
         return fingerprints

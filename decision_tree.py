@@ -8,6 +8,7 @@ from filepaths import get_env_path
 from typing_extensions import Any
 import warnings
 from sklearn.exceptions import UndefinedMetricWarning
+from progress_utils import progress_iter
 from imblearn.under_sampling import RandomUnderSampler
 from imblearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -173,7 +174,6 @@ def extrair_regras_resumidas(modelo_arvore, nomes_das_features, scaler=None, dic
 
 def get_binary_targets(train_activations: np.ndarray, perc=50, model_type:str='ReLU') -> list[tuple[int, float]]:
     bin_targets = []
-    print(f'model_type: {model_type}')
 
     for col in range(train_activations.shape[1]):
         # lista com todas as ativações para o embedding atual
@@ -249,7 +249,9 @@ def train_binary_trees(train_activations: np.ndarray, X: np.ndarray,
                        feature_names: list[str], model_type: str='ReLU',
                        max_depth:int=15,
                        factor_ids: Sequence[int] | None = None,
-                       min_positive_samples: int = MIN_POSITIVE_SAMPLES)\
+                       min_positive_samples: int = MIN_POSITIVE_SAMPLES,
+                       show_progress: bool = False,
+                       progress_desc: str = "High-precision tree rules")\
         -> list[dict[str, Any]]:
     warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
     if min_positive_samples < 1:
@@ -267,78 +269,85 @@ def train_binary_trees(train_activations: np.ndarray, X: np.ndarray,
     percentiles = [90, 80, 70, 60, 50]
     valid_rules = {p: [] for p in percentiles}
 
+    fit_tasks: list[tuple[int, int, float]] = []
     for perc in percentiles:
         bin_targets = get_binary_targets(train_activations, perc, model_type)
         if selected_factors is not None:
             bin_targets = [
                 target for target in bin_targets if target[0] in selected_factors
             ]
-        for (idx, target) in bin_targets:
-            cur_train_activations = train_activations[:, idx]
-            n_positives = (cur_train_activations > 0).sum()
+        fit_tasks.extend((perc, idx, target) for idx, target in bin_targets)
 
-            train_target_mask = (cur_train_activations >= target) # y
+    for perc, idx, target in progress_iter(
+        fit_tasks,
+        enabled=show_progress,
+        desc=progress_desc,
+        total=len(fit_tasks),
+        unit="factor-fit",
+        leave=False,
+    ):
+        cur_train_activations = train_activations[:, idx]
+
+        train_target_mask = (cur_train_activations >= target)  # y
+        n_high = train_target_mask.sum()
+
+        if n_high < min_positive_samples:
+            train_target_mask = (cur_train_activations > 0)
             n_high = train_target_mask.sum()
-            # print(f"Extracting rules for factor {idx} with {n_positives} non-zero activations...")
+            if train_target_mask.sum() < min_positive_samples:
+                continue
 
-            if n_high < min_positive_samples:
-                train_target_mask = (cur_train_activations > 0)
-                n_high = train_target_mask.sum()
-                if train_target_mask.sum() < min_positive_samples:
-                    continue
+        clf = DecisionTreeClassifier(
+            max_depth=max_depth,
+            min_samples_leaf=0.01,
+            random_state=42
+        )
 
-            clf = DecisionTreeClassifier(
-                max_depth=max_depth,
-                min_samples_leaf=0.01,
-                random_state=42
-            )
+        clf.fit(X, train_target_mask)
 
-            clf.fit(X, train_target_mask)
+        text_rules = export_text(
+            clf,
+            feature_names=feature_names,
+            max_depth=clf.get_depth()
+        )
 
-            text_rules = export_text(
-                clf,
-                feature_names=feature_names,
-                max_depth=clf.get_depth()
-            )
+        tree_rules_df = get_rules_from_text(text_rules=text_rules)
 
-            tree_rules_df = get_rules_from_text(text_rules=text_rules)
+        best_rule = None
+        best_recall = None
+        best_prec = None
+        num_true = None
 
-            best_rule = None
-            best_recall = None
-            best_prec = None
-            num_true = None
+        for _, row in tree_rules_df.iterrows():
+            rule = row['Path']
+            true_mask = mask_from_rule(rule, X, feature_names)
 
-            for _, row in tree_rules_df.iterrows():
-                rule = row['Path']
-                true_mask = mask_from_rule(rule, X, feature_names)
+            if true_mask.sum() == 0:
+                continue
 
-                if true_mask.sum() == 0:
-                    continue
-                    
-                n_true_positive = (true_mask & train_target_mask).sum()
-                recall = n_true_positive / max(n_high, 1)
-                precision = float(train_target_mask[true_mask].mean())
+            n_true_positive = (true_mask & train_target_mask).sum()
+            recall = n_true_positive / max(n_high, 1)
+            precision = float(train_target_mask[true_mask].mean())
 
-                if precision < 0.9 or recall < 0.25:
-                    continue
-                
-                if best_recall is None or recall > best_recall:
-                    best_rule = row
-                    best_prec = precision
-                    best_recall = recall
-                    num_true = true_mask.sum()
+            if precision < 0.9 or recall < 0.25:
+                continue
 
-            if best_rule is not None:
-                valid_rules[perc].append({
-                    "Factor": idx,
-                    "Rule": best_rule['Path'],
-                    "Class": best_rule['Class'],
-                    "Precision": best_prec,
-                    "Recall": best_recall,
-                    "Patients": num_true,
-                    "Patients_concept": n_high
-                })
-        print(f'Regras válidas encontradas com percentil {perc}: {len(valid_rules[perc])}')
+            if best_recall is None or recall > best_recall:
+                best_rule = row
+                best_prec = precision
+                best_recall = recall
+                num_true = true_mask.sum()
+
+        if best_rule is not None:
+            valid_rules[perc].append({
+                "Factor": idx,
+                "Rule": best_rule['Path'],
+                "Class": best_rule['Class'],
+                "Precision": best_prec,
+                "Recall": best_recall,
+                "Patients": num_true,
+                "Patients_concept": n_high
+            })
     return valid_rules
 
 def get_rules_forced(train_activations: np.ndarray, X: np.ndarray, surviving_concepts: np.ndarray, tree_rules_df: pd.DataFrame,  perc: int, feature_names: list[str], model_type: str='ReLU', balanced:bool = False, graph_output_dir: str | Path = TREE_GRAPH_PATH):

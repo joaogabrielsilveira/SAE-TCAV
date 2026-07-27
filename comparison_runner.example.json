@@ -3,6 +3,7 @@
   "semantic_config_path": "semantic_experiment.example.json",
   "artifact_dir": "stats/comparison",
   "use_cache": true,
+  "show_progress": true,
   "seed": 42,
   "accelerator": {
     "device": "auto"
@@ -13,7 +14,7 @@
     "run_walkforward": true
   },
   "sae": {
-    "seeds": [42, 135],
+    "seeds": [42, 135, 246, 357],
     "model_type": "ReLU",
     "epochs": 1000,
     "alpha": 0.1,

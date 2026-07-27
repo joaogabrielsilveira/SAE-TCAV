@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from sklearn.tree import DecisionTreeClassifier
 
 from semantic_rules import Condition, Rule
+from progress_utils import progress_iter
 
 
 BootstrapUnit = Literal["auto", "row", "group"]
@@ -44,6 +45,8 @@ class StableRuleBackendConfig:
     min_positive_leaf_samples: int = 2
     bootstrap_unit: BootstrapUnit = "auto"
     random_state: int = 42
+    show_progress: bool = False
+    progress_desc: str = "Rule bootstraps"
 
     def __post_init__(self) -> None:
         if self.n_bootstraps < 1:
@@ -60,6 +63,8 @@ class StableRuleBackendConfig:
             raise ValueError("positive_leaf_probability must be in [0, 1]")
         if self.min_positive_leaf_samples < 1:
             raise ValueError("min_positive_leaf_samples must be >= 1")
+        if not isinstance(self.show_progress, bool):
+            raise ValueError("show_progress must be a boolean")
 
 
 @dataclass(frozen=True)
@@ -182,7 +187,15 @@ class RandomizedTreeRuleBackend:
         diagnostics: list[BootstrapDiagnostic] = []
         single_class_bootstraps = 0
 
-        for bootstrap_id, bootstrap_sequence in enumerate(bootstrap_sequences):
+        bootstrap_iter = progress_iter(
+            enumerate(bootstrap_sequences),
+            enabled=self.config.show_progress,
+            desc=self.config.progress_desc,
+            total=len(bootstrap_sequences),
+            unit="bootstrap",
+            leave=False,
+        )
+        for bootstrap_id, bootstrap_sequence in bootstrap_iter:
             child_sequences = bootstrap_sequence.spawn(self.config.trees_per_bootstrap + 1)
             bootstrap_seed = _seed_from_sequence(child_sequences[0])
             fit_indices, oob_indices = _bootstrap_indices(

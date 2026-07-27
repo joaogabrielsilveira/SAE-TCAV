@@ -39,6 +39,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Ignore complete and stage caches",
     )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable tqdm progress bars",
+    )
     args = parser.parse_args(argv)
 
     config = ComparisonRunnerConfig.from_json(args.config)
@@ -63,6 +68,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             config,
             functional=replace(config.functional, enabled=False),
         )
+    if args.no_progress:
+        config = replace(config, show_progress=False)
 
     summary = run_comparison(config, force=args.force)
     print(summary["artifact_dir"])

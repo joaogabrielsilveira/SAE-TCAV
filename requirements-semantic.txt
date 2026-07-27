@@ -14,6 +14,7 @@ imbalanced-learn==0.13.0
 matplotlib==3.10.9
 lightgbm==3.3.5
 pyarrow==24.0.0
+tqdm>=4.66,<5
 
 # SAE, TCAV, and Drift-Resilient TabPFN.
 torch==2.1.2
