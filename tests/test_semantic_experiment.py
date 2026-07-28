@@ -4,6 +4,7 @@ from dataclasses import replace
 import numpy as np
 
 import semantic_experiment
+from comparison_cache import ComparisonCache
 from semantic_config import SemanticExperimentConfig
 from semantic_rules import Condition, Rule
 from stable_rule_backend import (
@@ -56,8 +57,18 @@ def _small_config(artifact_dir, *, class_analysis_enabled=None):
 
 def _install_stable_discovery(monkeypatch):
     def fake_discovery(
-        X_fit, y_fit, feature_names, *, groups, clinical_group_map, config
+        X_fit,
+        y_fit,
+        feature_names,
+        *,
+        groups,
+        clinical_group_map,
+        config,
+        bootstrap_ids=None,
     ):
+        selected_ids = (
+            range(2) if bootstrap_ids is None else bootstrap_ids
+        )
         rule = Rule(
             "stable-signal",
             (Condition(0, "signal", ">", 0.0, ("signal_group",), 0.5),),
@@ -83,7 +94,7 @@ def _install_stable_discovery(monkeypatch):
                 oob_precision=0.0,
                 oob_recall=0.0,
             )
-            for bootstrap_id in range(2)
+            for bootstrap_id in selected_ids
         )
         diagnostics = tuple(
             BootstrapDiagnostic(
@@ -95,7 +106,7 @@ def _install_stable_discovery(monkeypatch):
                 int(y_fit.sum()),
                 1,
             )
-            for bootstrap_id in range(2)
+            for bootstrap_id in selected_ids
         )
         return StableRuleDiscoveryResult(
             occurrences,
@@ -172,8 +183,20 @@ def test_end_to_end_uses_fit_only_then_shared_final_records(monkeypatch, tmp_pat
     expected_final_rows = set(row_id[expected_splits["idx_semantic_final"]])
     discovery_rows = []
 
-    def fake_discovery(X_fit, y_fit, feature_names, *, groups, clinical_group_map, config):
+    def fake_discovery(
+        X_fit,
+        y_fit,
+        feature_names,
+        *,
+        groups,
+        clinical_group_map,
+        config,
+        bootstrap_ids=None,
+    ):
         discovery_rows.append(set(X_fit[:, 1]))
+        selected_ids = (
+            range(2) if bootstrap_ids is None else bootstrap_ids
+        )
         rule = Rule(
             "stable-signal",
             (Condition(0, "signal", ">", 0.0, ("signal_group",), 0.5),),
@@ -189,11 +212,11 @@ def test_end_to_end_uses_fit_only_then_shared_final_records(monkeypatch, tmp_pat
                 oob_selected_count=0, oob_true_positive_count=0,
                 oob_precision=0.0, oob_recall=0.0,
             )
-            for bootstrap_id in range(2)
+            for bootstrap_id in selected_ids
         )
         diagnostics = tuple(
             BootstrapDiagnostic(bootstrap_id, 100 + bootstrap_id, len(X_fit), len(X_fit), 0, int(y_fit.sum()), 1)
-            for bootstrap_id in range(2)
+            for bootstrap_id in selected_ids
         )
         return StableRuleDiscoveryResult(
             occurrences, diagnostics, tuple(feature_names), len(X_fit), int(y_fit.sum()), "group"
@@ -346,6 +369,89 @@ def test_progress_toggle_reuses_semantic_result_cache(monkeypatch, tmp_path):
 
     assert cached["experiment_hash"] == first["experiment_hash"]
     assert cached["cache_hit"] is True
+
+
+def test_objective_change_reuses_bootstraps_and_families(tmp_path):
+    config = _small_config(tmp_path / "semantic-output")
+    signal = np.linspace(-2.0, 2.0, 60)
+    X = np.column_stack((signal, signal**2))
+    activations = signal - signal.min() + 0.1
+    cache_root = tmp_path / "shared-cache"
+
+    def learn(current_config, cache):
+        return semantic_experiment.learn_factor_semantics(
+            run_id="0",
+            factor_id=0,
+            activation_fraction=0.5,
+            X_fit=X[:40],
+            activations_fit=activations[:40],
+            patient_groups_fit=np.arange(40),
+            X_selection=X[40:],
+            activations_selection=activations[40:],
+            feature_names=("signal", "squared"),
+            clinical_groups={"signal": ("clinical",)},
+            config=current_config,
+            shared_cache=cache,
+        )
+
+    first_cache = ComparisonCache(cache_root)
+    learn(config, first_cache)
+    changed_config = replace(
+        config,
+        objective=replace(config.objective, min_precision=0.1),
+    )
+    second_cache = ComparisonCache(cache_root)
+    learn(changed_config, second_cache)
+
+    statuses = {
+        event.stage: event.status for event in second_cache.events
+    }
+    assert statuses["semantic_bootstrap"] == "hit"
+    assert statuses["semantic_families"] == "hit"
+    assert statuses["semantic_selection"] == "miss"
+
+    increased_config = replace(
+        changed_config,
+        discovery=replace(
+            changed_config.discovery,
+            n_bootstraps=3,
+        ),
+    )
+    third_cache = ComparisonCache(cache_root)
+    learn(increased_config, third_cache)
+    bootstrap_statuses = [
+        event.status
+        for event in third_cache.events
+        if event.stage == "semantic_bootstrap"
+    ]
+    assert bootstrap_statuses.count("hit") == 2
+    assert bootstrap_statuses.count("miss") == 1
+
+    taxonomy_cache = ComparisonCache(cache_root)
+    semantic_experiment.learn_factor_semantics(
+        run_id="0",
+        factor_id=0,
+        activation_fraction=0.5,
+        X_fit=X[:40],
+        activations_fit=activations[:40],
+        patient_groups_fit=np.arange(40),
+        X_selection=X[40:],
+        activations_selection=activations[40:],
+        feature_names=("signal", "squared"),
+        clinical_groups={"signal": ("renamed-clinical-group",)},
+        config=increased_config,
+        shared_cache=taxonomy_cache,
+    )
+    assert all(
+        event.status == "hit"
+        for event in taxonomy_cache.events
+        if event.stage == "semantic_bootstrap"
+    )
+    assert next(
+        event
+        for event in taxonomy_cache.events
+        if event.stage == "semantic_families"
+    ).status == "miss"
 
 
 def test_disabling_class_analysis_preserves_pooled_output_and_omits_additions(

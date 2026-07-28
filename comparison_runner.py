@@ -10,16 +10,19 @@ from __future__ import annotations
 import csv
 from dataclasses import asdict, dataclass, field, replace
 import hashlib
+import inspect
 import json
 import math
 from pathlib import Path
 import pickle
-from typing import Any, Mapping, Sequence
+import platform
+from typing import Any, Callable, Literal, Mapping, Sequence
 
 import numpy as np
 
 from semantic_artifacts import array_fingerprint, stable_hash
 from runtime_acceleration import StageTelemetry, accelerator_manifest
+from comparison_cache import ComparisonCache
 
 
 @dataclass(frozen=True)
@@ -126,6 +129,8 @@ class ComparisonRunnerConfig:
     semantic_config_path: str = "semantic_experiment.example.json"
     artifact_dir: str = "stats/comparison"
     use_cache: bool = True
+    cache_dir: str | None = None
+    cache_verification: Literal["manifest", "checksum"] = "checksum"
     show_progress: bool = True
     seed: int = 42
     accelerator: AcceleratorRunnerConfig = field(
@@ -143,6 +148,10 @@ class ComparisonRunnerConfig:
             self.show_progress, bool
         ):
             raise ValueError("use_cache and show_progress must be booleans")
+        if self.cache_verification not in {"manifest", "checksum"}:
+            raise ValueError(
+                "cache_verification must be 'manifest' or 'checksum'"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -156,6 +165,8 @@ class ComparisonRunnerConfig:
             "semantic_config_path",
             "artifact_dir",
             "use_cache",
+            "cache_dir",
+            "cache_verification",
             "show_progress",
             "seed",
             "accelerator",
@@ -174,6 +185,12 @@ class ComparisonRunnerConfig:
             ),
             artifact_dir=str(raw.get("artifact_dir", cls.artifact_dir)),
             use_cache=raw.get("use_cache", True),
+            cache_dir=(
+                None if raw.get("cache_dir") is None else str(raw["cache_dir"])
+            ),
+            cache_verification=str(
+                raw.get("cache_verification", "checksum")
+            ),
             show_progress=raw.get("show_progress", True),
             seed=int(raw.get("seed", 42)),
             accelerator=_nested_config(
@@ -206,6 +223,11 @@ class ComparisonRunnerConfig:
                 _resolve_path(base, config.semantic_config_path)
             ),
             artifact_dir=str(_resolve_path(base, config.artifact_dir)),
+            cache_dir=(
+                None
+                if config.cache_dir is None
+                else str(_resolve_path(base, config.cache_dir))
+            ),
         )
 
 
@@ -255,6 +277,29 @@ class _EmbeddingData:
     scaler: Any
     fit_time_seconds: float
     walkforward_metrics: list[dict[str, Any]]
+    model_identity: str | None = None
+    model_provider: Callable[[], Mapping[str, Any]] | None = None
+
+    def require_model(self, *, require_decoder: bool = False) -> Any:
+        if self.model is None:
+            if self.model_provider is None:
+                raise RuntimeError("TabPFN model is unavailable")
+            fit = self.model_provider()
+            self.model = fit["model"]
+            self.model_device = fit["model_add_x_device"]
+            self.example_add_shape = fit["example_add_shape"]
+            self.fit_time_seconds = float(fit["fit_time_sec"])
+        if require_decoder:
+            processed = getattr(self.model, "model_processed_", None)
+            decoder_dict = getattr(processed, "decoder_dict", None)
+            if (
+                not isinstance(decoder_dict, Mapping)
+                or "standard" not in decoder_dict
+            ):
+                raise ValueError(
+                    "TabPFN model lacks standard decoder access required by TCAV"
+                )
+        return self.model
 
 
 @dataclass
@@ -265,6 +310,9 @@ class _SAEData:
 
 class DefaultComparisonAdapter:
     """Production adapter for expensive legacy model and filesystem stages."""
+
+    def __init__(self, cache: ComparisonCache | None = None) -> None:
+        self.cache = cache
 
     def prepare(
         self,
@@ -280,55 +328,88 @@ class DefaultComparisonAdapter:
             prepare_database,
         )
 
-        cache_path = workspace / "prepared.pkl"
-        if config.use_cache and not force and cache_path.exists():
-            with cache_path.open("rb") as handle:
-                prepared = pickle.load(handle)
-            _validate_prepared(prepared)
-            return prepared
-
         dataset_path = Path(config.dataset_path)
         if not dataset_path.is_file():
             raise FileNotFoundError(f"Renal Feather file not found: {dataset_path}")
-        frame = open_feather(str(dataset_path))
-        required = {"patient_id", "date", "event"}
-        missing = required - set(frame.columns)
-        if missing:
-            raise ValueError(f"Renal Feather missing columns: {sorted(missing)}")
-        if not frame["event"].astype(str).eq("DEATH").any():
-            raise ValueError("Renal Feather must contain an exact 'DEATH' event")
-
         preparation_config = TabPFNPrepConfig()
         preparation_config.rng_seed = config.seed
-        prepared_rows = prepare_database(frame, cfg=preparation_config)
-        arrays = get_tabpfn_arrays(prepared_rows)
-        train_rows = prepared_rows["train_rows"].reset_index(drop=True)
-        test_rows = prepared_rows["test_rows"].reset_index(drop=True)
-        features = tuple(str(name) for name in prepared_rows["top_k_events"])
-        patient_ids = test_rows["patient_id"].astype(str).to_numpy()
-        years_test = np.asarray(arrays["years_test"], dtype=int)
-        record_keys = np.asarray(
-            [
-                f"patient:{patient}|year:{year}"
-                for patient, year in zip(patient_ids, years_test)
-            ],
-            dtype=str,
-        )
-        prepared = _PreparedData(
-            train_rows=train_rows,
-            test_rows=test_rows,
-            feature_names=features,
-            X_train=np.asarray(arrays["X_train"], dtype=np.float32),
-            y_train=np.asarray(arrays["y_train"], dtype=int),
-            years_train=np.asarray(arrays["years_train"], dtype=int),
-            X_test=np.asarray(arrays["X_test"], dtype=np.float32),
-            y_test=np.asarray(arrays["y_test"], dtype=int),
-            years_test=years_test,
-            patient_ids=patient_ids,
-            record_keys=record_keys,
-        )
+
+        def compute() -> _PreparedData:
+            frame = open_feather(str(dataset_path))
+            required = {"patient_id", "date", "event"}
+            missing = required - set(frame.columns)
+            if missing:
+                raise ValueError(
+                    f"Renal Feather missing columns: {sorted(missing)}"
+                )
+            if not frame["event"].astype(str).eq("DEATH").any():
+                raise ValueError("Renal Feather must contain an exact 'DEATH' event")
+            prepared_rows = prepare_database(frame, cfg=preparation_config)
+            arrays = get_tabpfn_arrays(prepared_rows)
+            train_rows = prepared_rows["train_rows"].reset_index(drop=True)
+            test_rows = prepared_rows["test_rows"].reset_index(drop=True)
+            features = tuple(str(name) for name in prepared_rows["top_k_events"])
+            patient_ids = test_rows["patient_id"].astype(str).to_numpy()
+            years_test = np.asarray(arrays["years_test"], dtype=int)
+            record_keys = np.asarray(
+                [
+                    f"patient:{patient}|year:{year}"
+                    for patient, year in zip(patient_ids, years_test)
+                ],
+                dtype=str,
+            )
+            return _PreparedData(
+                train_rows=train_rows,
+                test_rows=test_rows,
+                feature_names=features,
+                X_train=np.asarray(arrays["X_train"], dtype=np.float32),
+                y_train=np.asarray(arrays["y_train"], dtype=int),
+                years_train=np.asarray(arrays["years_train"], dtype=int),
+                X_test=np.asarray(arrays["X_test"], dtype=np.float32),
+                y_test=np.asarray(arrays["y_test"], dtype=int),
+                years_test=years_test,
+                patient_ids=patient_ids,
+                record_keys=record_keys,
+            )
+
+        if self.cache is None:
+            prepared = compute()
+        else:
+            prep_values = {
+                name: getattr(preparation_config, name)
+                for name in (
+                    "rng_seed",
+                    "target_pos_lines",
+                    "target_neg_lines",
+                    "max_total_rows",
+                    "final_top_k",
+                    "m_candidates",
+                    "forced_train_year_start",
+                    "forced_test_year_start",
+                )
+            }
+            result = self.cache.resolve(
+                stage="prepared",
+                item="renal-dataset",
+                dependencies={
+                    "dataset_sha256": _file_fingerprint(dataset_path),
+                    "preparation": prep_values,
+                    "versions": _package_versions(
+                        "numpy", "pandas", "lightgbm", "pyarrow"
+                    ),
+                },
+                source_fingerprint=_source_files_fingerprint("database.py"),
+                load=lambda directory: _pickle_load(directory / "prepared.pkl"),
+                compute=compute,
+                store=lambda directory, value: _pickle_dump(
+                    directory / "prepared.pkl", value
+                ),
+                validate=_validate_prepared,
+                fingerprint=_prepared_fingerprints,
+            )
+            prepared = result.value
         _validate_prepared(prepared)
-        with cache_path.open("wb") as handle:
+        with (workspace / "prepared.pkl").open("wb") as handle:
             pickle.dump(prepared, handle)
         return prepared
 
@@ -343,9 +424,13 @@ class DefaultComparisonAdapter:
         from tabpfn_model import (
             EmbeddingExtractConfig,
             TabPFNEvalConfig,
+            batch_get_embeddings,
+            ensure_test_feature_columns,
             extract_embeddings_robust,
             fit_dr_tabpfn,
             flatten_embeddings,
+            infer_model_additional_x_info,
+            make_dist_tensor,
             scale_embeddings,
             walkforward_evaluate_tabpfn,
         )
@@ -356,13 +441,6 @@ class DefaultComparisonAdapter:
         evaluation.batch_size_predict = config.tabpfn.batch_size
         evaluation.device = config.accelerator.device
         evaluation.show_progress = config.show_progress
-        fit = fit_dr_tabpfn(
-            prepared.X_train,
-            prepared.y_train,
-            prepared.years_train,
-            evaluation,
-        )
-        model = fit["model"]
         domain_map = {
             int(year): index
             for index, year in enumerate(
@@ -372,33 +450,85 @@ class DefaultComparisonAdapter:
                 )
             )
         }
-        walkforward_metrics: list[dict[str, Any]] = []
-        if config.tabpfn.run_walkforward:
-            walkforward = walkforward_evaluate_tabpfn(
-                drift_model=model,
-                test_rows=prepared.test_rows,
-                top_k_events=list(prepared.feature_names),
-                train_years=prepared.years_train,
-                model_add_x_device=fit["model_add_x_device"],
-                batch_size_predict=config.tabpfn.batch_size,
-                example_add_shape=fit["example_add_shape"],
-                use_cache=False,
-                show_progress=config.show_progress,
-            )
-            domain_map = {
-                int(year): int(index)
-                for year, index in walkforward["year_to_domain_combined"].items()
-            }
-            walkforward_metrics = [
-                _jsonable(row) for row in walkforward["results_per_year"]
-            ]
 
-        embedding_cache = workspace / "embeddings.npz"
-        if config.use_cache and not force and embedding_cache.exists():
-            with np.load(embedding_cache, allow_pickle=False) as cached:
-                train_raw = np.asarray(cached["train_raw"])
-                test_raw = np.asarray(cached["test_raw"])
-        else:
+        numerical_environment = _numerical_environment_fingerprint(
+            config.accelerator.device, "numpy", "torch", "tabpfn"
+        )
+        model_dependencies = {
+            "model_name": config.tabpfn.model_name,
+            "checkpoint": _tabpfn_checkpoint_fingerprint(
+                config.tabpfn.model_name
+            ),
+            "seed": config.seed,
+            "X_train": array_fingerprint(prepared.X_train),
+            "y_train": array_fingerprint(prepared.y_train),
+            "years_train": array_fingerprint(prepared.years_train),
+        }
+        fit_source = _callable_source_fingerprint(
+            fit_dr_tabpfn, infer_model_additional_x_info
+        )
+        extraction_source = _callable_source_fingerprint(
+            extract_embeddings_robust,
+            flatten_embeddings,
+            batch_get_embeddings,
+            make_dist_tensor,
+        )
+        walkforward_source = _callable_source_fingerprint(
+            walkforward_evaluate_tabpfn,
+            ensure_test_feature_columns,
+            make_dist_tensor,
+        )
+        scaling_source = _callable_source_fingerprint(scale_embeddings)
+        model_identity = stable_hash(
+            model_dependencies,
+            fit_source,
+            numerical_environment,
+        )
+        fit_holder: dict[str, Mapping[str, Any]] = {}
+
+        def fit_model() -> Mapping[str, Any]:
+            if "fit" in fit_holder:
+                return fit_holder["fit"]
+
+            def compute_fit():
+                return fit_dr_tabpfn(
+                    prepared.X_train,
+                    prepared.y_train,
+                    prepared.years_train,
+                    evaluation,
+                )
+
+            if self.cache is None:
+                fit = compute_fit()
+            else:
+                fit_result = self.cache.resolve(
+                    stage="tabpfn_fit",
+                    item=config.tabpfn.model_name,
+                    dependencies=model_dependencies,
+                    source_fingerprint=fit_source,
+                    environment_fingerprint=numerical_environment,
+                    load=lambda directory: _pickle_load(
+                        directory / "fitted_model.pkl"
+                    ),
+                    compute=compute_fit,
+                    store=_store_tabpfn_fit,
+                    validate=_validate_tabpfn_fit,
+                    fingerprint=lambda value: {
+                        "model_identity": stable_hash(
+                            model_dependencies,
+                            type(value["model"]).__qualname__,
+                            value.get("model_source"),
+                        )
+                    },
+                    ignore_store_errors=True,
+                )
+                fit = fit_result.value
+            fit_holder["fit"] = fit
+            return fit
+
+        def compute_raw() -> tuple[np.ndarray, np.ndarray]:
+            fit = fit_model()
+            model = fit["model"]
             extraction = EmbeddingExtractConfig()
             extraction.batch_size = config.tabpfn.batch_size
             extraction.use_cache = False
@@ -431,32 +561,154 @@ class DefaultComparisonAdapter:
                     example_add_shape=fit["example_add_shape"],
                 )
             )
-            np.savez_compressed(
-                embedding_cache, train_raw=train_raw, test_raw=test_raw
+            return np.asarray(train_raw), np.asarray(test_raw)
+
+        raw_dependencies = {
+            "model": model_dependencies,
+            "X_train": array_fingerprint(prepared.X_train),
+            "years_train": array_fingerprint(prepared.years_train),
+            "X_test": array_fingerprint(prepared.X_test),
+            "years_test": array_fingerprint(prepared.years_test),
+            "domain_map": domain_map,
+        }
+        if self.cache is None:
+            train_raw, test_raw = compute_raw()
+        else:
+            raw_result = self.cache.resolve(
+                stage="embeddings_raw",
+                item="train-and-test",
+                dependencies=raw_dependencies,
+                source_fingerprint=extraction_source,
+                environment_fingerprint=numerical_environment,
+                load=_load_embedding_pair,
+                compute=compute_raw,
+                store=_store_embedding_pair,
+                validate=lambda value: _validate_embedding_pair(value, prepared),
+                fingerprint=lambda value: {
+                    "train_raw": array_fingerprint(value[0]),
+                    "test_raw": array_fingerprint(value[1]),
+                },
+            )
+            train_raw, test_raw = raw_result.value
+
+        walkforward_metrics: list[dict[str, Any]] = []
+        if config.tabpfn.run_walkforward:
+            def compute_walkforward() -> list[dict[str, Any]]:
+                fit = fit_model()
+                walkforward = walkforward_evaluate_tabpfn(
+                    drift_model=fit["model"],
+                    test_rows=prepared.test_rows,
+                    top_k_events=list(prepared.feature_names),
+                    train_years=prepared.years_train,
+                    model_add_x_device=fit["model_add_x_device"],
+                    batch_size_predict=config.tabpfn.batch_size,
+                    example_add_shape=fit["example_add_shape"],
+                    use_cache=False,
+                    show_progress=config.show_progress,
+                )
+                return [
+                    _jsonable(row) for row in walkforward["results_per_year"]
+                ]
+
+            if self.cache is None:
+                walkforward_metrics = compute_walkforward()
+            else:
+                walk_result = self.cache.resolve(
+                    stage="walkforward",
+                    item="test-years",
+                    dependencies={
+                        "model": model_dependencies,
+                        "test_rows": array_fingerprint(
+                            prepared.test_rows[
+                                list(prepared.feature_names) + ["DEATH", "year"]
+                            ].to_numpy()
+                        ),
+                        "record_keys": array_fingerprint(
+                            prepared.record_keys
+                        ),
+                        "feature_names": prepared.feature_names,
+                        "domain_map": domain_map,
+                    },
+                    source_fingerprint=walkforward_source,
+                    environment_fingerprint=numerical_environment,
+                    load=lambda directory: _read_json(
+                        directory / "metrics.json"
+                    ),
+                    compute=compute_walkforward,
+                    store=lambda directory, value: _write_json(
+                        directory / "metrics.json", value
+                    ),
+                    validate=lambda value: _validate_walkforward(value),
+                    fingerprint=lambda value: {
+                        "metrics": stable_hash(value)
+                    },
+                )
+                walkforward_metrics = walk_result.value
+
+        def compute_scaled():
+            return scale_embeddings(
+                np.asarray(train_raw), np.asarray(test_raw), fit_test=False
             )
 
-        train_scaled, test_scaled, scaler = scale_embeddings(
-            np.asarray(train_raw), np.asarray(test_raw), fit_test=False
-        )
+        if self.cache is None:
+            train_scaled, test_scaled, scaler = compute_scaled()
+        else:
+            scaled_result = self.cache.resolve(
+                stage="embeddings_scaled",
+                item="standard-scaler",
+                dependencies={
+                    "train_raw": array_fingerprint(train_raw),
+                    "test_raw": array_fingerprint(test_raw),
+                    "fit_test": False,
+                    "sklearn": _package_versions("sklearn"),
+                },
+                source_fingerprint=scaling_source,
+                load=_load_scaled_embeddings,
+                compute=compute_scaled,
+                store=_store_scaled_embeddings,
+                validate=lambda value: _validate_scaled_embeddings(
+                    value, prepared
+                ),
+                fingerprint=lambda value: {
+                    "train_scaled": array_fingerprint(value[0]),
+                    "test_scaled": array_fingerprint(value[1]),
+                },
+            )
+            train_scaled, test_scaled, scaler = scaled_result.value
+
         if len(train_scaled) != len(prepared.X_train) or len(test_scaled) != len(
             prepared.X_test
         ):
             raise ValueError("TabPFN embedding rows do not align with prepared data")
         if not np.isfinite(train_scaled).all() or not np.isfinite(test_scaled).all():
             raise ValueError("TabPFN embeddings contain non-finite values")
+        np.savez_compressed(
+            workspace / "embeddings.npz",
+            train_raw=train_raw,
+            test_raw=test_raw,
+        )
         _write_json(workspace / "tabpfn_metrics.json", walkforward_metrics)
+        fit = fit_holder.get("fit")
         return _EmbeddingData(
-            model=model,
-            model_device=fit["model_add_x_device"],
-            example_add_shape=fit["example_add_shape"],
+            model=fit["model"] if fit is not None else None,
+            model_device=(
+                fit["model_add_x_device"] if fit is not None else None
+            ),
+            example_add_shape=(
+                fit["example_add_shape"] if fit is not None else None
+            ),
             year_to_domain=domain_map,
             train_raw=np.asarray(train_raw),
             test_raw=np.asarray(test_raw),
             train_scaled=np.asarray(train_scaled),
             test_scaled=np.asarray(test_scaled),
             scaler=scaler,
-            fit_time_seconds=float(fit["fit_time_sec"]),
+            fit_time_seconds=(
+                float(fit["fit_time_sec"]) if fit is not None else 0.0
+            ),
             walkforward_metrics=walkforward_metrics,
+            model_identity=model_identity,
+            model_provider=fit_model,
         )
 
     def train_saes(
@@ -471,60 +723,153 @@ class DefaultComparisonAdapter:
     ) -> _SAEData:
         import torch
 
-        from sae_compare import encode_sae_runs, train_all_saes
-
-        model_cache = workspace / "sae_runs.pt"
-        activation_cache = workspace / "activations.npz"
-        if (
-            config.use_cache
-            and not force
-            and model_cache.exists()
-            and activation_cache.exists()
-        ):
-            runs = torch.load(model_cache, map_location="cpu")
-            with np.load(activation_cache, allow_pickle=False) as cached:
-                activations = {
-                    int(name.removeprefix("run_")): np.asarray(cached[name])
-                    for name in cached.files
-                }
-            _validate_activations(activations, runs, len(prepared.X_test))
-            return _SAEData(runs=runs, activations=activations)
+        from sae import SAE, train_sae_model
+        from sae_compare import encode_sae, high_activation_matrix, train_all_saes
 
         fit_indices = splits["idx_semantic_fit"]
         matching_indices = splits["idx_semantic_select"]
         sae = config.sae
-        runs = train_all_saes(
-            num_models=len(sae.seeds),
-            embs=embeddings.test_scaled[fit_indices],
-            alpha=sae.alpha,
-            scaling_factor=sae.scaling_factor,
-            model_type=sae.model_type,
-            k=sae.k,
-            k_aux=sae.k_aux,
-            universal_embs=embeddings.test_scaled[matching_indices],
-            seeds=sae.seeds,
-            epochs=sae.epochs,
-            learning_rate=sae.learning_rate,
-            weight_decay=sae.weight_decay,
-            device=config.accelerator.device,
-            encoding_batch_size=sae.encoding_batch_size,
-            show_progress=config.show_progress,
+        fit_embeddings = embeddings.test_scaled[fit_indices]
+        numerical_environment = _numerical_environment_fingerprint(
+            config.accelerator.device, "numpy", "torch"
         )
-        activations = encode_sae_runs(
-            runs,
-            embeddings.test_scaled,
-            device=config.accelerator.device,
-            batch_size=sae.encoding_batch_size,
-            show_progress=config.show_progress,
+        shared_hyperparameters = {
+            "model_type": sae.model_type,
+            "epochs": sae.epochs,
+            "alpha": sae.alpha,
+            "scaling_factor": sae.scaling_factor,
+            "learning_rate": sae.learning_rate,
+            "weight_decay": sae.weight_decay,
+            "k": sae.k,
+            "k_aux": sae.k_aux,
+            "use_decoder_bias": True,
+        }
+        sae_training_source = _callable_source_fingerprint(
+            train_all_saes, train_sae_model, SAE
         )
+        sae_activation_source = _callable_source_fingerprint(
+            encode_sae, SAE.encode
+        )
+        runs: list[dict[str, Any]] = []
+        activations: dict[int, np.ndarray] = {}
+        from progress_utils import progress_iter
+
+        for run_index, seed in progress_iter(
+            list(enumerate(sae.seeds)),
+            enabled=config.show_progress,
+            desc="Resolving SAE runs",
+            total=len(sae.seeds),
+            unit="run",
+        ):
+            def compute_run(seed_value=seed):
+                return train_all_saes(
+                    num_models=1,
+                    embs=fit_embeddings,
+                    alpha=sae.alpha,
+                    scaling_factor=sae.scaling_factor,
+                    model_type=sae.model_type,
+                    k=sae.k,
+                    k_aux=sae.k_aux,
+                    universal_embs=None,
+                    seeds=(seed_value,),
+                    epochs=sae.epochs,
+                    learning_rate=sae.learning_rate,
+                    weight_decay=sae.weight_decay,
+                    device=config.accelerator.device,
+                    encoding_batch_size=sae.encoding_batch_size,
+                    show_progress=config.show_progress,
+                )[0]
+
+            model_dependencies = {
+                "fit_embeddings": array_fingerprint(fit_embeddings),
+                "seed": int(seed),
+                "hyperparameters": shared_hyperparameters,
+            }
+            if self.cache is None:
+                trained = compute_run()
+                model_key = stable_hash(model_dependencies)
+            else:
+                model_result = self.cache.resolve(
+                    stage="sae_model",
+                    item=f"seed:{seed}",
+                    dependencies=model_dependencies,
+                    source_fingerprint=sae_training_source,
+                    environment_fingerprint=numerical_environment,
+                    load=lambda directory: _load_sae_run(
+                        directory,
+                        data_dimension=fit_embeddings.shape[1],
+                        sae_config=sae,
+                    ),
+                    compute=compute_run,
+                    store=_store_sae_run,
+                    validate=lambda value, expected_seed=seed: _validate_sae_run(
+                        value, expected_seed, fit_embeddings.shape[1]
+                    ),
+                    fingerprint=lambda value: {
+                        "model_state": _model_state_fingerprint(value["model"])
+                    },
+                )
+                trained = model_result.value
+                model_key = model_result.output_fingerprints["model_state"]
+
+            def compute_activations(run=trained):
+                return encode_sae(
+                    run,
+                    embeddings.test_scaled,
+                    device=config.accelerator.device,
+                    batch_size=sae.encoding_batch_size,
+                )
+
+            activation_dependencies = {
+                "model_state": model_key,
+                "test_embeddings": array_fingerprint(
+                    embeddings.test_scaled
+                ),
+            }
+            if self.cache is None:
+                activation_matrix = compute_activations()
+            else:
+                activation_result = self.cache.resolve(
+                    stage="sae_activations",
+                    item=f"seed:{seed}",
+                    dependencies=activation_dependencies,
+                    source_fingerprint=sae_activation_source,
+                    environment_fingerprint=numerical_environment,
+                    load=lambda directory: _load_single_array(
+                        directory / "activations.npy"
+                    ),
+                    compute=compute_activations,
+                    store=lambda directory, value: np.save(
+                        directory / "activations.npy", value
+                    ),
+                    validate=lambda value: _validate_activation_matrix(
+                        value, len(prepared.X_test)
+                    ),
+                    fingerprint=lambda value: {
+                        "activations": array_fingerprint(value)
+                    },
+                )
+                activation_matrix = activation_result.value
+
+            run = dict(trained)
+            run["idx"] = run_index
+            run["run_id"] = f"sae_{run_index}"
+            run["seed"] = int(seed)
+            run["encoded_embs"] = np.asarray(activation_matrix[fit_indices])
+            run["high_activation_matrix"] = high_activation_matrix(
+                np.asarray(activation_matrix[matching_indices]), perc=90
+            )
+            runs.append(run)
+            activations[run_index] = np.asarray(activation_matrix)
+
         _validate_activations(activations, runs, len(prepared.X_test))
-        torch.save(runs, model_cache)
+        torch.save(runs, workspace / "sae_runs.pt")
         state_dir = workspace / "sae"
         state_dir.mkdir(parents=True, exist_ok=True)
         for run in runs:
             torch.save(run["model"].state_dict(), state_dir / f"run_{run['idx']}.pt")
         np.savez_compressed(
-            activation_cache,
+            workspace / "activations.npz",
             **{f"run_{run_id}": matrix for run_id, matrix in activations.items()},
         )
         _write_json(
@@ -550,11 +895,22 @@ class DefaultComparisonAdapter:
         config: ComparisonRunnerConfig,
         workspace: Path,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        from sae_compare import get_concepts_matching
+        from sae_compare import (
+            cosine_similarity_matrix,
+            get_concepts_matching,
+            get_overlap,
+            overlap_matrix,
+        )
 
         all_matches: list[dict[str, Any]] = []
         selected: list[dict[str, Any]] = []
         run_pairs = _run_pairs(len(sae_data.runs), config.matching.scope)
+        matching_source = _callable_source_fingerprint(
+            get_concepts_matching,
+            cosine_similarity_matrix,
+            overlap_matrix,
+            get_overlap,
+        )
         from progress_utils import progress_iter
 
         for left_index, right_index in progress_iter(
@@ -564,12 +920,76 @@ class DefaultComparisonAdapter:
             total=len(run_pairs),
             unit="pair",
         ):
-            frame = get_concepts_matching(
-                sae_data.runs[left_index],
-                sae_data.runs[right_index],
-                pair_criteria=config.matching.criterion,
-            )
-            pair_rows = [_jsonable(row) for row in frame.to_dict(orient="records")]
+            left_run = sae_data.runs[left_index]
+            right_run = sae_data.runs[right_index]
+
+            def compute_pair_rows():
+                frame = get_concepts_matching(
+                    left_run,
+                    right_run,
+                    pair_criteria=config.matching.criterion,
+                )
+                return [
+                    {
+                        key: _jsonable(row[key])
+                        for key in (
+                            "original_concept",
+                            "best_pair",
+                            "cos_sim",
+                            "overlap",
+                        )
+                    }
+                    for row in frame.to_dict(orient="records")
+                ]
+
+            if self.cache is None:
+                cached_rows = compute_pair_rows()
+            else:
+                pair_result = self.cache.resolve(
+                    stage="matching_pair",
+                    item=(
+                        f"seed:{left_run['seed']}-seed:{right_run['seed']}"
+                    ),
+                    dependencies={
+                        "left_directions": array_fingerprint(
+                            np.asarray(left_run["decoder_directions"])
+                        ),
+                        "right_directions": array_fingerprint(
+                            np.asarray(right_run["decoder_directions"])
+                        ),
+                        "left_high_activations": array_fingerprint(
+                            np.asarray(left_run["high_activation_matrix"])
+                        ),
+                        "right_high_activations": array_fingerprint(
+                            np.asarray(right_run["high_activation_matrix"])
+                        ),
+                        "criterion": config.matching.criterion,
+                    },
+                    source_fingerprint=matching_source,
+                    environment_fingerprint=stable_hash(
+                        _package_versions("numpy", "scipy", "sklearn")
+                    ),
+                    load=lambda directory: _read_json(
+                        directory / "matches.json"
+                    ),
+                    compute=compute_pair_rows,
+                    store=lambda directory, value: _write_json(
+                        directory / "matches.json", value
+                    ),
+                    validate=_validate_matching_rows,
+                    fingerprint=lambda value: {
+                        "matches": stable_hash(value)
+                    },
+                )
+                cached_rows = pair_result.value
+            pair_rows = [
+                {
+                    **row,
+                    "sae_i_idx": left_index,
+                    "sae_j_idx": right_index,
+                }
+                for row in cached_rows
+            ]
             pair_rows.sort(
                 key=lambda row: (
                     int(row["sae_i_idx"]),
@@ -618,12 +1038,41 @@ class DefaultComparisonAdapter:
 
         import pandas as pd
 
-        from decision_tree import get_rules_forced, train_binary_trees
+        from decision_tree import (
+            get_binary_targets,
+            get_rules_forced,
+            get_rules_from_text,
+            mask_from_rule,
+            train_binary_trees,
+        )
         from tcav import (
+            extract_rule_conditions,
+            get_rule_mask,
             get_model_gradients,
             get_tcav_scores,
             robust_tcav_significance_test,
             train_cavs_from_rules,
+        )
+        high_precision_source = _callable_source_fingerprint(
+            train_binary_trees,
+            get_binary_targets,
+            get_rules_from_text,
+            mask_from_rule,
+        )
+        forced_rule_source = _callable_source_fingerprint(
+            get_rules_forced,
+            get_binary_targets,
+            get_rules_from_text,
+            mask_from_rule,
+        )
+        cav_source = _callable_source_fingerprint(
+            train_cavs_from_rules,
+            extract_rule_conditions,
+            get_rule_mask,
+        )
+        gradient_source = _callable_source_fingerprint(get_model_gradients)
+        tcav_factor_source = _callable_source_fingerprint(
+            get_tcav_scores, robust_tcav_significance_test
         )
 
         fit_indices = splits["idx_semantic_fit"]
@@ -645,17 +1094,68 @@ class DefaultComparisonAdapter:
             unit="run",
         ):
             activations = sae_data.activations[run_id]
-            rules_by_percentile = train_binary_trees(
-                activations[fit_indices],
-                prepared.X_test[fit_indices],
-                list(prepared.feature_names),
-                model_type=config.sae.model_type,
-                max_depth=config.functional.tree_max_depth,
-                factor_ids=sorted(factor_ids),
-                min_positive_samples=config.functional.minimum_rule_samples,
-                show_progress=config.show_progress,
-                progress_desc=f"Tree rules run {run_id}",
-            )
+            rules_by_percentile: dict[int, list[dict[str, Any]]] = {
+                percentile: [] for percentile in (90, 80, 70, 60, 50)
+            }
+            for factor_id in sorted(factor_ids):
+                def compute_factor_rules(current_factor=factor_id):
+                    return train_binary_trees(
+                        activations[fit_indices],
+                        prepared.X_test[fit_indices],
+                        list(prepared.feature_names),
+                        model_type=config.sae.model_type,
+                        max_depth=config.functional.tree_max_depth,
+                        factor_ids=[current_factor],
+                        min_positive_samples=(
+                            config.functional.minimum_rule_samples
+                        ),
+                        show_progress=config.show_progress,
+                        progress_desc=(
+                            f"Tree rule run {run_id} factor {current_factor}"
+                        ),
+                    )
+
+                if self.cache is None:
+                    factor_rules = compute_factor_rules()
+                else:
+                    rule_result = self.cache.resolve(
+                        stage="high_precision_rule",
+                        item=f"run:{run_id}-factor:{factor_id}",
+                        dependencies={
+                            "X_fit": array_fingerprint(
+                                prepared.X_test[fit_indices]
+                            ),
+                            "activation_fit": array_fingerprint(
+                                activations[fit_indices, factor_id]
+                            ),
+                            "feature_names": prepared.feature_names,
+                            "model_type": config.sae.model_type,
+                            "max_depth": config.functional.tree_max_depth,
+                            "minimum_rule_samples": (
+                                config.functional.minimum_rule_samples
+                            ),
+                        },
+                        source_fingerprint=high_precision_source,
+                        environment_fingerprint=stable_hash(
+                            _package_versions("numpy", "sklearn")
+                        ),
+                        load=lambda directory: _normalize_percentile_rules(
+                            _read_json(directory / "rules.json")
+                        ),
+                        compute=compute_factor_rules,
+                        store=lambda directory, value: _write_json(
+                            directory / "rules.json", value
+                        ),
+                        validate=_validate_percentile_rules,
+                        fingerprint=lambda value: {
+                            "rules": stable_hash(value)
+                        },
+                    )
+                    factor_rules = rule_result.value
+                for percentile, rows in factor_rules.items():
+                    rules_by_percentile[int(percentile)].extend(
+                        dict(row) for row in rows
+                    )
             best_percentile = max(
                 rules_by_percentile,
                 key=lambda percentile: len(rules_by_percentile[percentile]),
@@ -672,34 +1172,88 @@ class DefaultComparisonAdapter:
             ]
             missing = sorted(factor_ids - primary_factors)
             if config.functional.forced_rule_fallback and missing:
-                primary_frame = pd.DataFrame(
-                    primary,
-                    columns=[
-                        "Factor",
-                        "Rule",
-                        "Class",
-                        "Precision",
-                        "Recall",
-                        "Patients",
-                        "Patients_concept",
-                    ],
-                )
-                forced = get_rules_forced(
-                    train_activations=activations[fit_indices],
-                    X=prepared.X_test[fit_indices],
-                    surviving_concepts=np.asarray(missing, dtype=int),
-                    tree_rules_df=primary_frame,
-                    perc=best_percentile,
-                    feature_names=list(prepared.feature_names),
-                    model_type=config.sae.model_type,
-                    graph_output_dir=(
+                for factor_id in missing:
+                    graph_dir = (
                         workspace / "decision_tree_graphs" / f"run_{run_id}"
-                    ),
-                )
-                combined.extend(
-                    {**dict(rule), "Provenance": "forced_fallback"}
-                    for rule in forced
-                )
+                    )
+
+                    def compute_forced(current_factor=factor_id):
+                        empty = pd.DataFrame(
+                            columns=[
+                                "Factor",
+                                "Rule",
+                                "Class",
+                                "Precision",
+                                "Recall",
+                                "Patients",
+                                "Patients_concept",
+                            ]
+                        )
+                        rows = get_rules_forced(
+                            train_activations=activations[fit_indices],
+                            X=prepared.X_test[fit_indices],
+                            surviving_concepts=np.asarray(
+                                [current_factor], dtype=int
+                            ),
+                            tree_rules_df=empty,
+                            perc=best_percentile,
+                            feature_names=list(prepared.feature_names),
+                            model_type=config.sae.model_type,
+                            graph_output_dir=graph_dir,
+                        )
+                        dot_path = graph_dir / f"{current_factor}.dot"
+                        return {
+                            "rules": [_jsonable(row) for row in rows],
+                            "dot": (
+                                dot_path.read_text(encoding="utf-8")
+                                if dot_path.is_file()
+                                else None
+                            ),
+                        }
+
+                    if self.cache is None:
+                        forced_value = compute_forced()
+                    else:
+                        forced_result = self.cache.resolve(
+                            stage="forced_rule",
+                            item=f"run:{run_id}-factor:{factor_id}",
+                            dependencies={
+                                "X_fit": array_fingerprint(
+                                    prepared.X_test[fit_indices]
+                                ),
+                                "activation_fit": array_fingerprint(
+                                    activations[fit_indices, factor_id]
+                                ),
+                                "feature_names": prepared.feature_names,
+                                "model_type": config.sae.model_type,
+                                "percentile": best_percentile,
+                            },
+                            source_fingerprint=forced_rule_source,
+                            environment_fingerprint=stable_hash(
+                                _package_versions("numpy", "sklearn")
+                            ),
+                            load=lambda directory: _read_json(
+                                directory / "forced.json"
+                            ),
+                            compute=compute_forced,
+                            store=lambda directory, value: _write_json(
+                                directory / "forced.json", value
+                            ),
+                            validate=_validate_forced_rule_value,
+                            fingerprint=lambda value: {
+                                "forced": stable_hash(value)
+                            },
+                        )
+                        forced_value = forced_result.value
+                    if forced_value.get("dot") is not None:
+                        graph_dir.mkdir(parents=True, exist_ok=True)
+                        (graph_dir / f"{factor_id}.dot").write_text(
+                            forced_value["dot"], encoding="utf-8"
+                        )
+                    combined.extend(
+                        {**dict(rule), "Provenance": "forced_fallback"}
+                        for rule in forced_value["rules"]
+                    )
 
             for rule in combined:
                 rule_rows.append(
@@ -713,21 +1267,73 @@ class DefaultComparisonAdapter:
                 {key: value for key, value in rule.items() if key != "Provenance"}
                 for rule in combined
             ]
-            cavs_by_run[run_id] = train_cavs_from_rules(
-                rules_per_percentile=cav_rules,
-                X_cav_train_df=prepared.test_rows.iloc[select_indices][
-                    list(prepared.feature_names)
-                ].reset_index(drop=True),
-                cav_train_emb=embeddings.test_raw[select_indices],
-                cav_train_emb_encoded=activations[select_indices],
-                y_cav_train=prepared.y_test[select_indices],
-                feature_cols=list(prepared.feature_names),
-                emb_scaler=embeddings.scaler,
-                # Preserve main.py's legacy CAV negative-cohort mapping.
-                high_quantile=1.0 - (float(best_percentile) / 100.0),
-                min_pos_samples=config.functional.minimum_cav_samples,
-                random_state=config.seed + run_id,
-            )
+            def compute_cavs():
+                return train_cavs_from_rules(
+                    rules_per_percentile=cav_rules,
+                    X_cav_train_df=prepared.test_rows.iloc[select_indices][
+                        list(prepared.feature_names)
+                    ].reset_index(drop=True),
+                    cav_train_emb=embeddings.test_raw[select_indices],
+                    cav_train_emb_encoded=activations[select_indices],
+                    y_cav_train=prepared.y_test[select_indices],
+                    feature_cols=list(prepared.feature_names),
+                    emb_scaler=embeddings.scaler,
+                    # Preserve main.py's legacy CAV negative-cohort mapping.
+                    high_quantile=1.0
+                    - (float(best_percentile) / 100.0),
+                    min_pos_samples=config.functional.minimum_cav_samples,
+                    random_state=config.seed + run_id,
+                )
+
+            if self.cache is None:
+                cavs_by_run[run_id] = compute_cavs()
+            else:
+                cav_result = self.cache.resolve(
+                    stage="cav",
+                    item=f"run:{run_id}",
+                    dependencies={
+                        "rules": stable_hash(cav_rules),
+                        "X_select": array_fingerprint(
+                            prepared.X_test[select_indices]
+                        ),
+                        "raw_embeddings_select": array_fingerprint(
+                            embeddings.test_raw[select_indices]
+                        ),
+                        "activations_select": array_fingerprint(
+                            activations[select_indices]
+                        ),
+                        "outcome_select": array_fingerprint(
+                            prepared.y_test[select_indices]
+                        ),
+                        "scaler_mean": array_fingerprint(
+                            np.asarray(embeddings.scaler.mean_)
+                        ),
+                        "scaler_scale": array_fingerprint(
+                            np.asarray(embeddings.scaler.scale_)
+                        ),
+                        "percentile": best_percentile,
+                        "minimum_cav_samples": (
+                            config.functional.minimum_cav_samples
+                        ),
+                        "seed": config.seed + run_id,
+                    },
+                    source_fingerprint=cav_source,
+                    environment_fingerprint=stable_hash(
+                        _package_versions("numpy", "sklearn")
+                    ),
+                    load=lambda directory: _pickle_load(
+                        directory / "cavs.pkl"
+                    ),
+                    compute=compute_cavs,
+                    store=lambda directory, value: _pickle_dump(
+                        directory / "cavs.pkl", value
+                    ),
+                    validate=lambda value: _validate_cavs(
+                        value, embeddings.test_raw.shape[1]
+                    ),
+                    fingerprint=_cav_fingerprints,
+                )
+                cavs_by_run[run_id] = cav_result.value
             rules_by_factor = {int(rule["Factor"]): rule for rule in combined}
             for factor_id in sorted(factor_ids):
                 rule = rules_by_factor.get(factor_id)
@@ -758,18 +1364,58 @@ class DefaultComparisonAdapter:
             [embeddings.year_to_domain[int(year)] for year in prepared.years_test[tcav_indices]],
             dtype=np.int64,
         )
-        gradient_cache = workspace / "tcav_gradients.pkl"
-        if (force or not config.use_cache) and gradient_cache.exists():
-            gradient_cache.unlink()
-        gradients = get_model_gradients(
-            model=embeddings.model,
-            X=prepared.X_test[tcav_indices],
-            dist_vec=dist_eval,
-            cache_file=gradient_cache,
-            batch_size=config.functional.gradient_batch_size,
-            device=config.accelerator.device,
-            show_progress=config.show_progress,
-        )
+
+        def compute_gradients():
+            return get_model_gradients(
+                model=embeddings.require_model(require_decoder=True),
+                X=prepared.X_test[tcav_indices],
+                dist_vec=dist_eval,
+                cache_file=None,
+                batch_size=config.functional.gradient_batch_size,
+                device=config.accelerator.device,
+                show_progress=config.show_progress,
+                use_cache=False,
+            )
+
+        if self.cache is None:
+            gradients = compute_gradients()
+        else:
+            gradient_result = self.cache.resolve(
+                stage="tcav_gradients",
+                item="tcav-evaluation-cohort",
+                dependencies={
+                    "model_identity": embeddings.model_identity,
+                    "X": array_fingerprint(
+                        prepared.X_test[tcav_indices]
+                    ),
+                    "record_keys": array_fingerprint(
+                        prepared.record_keys[tcav_indices]
+                    ),
+                    "domain_vector": array_fingerprint(dist_eval),
+                },
+                source_fingerprint=gradient_source,
+                environment_fingerprint=_numerical_environment_fingerprint(
+                    config.accelerator.device, "numpy", "torch"
+                ),
+                load=lambda directory: _load_single_array(
+                    directory / "gradients.npy"
+                ),
+                compute=compute_gradients,
+                store=lambda directory, value: np.save(
+                    directory / "gradients.npy", value
+                ),
+                validate=lambda value: _validate_gradients(
+                    value,
+                    len(tcav_indices),
+                    embeddings.test_raw.shape[1],
+                ),
+                fingerprint=lambda value: {
+                    "gradients": array_fingerprint(value)
+                },
+            )
+            gradients = gradient_result.value
+        with (workspace / "tcav_gradients.pkl").open("wb") as handle:
+            pickle.dump(gradients, handle)
         functional: dict[str, dict[int, dict[str, Any]]] = {}
         cav_arrays: dict[str, np.ndarray] = {}
         diagnostic_lookup = {
@@ -784,7 +1430,6 @@ class DefaultComparisonAdapter:
             total=len(cav_items),
             unit="run",
         ):
-            scores = get_tcav_scores(list(cavs.values()), gradients)
             factor_items = sorted(cavs.items())
             for factor_id, cav in progress_iter(
                 factor_items,
@@ -794,7 +1439,102 @@ class DefaultComparisonAdapter:
                 unit="factor",
                 leave=False,
             ):
-                score = float(scores[factor_id])
+                def compute_tcav_factor():
+                    score_value = float(
+                        get_tcav_scores([cav], gradients)[factor_id]
+                    )
+                    result: dict[str, Any] = {"tcav_score": score_value}
+                    if config.functional.significance_runs > 0:
+                        try:
+                            significance = robust_tcav_significance_test(
+                                concept_idx=factor_id,
+                                embs=embeddings.test_raw[select_indices],
+                                idx_pos=np.asarray(
+                                    cav["positive_idx"], dtype=int
+                                ),
+                                idx_neg=np.asarray(
+                                    cav["negative_idx"], dtype=int
+                                ),
+                                model_grads=gradients,
+                                scaler_emb=embeddings.scaler,
+                                n_runs=config.functional.significance_runs,
+                                sample_fraction=1.0,
+                                rng_seed=(
+                                    config.seed
+                                    + run_id * 10_000
+                                    + factor_id
+                                ),
+                            )
+                            result.update(
+                                {
+                                    "tcav_p_value": _finite_or_none(
+                                        significance.get("p_value")
+                                    ),
+                                    "tcav_t_stat": _finite_or_none(
+                                        significance.get("t_stat")
+                                    ),
+                                    "tcav_effect_size": _finite_or_none(
+                                        significance.get("cohens_d")
+                                    ),
+                                }
+                            )
+                        except (ValueError, FloatingPointError) as error:
+                            result["significance_error"] = str(error)
+                    return result
+
+                if self.cache is None:
+                    tcav_values = compute_tcav_factor()
+                else:
+                    tcav_result = self.cache.resolve(
+                        stage="tcav_factor",
+                        item=f"run:{run_id}-factor:{factor_id}",
+                        dependencies={
+                            "cav": array_fingerprint(
+                                np.asarray(cav["CAV"])
+                            ),
+                            "positive_idx": array_fingerprint(
+                                np.asarray(cav["positive_idx"], dtype=int)
+                            ),
+                            "negative_idx": array_fingerprint(
+                                np.asarray(cav["negative_idx"], dtype=int)
+                            ),
+                            "gradients": array_fingerprint(gradients),
+                            "select_embeddings": array_fingerprint(
+                                embeddings.test_raw[select_indices]
+                            ),
+                            "scaler_mean": array_fingerprint(
+                                np.asarray(embeddings.scaler.mean_)
+                            ),
+                            "scaler_scale": array_fingerprint(
+                                np.asarray(embeddings.scaler.scale_)
+                            ),
+                            "significance_runs": (
+                                config.functional.significance_runs
+                            ),
+                            "seed": (
+                                config.seed + run_id * 10_000 + factor_id
+                            ),
+                        },
+                        source_fingerprint=tcav_factor_source,
+                        environment_fingerprint=stable_hash(
+                            _package_versions(
+                                "numpy", "scipy", "sklearn"
+                            )
+                        ),
+                        load=lambda directory: _read_json(
+                            directory / "tcav.json"
+                        ),
+                        compute=compute_tcav_factor,
+                        store=lambda directory, value: _write_json(
+                            directory / "tcav.json", value
+                        ),
+                        validate=_validate_tcav_factor,
+                        fingerprint=lambda value: {
+                            "tcav": stable_hash(value)
+                        },
+                    )
+                    tcav_values = tcav_result.value
+                score = float(tcav_values["tcav_score"])
                 entry: dict[str, Any] = {
                     "CAV": np.asarray(cav["CAV"]),
                     "TCAV_score": score,
@@ -802,36 +1542,12 @@ class DefaultComparisonAdapter:
                 }
                 diagnostic = diagnostic_lookup[(run_id, factor_id)]
                 diagnostic["tcav_score"] = score
-                if config.functional.significance_runs > 0:
-                    try:
-                        significance = robust_tcav_significance_test(
-                            concept_idx=factor_id,
-                            embs=embeddings.test_raw[select_indices],
-                            idx_pos=np.asarray(cav["positive_idx"], dtype=int),
-                            idx_neg=np.asarray(cav["negative_idx"], dtype=int),
-                            model_grads=gradients,
-                            scaler_emb=embeddings.scaler,
-                            n_runs=config.functional.significance_runs,
-                            sample_fraction=1.0,
-                            rng_seed=config.seed + run_id * 10_000 + factor_id,
-                        )
-                        p_value = _finite_or_none(significance.get("p_value"))
-                        diagnostic.update(
-                            {
-                                "tcav_p_value": p_value,
-                                "tcav_t_stat": _finite_or_none(
-                                    significance.get("t_stat")
-                                ),
-                                "tcav_effect_size": _finite_or_none(
-                                    significance.get("cohens_d")
-                                ),
-                                "tcav_significant": (
-                                    p_value is not None and p_value < 0.05
-                                ),
-                            }
-                        )
-                    except (ValueError, FloatingPointError) as error:
-                        diagnostic["significance_error"] = str(error)
+                diagnostic.update(tcav_values)
+                p_value = tcav_values.get("tcav_p_value")
+                if "tcav_p_value" in tcav_values:
+                    diagnostic["tcav_significant"] = (
+                        p_value is not None and float(p_value) < 0.05
+                    )
                 functional.setdefault(str(run_id), {})[factor_id] = entry
                 cav_arrays[f"run_{run_id}_factor_{factor_id}"] = np.asarray(
                     cav["CAV"]
@@ -888,6 +1604,7 @@ class DefaultComparisonAdapter:
             functional_by_factor=functional,
             record_keys=prepared.record_keys,
             force=force,
+            shared_cache=self.cache,
         )
 
 
@@ -895,6 +1612,7 @@ def run_comparison(
     config: ComparisonRunnerConfig,
     *,
     force: bool = False,
+    force_stages: Sequence[str] = (),
     adapter: DefaultComparisonAdapter | None = None,
 ) -> dict[str, Any]:
     """Run the complete comparison and return a compact artifact summary."""
@@ -914,11 +1632,18 @@ def run_comparison(
     )
     dataset_hash = _file_fingerprint(dataset_path)
     semantic_dependencies = _semantic_dependency_fingerprints(semantic_path)
-    hash_semantic_dependencies = dict(semantic_dependencies)
-    hash_semantic_dependencies.pop("config_sha256", None)
+    hash_semantic_dependencies = {
+        "scientific_config_hash": semantic_dependencies[
+            "scientific_config_hash"
+        ],
+        "clinical_groups_sha256": (
+            None
+            if semantic_dependencies["clinical_groups"] is None
+            else semantic_dependencies["clinical_groups"]["sha256"]
+        ),
+    }
     source_hash = _runner_source_fingerprint()
-    hash_config = config.to_dict()
-    hash_config.pop("show_progress", None)
+    hash_config = _scientific_runner_config(config)
     runner_hash = stable_hash(
         hash_config,
         dataset_hash,
@@ -928,25 +1653,91 @@ def run_comparison(
     workspace = Path(config.artifact_dir) / runner_hash
     workspace.mkdir(parents=True, exist_ok=True)
     summary_path = workspace / "summary.json"
-    if config.use_cache and not force and summary_path.exists():
+    if (
+        config.use_cache
+        and not force
+        and not force_stages
+        and summary_path.exists()
+    ):
         with summary_path.open(encoding="utf-8") as handle:
             cached = json.load(handle)
         cached["cache_hit"] = True
         return cached
 
+    cache_root = (
+        Path(config.cache_dir)
+        if config.cache_dir is not None
+        else Path(config.artifact_dir) / "_cache" / "v2"
+    )
+    forced_groups = tuple(
+        comparison_cache_group
+        for comparison_cache_group in (
+            (
+                "prepared",
+                "splits",
+                "tabpfn",
+                "embeddings",
+                "sae",
+                "activations",
+                "matching",
+                "functional",
+                "semantic",
+            )
+            if force
+            else tuple(force_stages)
+        )
+    )
+    shared_cache = ComparisonCache(
+        cache_root,
+        enabled=config.use_cache,
+        verification=config.cache_verification,
+        forced_stages=forced_groups,
+    )
     telemetry = StageTelemetry(
         workspace / "stage_metrics.json",
         requested_device=config.accelerator.device,
     )
-    active_adapter = adapter or DefaultComparisonAdapter()
+    active_adapter = adapter or DefaultComparisonAdapter(shared_cache)
     with telemetry.measure("prepare"):
         prepared = active_adapter.prepare(config, workspace, force=force)
     from semantic_splits import semantic_test_subsplits
 
     with telemetry.measure("split"):
-        splits = semantic_test_subsplits(
-            prepared.y_test, prepared.patient_ids, rng_seed=config.seed
+        def compute_splits():
+            return semantic_test_subsplits(
+                prepared.y_test, prepared.patient_ids, rng_seed=config.seed
+            )
+
+        split_result = shared_cache.resolve(
+            stage="splits",
+            item="semantic-test-subsplits",
+            dependencies={
+                "outcome": array_fingerprint(prepared.y_test),
+                "patient_ids": array_fingerprint(prepared.patient_ids),
+                "seed": config.seed,
+                "fractions": (0.33, 0.335, 0.1675, 0.1675),
+            },
+            source_fingerprint=_source_files_fingerprint(
+                "semantic_splits.py"
+            ),
+            load=_load_splits,
+            compute=compute_splits,
+            store=_store_splits,
+            validate=lambda value: _validate_splits(
+                value, len(prepared.y_test), prepared.patient_ids
+            ),
+            fingerprint=lambda value: {
+                "splits": stable_hash(
+                    {
+                        name: indices.tolist()
+                        for name, indices in sorted(value.items())
+                        if name.startswith("idx_semantic")
+                        or name == "idx_tcav_eval"
+                    }
+                )
+            },
         )
+        splits = split_result.value
         np.savez_compressed(
             workspace / "splits.npz",
             **{
@@ -983,7 +1774,7 @@ def run_comparison(
             selected_matches,
             config,
             workspace,
-            force=force,
+            force=force or "functional" in force_stages,
         )
     with telemetry.measure("semantic_bundle"):
         _write_semantic_inputs(workspace, prepared, sae_data.activations)
@@ -995,10 +1786,23 @@ def run_comparison(
             functional,
             config,
             workspace,
-            force=force,
+            force=force or "semantic" in force_stages,
         )
     from semantic_artifacts import environment_manifest
 
+    tabpfn_fit_events = [
+        event
+        for event in shared_cache.events
+        if event.stage == "tabpfn_fit"
+    ]
+    tabpfn_model_cache_supported = (
+        None
+        if not tabpfn_fit_events
+        else not any(
+            event.reason == "store_unsupported"
+            for event in tabpfn_fit_events
+        )
+    )
     manifest = {
         "runner_hash": runner_hash,
         "dataset_path": str(dataset_path.resolve()),
@@ -1022,7 +1826,15 @@ def run_comparison(
         "total_timed_seconds": sum(
             float(row["seconds"]) for row in telemetry.records.values()
         ),
+        "cache": {
+            **shared_cache.summary(),
+            "refs_file": str(workspace / "cache_refs.json"),
+            "tabpfn_model_cache_supported": (
+                tabpfn_model_cache_supported
+            ),
+        },
     }
+    shared_cache.write_refs(workspace / "cache_refs.json")
     _write_json(workspace / "runner_manifest.json", manifest)
     summary = {
         "runner_hash": runner_hash,
@@ -1038,10 +1850,414 @@ def run_comparison(
         "resolved_device": accelerator_info["resolved_device"],
         "stage_metrics_file": str(workspace / "stage_metrics.json"),
         "total_timed_seconds": manifest["total_timed_seconds"],
+        "cache": manifest["cache"],
         "cache_hit": False,
     }
     _write_json(summary_path, summary)
     return summary
+
+
+def _scientific_runner_config(
+    config: ComparisonRunnerConfig,
+) -> dict[str, Any]:
+    value = config.to_dict()
+    for name in (
+        "artifact_dir",
+        "cache_dir",
+        "cache_verification",
+        "use_cache",
+        "show_progress",
+        "dataset_path",
+        "semantic_config_path",
+    ):
+        value.pop(name, None)
+    value["accelerator"].pop("device", None)
+    value["tabpfn"].pop("batch_size", None)
+    value["sae"].pop("encoding_batch_size", None)
+    value["functional"].pop("gradient_batch_size", None)
+    return value
+
+
+def _source_files_fingerprint(*names: str) -> str:
+    root = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for name in names:
+        digest.update(name.encode())
+        digest.update((root / name).read_bytes())
+    return digest.hexdigest()
+
+
+def _callable_source_fingerprint(*values: Any) -> str:
+    digest = hashlib.sha256()
+    for value in values:
+        digest.update(str(getattr(value, "__module__", "")).encode())
+        digest.update(str(getattr(value, "__qualname__", repr(value))).encode())
+        digest.update(inspect.getsource(value).encode())
+    return digest.hexdigest()
+
+
+def _tabpfn_checkpoint_fingerprint(model_name: str) -> dict[str, Any]:
+    try:
+        import tabpfn
+        from importlib import resources
+
+        candidate = Path(resources.files(tabpfn)) / "model_cache" / (
+            f"{model_name}.cpkt"
+        )
+        return {
+            "path_name": candidate.name,
+            "sha256": (
+                _file_fingerprint(candidate) if candidate.is_file() else None
+            ),
+        }
+    except (ImportError, OSError, TypeError):
+        return {"path_name": f"{model_name}.cpkt", "sha256": None}
+
+
+def _package_versions(*names: str) -> dict[str, str]:
+    versions: dict[str, str] = {"python": platform.python_version()}
+    for name in names:
+        try:
+            module = __import__(name)
+            versions[name] = str(getattr(module, "__version__", "unknown"))
+        except ImportError:
+            versions[name] = "unavailable"
+    return versions
+
+
+def _numerical_environment_fingerprint(
+    requested_device: str, *packages: str
+) -> str:
+    accelerator = accelerator_manifest(requested_device)
+    accelerator.pop("requested_device", None)
+    return stable_hash(accelerator, _package_versions(*packages))
+
+
+def _pickle_load(path: Path) -> Any:
+    with path.open("rb") as handle:
+        return pickle.load(handle)
+
+
+def _pickle_dump(path: Path, value: Any) -> None:
+    with path.open("wb") as handle:
+        pickle.dump(value, handle)
+
+
+def _read_json(path: Path) -> Any:
+    with path.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _prepared_fingerprints(prepared: _PreparedData) -> dict[str, str]:
+    return {
+        "X_train": array_fingerprint(prepared.X_train),
+        "y_train": array_fingerprint(prepared.y_train),
+        "years_train": array_fingerprint(prepared.years_train),
+        "X_test": array_fingerprint(prepared.X_test),
+        "y_test": array_fingerprint(prepared.y_test),
+        "years_test": array_fingerprint(prepared.years_test),
+        "patient_ids": array_fingerprint(prepared.patient_ids),
+        "record_keys": array_fingerprint(prepared.record_keys),
+        "feature_names": stable_hash(prepared.feature_names),
+    }
+
+
+def _validate_tabpfn_fit(value: Mapping[str, Any]) -> None:
+    required = {
+        "model",
+        "model_add_x_device",
+        "example_add_shape",
+        "fit_time_sec",
+        "model_source",
+    }
+    missing = required - set(value)
+    if missing:
+        raise ValueError(f"TabPFN fit missing fields: {sorted(missing)}")
+    if not hasattr(value["model"], "get_embeddings"):
+        raise ValueError("Cached TabPFN model cannot extract embeddings")
+
+
+def _store_tabpfn_fit(directory: Path, value: Mapping[str, Any]) -> None:
+    if value.get("model_source") == "fallback_classifier":
+        raise RuntimeError("Fallback TabPFN fits are not shared-cacheable")
+    _pickle_dump(directory / "fitted_model.pkl", value)
+
+
+def _load_embedding_pair(directory: Path) -> tuple[np.ndarray, np.ndarray]:
+    with np.load(directory / "embeddings.npz", allow_pickle=False) as values:
+        return np.asarray(values["train_raw"]), np.asarray(values["test_raw"])
+
+
+def _store_embedding_pair(
+    directory: Path, value: tuple[np.ndarray, np.ndarray]
+) -> None:
+    np.savez_compressed(
+        directory / "embeddings.npz",
+        train_raw=value[0],
+        test_raw=value[1],
+    )
+
+
+def _validate_embedding_pair(
+    value: tuple[np.ndarray, np.ndarray], prepared: _PreparedData
+) -> None:
+    train_raw, test_raw = value
+    if train_raw.ndim != 2 or test_raw.ndim != 2:
+        raise ValueError("Cached embeddings must be two-dimensional")
+    if len(train_raw) != len(prepared.X_train) or len(test_raw) != len(
+        prepared.X_test
+    ):
+        raise ValueError("Cached embedding rows are not aligned")
+    if train_raw.shape[1] != test_raw.shape[1]:
+        raise ValueError("Cached embedding dimensions differ")
+    if not np.isfinite(train_raw).all() or not np.isfinite(test_raw).all():
+        raise ValueError("Cached embeddings contain non-finite values")
+
+
+def _validate_walkforward(value: Any) -> None:
+    if not isinstance(value, list) or any(
+        not isinstance(row, Mapping) for row in value
+    ):
+        raise ValueError("Walk-forward cache must contain metric rows")
+
+
+def _load_scaled_embeddings(directory: Path):
+    with np.load(directory / "scaled.npz", allow_pickle=False) as values:
+        train = np.asarray(values["train_scaled"])
+        test = np.asarray(values["test_scaled"])
+    scaler = _pickle_load(directory / "scaler.pkl")
+    return train, test, scaler
+
+
+def _store_scaled_embeddings(directory: Path, value) -> None:
+    train, test, scaler = value
+    np.savez_compressed(
+        directory / "scaled.npz",
+        train_scaled=train,
+        test_scaled=test,
+    )
+    _pickle_dump(directory / "scaler.pkl", scaler)
+
+
+def _validate_scaled_embeddings(value, prepared: _PreparedData) -> None:
+    train, test, scaler = value
+    _validate_embedding_pair((train, test), prepared)
+    if not hasattr(scaler, "transform"):
+        raise ValueError("Cached embedding scaler is invalid")
+
+
+def _model_state_fingerprint(model: Any) -> str:
+    digest = hashlib.sha256()
+    for name, tensor in sorted(model.state_dict().items()):
+        value = tensor.detach().cpu().numpy()
+        digest.update(name.encode())
+        digest.update(array_fingerprint(value).encode())
+    return digest.hexdigest()
+
+
+def _store_sae_run(directory: Path, run: Mapping[str, Any]) -> None:
+    import torch
+
+    torch.save(run["model"].state_dict(), directory / "state_dict.pt")
+    metadata = {key: value for key, value in run.items() if key != "model"}
+    _pickle_dump(directory / "metadata.pkl", metadata)
+
+
+def _load_sae_run(
+    directory: Path, *, data_dimension: int, sae_config: SAERunnerConfig
+) -> dict[str, Any]:
+    import torch
+    from sae import SAE
+
+    model = SAE(
+        data_dimension=data_dimension,
+        scaling_factor=sae_config.scaling_factor,
+        use_decoder_bias=True,
+        type=sae_config.model_type,
+        k=sae_config.k,
+        k_aux=sae_config.k_aux,
+    )
+    model.load_state_dict(
+        torch.load(directory / "state_dict.pt", map_location="cpu")
+    )
+    metadata = _pickle_load(directory / "metadata.pkl")
+    return {**metadata, "model": model}
+
+
+def _validate_sae_run(
+    run: Mapping[str, Any], expected_seed: int, data_dimension: int
+) -> None:
+    if int(run.get("seed", -1)) != int(expected_seed):
+        raise ValueError("Cached SAE seed mismatch")
+    model = run.get("model")
+    if model is None or int(model.encoder.in_features) != int(data_dimension):
+        raise ValueError("Cached SAE architecture mismatch")
+    expected_shape = (model.num_latents, data_dimension)
+    directions = np.asarray(run.get("decoder_directions"))
+    if directions.shape != expected_shape:
+        raise ValueError("Cached SAE directions mismatch")
+    current_directions = (
+        model.encoder.weight.detach().cpu().numpy()
+        if run.get("model_type") == "ReLU"
+        else model.decoder.weight.detach().cpu().numpy().T
+    )
+    if not np.array_equal(directions, current_directions):
+        raise ValueError("Cached SAE directions do not match model state")
+
+
+def _load_single_array(path: Path) -> np.ndarray:
+    return np.asarray(np.load(path, allow_pickle=False))
+
+
+def _validate_activation_matrix(value: np.ndarray, n_records: int) -> None:
+    matrix = np.asarray(value)
+    if matrix.ndim != 2 or len(matrix) != n_records:
+        raise ValueError("Cached activations are not row-aligned")
+    if not np.isfinite(matrix).all():
+        raise ValueError("Cached activations contain non-finite values")
+
+
+def _validate_matching_rows(rows: Any) -> None:
+    required = {"original_concept", "best_pair", "cos_sim", "overlap"}
+    if not isinstance(rows, list) or any(
+        not isinstance(row, Mapping) or not required <= set(row)
+        for row in rows
+    ):
+        raise ValueError("Cached matching rows are invalid")
+    for row in rows:
+        if int(row["original_concept"]) < 0 or int(row["best_pair"]) < 0:
+            raise ValueError("Cached matching factor IDs must be non-negative")
+        if not math.isfinite(float(row["cos_sim"])) or not math.isfinite(
+            float(row["overlap"])
+        ):
+            raise ValueError("Cached matching scores must be finite")
+
+
+def _normalize_percentile_rules(value: Any) -> dict[int, list[dict[str, Any]]]:
+    if not isinstance(value, Mapping):
+        raise ValueError("Cached percentile rules must be a mapping")
+    return {
+        int(percentile): [dict(row) for row in rows]
+        for percentile, rows in value.items()
+    }
+
+
+def _validate_percentile_rules(value: Any) -> None:
+    normalized = _normalize_percentile_rules(value)
+    if set(normalized) != {90, 80, 70, 60, 50}:
+        raise ValueError("Cached percentile rule levels are incomplete")
+    required = {
+        "Factor",
+        "Rule",
+        "Class",
+        "Precision",
+        "Recall",
+        "Patients",
+        "Patients_concept",
+    }
+    if any(
+        not required <= set(row)
+        for rows in normalized.values()
+        for row in rows
+    ):
+        raise ValueError("Cached high-precision rule row is incomplete")
+
+
+def _validate_forced_rule_value(value: Any) -> None:
+    if (
+        not isinstance(value, Mapping)
+        or not isinstance(value.get("rules"), list)
+        or value.get("dot") is not None
+        and not isinstance(value.get("dot"), str)
+    ):
+        raise ValueError("Cached forced-rule value is invalid")
+
+
+def _validate_cavs(value: Any, embedding_dimension: int) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError("Cached CAVs must be a mapping")
+    for factor_id, cav in value.items():
+        if not isinstance(cav, Mapping):
+            raise ValueError(f"Cached CAV {factor_id} is invalid")
+        vector = np.asarray(cav.get("CAV"))
+        if vector.shape != (embedding_dimension,) or not np.isfinite(
+            vector
+        ).all():
+            raise ValueError(f"Cached CAV {factor_id} has invalid direction")
+        for cohort in ("positive_idx", "negative_idx"):
+            if np.asarray(cav.get(cohort)).ndim != 1:
+                raise ValueError(
+                    f"Cached CAV {factor_id} has invalid {cohort}"
+                )
+
+
+def _cav_fingerprints(value: Mapping[Any, Mapping[str, Any]]) -> dict[str, str]:
+    return {
+        f"factor:{factor_id}": stable_hash(
+            array_fingerprint(np.asarray(cav["CAV"])),
+            array_fingerprint(np.asarray(cav["positive_idx"], dtype=int)),
+            array_fingerprint(np.asarray(cav["negative_idx"], dtype=int)),
+            cav["Rule"],
+        )
+        for factor_id, cav in sorted(value.items(), key=lambda item: int(item[0]))
+    }
+
+
+def _validate_gradients(
+    value: np.ndarray, n_records: int, embedding_dimension: int
+) -> None:
+    gradients = np.asarray(value)
+    if gradients.shape != (n_records, embedding_dimension):
+        raise ValueError("Cached TCAV gradients have invalid shape")
+    if not np.isfinite(gradients).all():
+        raise ValueError("Cached TCAV gradients contain non-finite values")
+
+
+def _validate_tcav_factor(value: Any) -> None:
+    if not isinstance(value, Mapping) or "tcav_score" not in value:
+        raise ValueError("Cached TCAV factor result is invalid")
+    score = float(value["tcav_score"])
+    if not 0.0 <= score <= 1.0:
+        raise ValueError("Cached TCAV score lies outside [0, 1]")
+
+
+def _load_splits(directory: Path) -> dict[str, np.ndarray]:
+    with np.load(directory / "splits.npz", allow_pickle=False) as values:
+        return {name: np.asarray(values[name], dtype=int) for name in values.files}
+
+
+def _store_splits(directory: Path, splits: Mapping[str, np.ndarray]) -> None:
+    np.savez_compressed(
+        directory / "splits.npz",
+        **{name: np.asarray(value, dtype=int) for name, value in splits.items()},
+    )
+
+
+def _validate_splits(
+    splits: Mapping[str, np.ndarray],
+    n_records: int,
+    patient_ids: np.ndarray,
+) -> None:
+    names = (
+        "idx_semantic_fit",
+        "idx_semantic_select",
+        "idx_tcav_eval",
+        "idx_semantic_final",
+    )
+    if any(name not in splits for name in names):
+        raise ValueError("Cached semantic splits are incomplete")
+    indices = [np.asarray(splits[name], dtype=int) for name in names]
+    combined = np.concatenate(indices)
+    if sorted(combined.tolist()) != list(range(n_records)):
+        raise ValueError("Cached semantic splits do not partition records")
+    groups = np.asarray(patient_ids)
+    group_sets = [set(groups[index].tolist()) for index in indices]
+    if any(
+        group_sets[left] & group_sets[right]
+        for left in range(len(group_sets))
+        for right in range(left + 1, len(group_sets))
+    ):
+        raise ValueError("Cached semantic splits leak patients")
 
 
 def _validate_prepared(prepared: _PreparedData) -> None:
@@ -1191,7 +2407,8 @@ def _semantic_dependency_fingerprints(path: Path) -> dict[str, Any]:
     scientific_raw = json.loads(json.dumps(raw))
     runtime = scientific_raw.get("runtime")
     if isinstance(runtime, dict):
-        runtime.pop("show_progress", None)
+        for name in ("artifact_dir", "cache", "show_progress", "n_jobs"):
+            runtime.pop(name, None)
     fingerprints["scientific_config_hash"] = stable_hash(scientific_raw)
     clinical_groups_path = raw.get("clinical_groups_path")
     if clinical_groups_path is None:
@@ -1212,6 +2429,7 @@ def _runner_source_fingerprint() -> str:
     root = Path(__file__).resolve().parent
     names = (
         "comparison_runner.py",
+        "comparison_cache.py",
         "main-comparison.py",
         "runtime_acceleration.py",
         "database.py",

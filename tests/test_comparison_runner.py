@@ -3,14 +3,18 @@ from dataclasses import replace
 from pathlib import Path
 import runpy
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 import comparison_runner
+from comparison_cache import ComparisonCache
 from comparison_runner import (
     AcceleratorRunnerConfig,
     ComparisonRunnerConfig,
+    DefaultComparisonAdapter,
     FunctionalRunnerConfig,
     MatchingRunnerConfig,
     SAERunnerConfig,
@@ -20,6 +24,7 @@ from comparison_runner import (
     _runtime_estimate,
     run_comparison,
 )
+from sae import SAE
 
 
 def _write_inputs(tmp_path: Path) -> tuple[Path, Path]:
@@ -253,6 +258,8 @@ def test_config_defaults_and_strict_nested_validation():
     assert config.functional == FunctionalRunnerConfig()
     assert config.functional.enabled is True
     assert config.show_progress is True
+    assert config.cache_dir is None
+    assert config.cache_verification == "checksum"
     assert ComparisonRunnerConfig.from_dict(
         {"show_progress": False}
     ).show_progress is False
@@ -271,6 +278,10 @@ def test_config_defaults_and_strict_nested_validation():
         ComparisonRunnerConfig.from_dict({"functional": {"enabled": 1}})
     with pytest.raises(ValueError, match="must be booleans"):
         ComparisonRunnerConfig.from_dict({"show_progress": 1})
+    with pytest.raises(ValueError, match="cache_verification"):
+        ComparisonRunnerConfig.from_dict(
+            {"cache_verification": "hope-for-the-best"}
+        )
 
 
 def test_config_json_resolves_all_paths_relative_to_config(tmp_path):
@@ -283,6 +294,7 @@ def test_config_json_resolves_all_paths_relative_to_config(tmp_path):
                 "dataset_path": "../data/input.feather",
                 "semantic_config_path": "semantic.json",
                 "artifact_dir": "../artifacts",
+                "cache_dir": "../cache",
             }
         ),
         encoding="utf-8",
@@ -295,6 +307,7 @@ def test_config_json_resolves_all_paths_relative_to_config(tmp_path):
         config_dir / "semantic.json"
     ).resolve()
     assert Path(config.artifact_dir) == (tmp_path / "artifacts").resolve()
+    assert Path(config.cache_dir) == (tmp_path / "cache").resolve()
 
 
 def test_two_run_orchestration_preserves_alignment_and_selected_matches(
@@ -378,6 +391,9 @@ def test_two_run_orchestration_preserves_alignment_and_selected_matches(
     )
     assert runner_manifest["accelerator"]["resolved_device"] in {"cpu", "cuda"}
     assert runner_manifest["stage_metrics"] == stage_metrics
+    assert (artifact_dir / "cache_refs.json").is_file()
+    assert runner_manifest["cache"]["refs_file"].endswith("cache_refs.json")
+    assert summary["cache"] == runner_manifest["cache"]
 
 
 def test_runtime_estimate_counts_selected_unique_factors(tmp_path):
@@ -442,6 +458,39 @@ def test_progress_toggle_reuses_complete_result_cache(monkeypatch, tmp_path):
 
     cached = run_comparison(
         replace(config, show_progress=True),
+        adapter=_FailingAdapter(),
+    )
+
+    assert cached["runner_hash"] == first["runner_hash"]
+    assert cached["cache_hit"] is True
+
+
+def test_execution_only_cache_and_batch_settings_reuse_complete_result(
+    monkeypatch, tmp_path
+):
+    config = replace(_config(tmp_path), cache_dir=str(tmp_path / "cache-a"))
+    monkeypatch.setattr(
+        comparison_runner,
+        "_runner_source_fingerprint",
+        lambda: "fixed-source",
+    )
+    monkeypatch.setattr(
+        "semantic_artifacts.environment_manifest",
+        lambda: {"python": "test"},
+    )
+    first = run_comparison(config, adapter=_FakeAdapter())
+
+    cached = run_comparison(
+        replace(
+            config,
+            cache_dir=str(tmp_path / "cache-b"),
+            cache_verification="manifest",
+            tabpfn=replace(config.tabpfn, batch_size=2048),
+            sae=replace(config.sae, encoding_batch_size=1024),
+            functional=replace(
+                config.functional, gradient_batch_size=64
+            ),
+        ),
         adapter=_FailingAdapter(),
     )
 
@@ -526,3 +575,105 @@ def test_main_comparison_help_does_not_load_pipeline(monkeypatch, capsys):
     assert "--device" in output
     assert "--skip-functional" in output
     assert "--no-progress" in output
+    assert "--force-stage" in output
+
+
+def test_adding_seed_reuses_existing_sae_models_and_activations(
+    monkeypatch, tmp_path
+):
+    prepared = _prepared_data()
+    embeddings = _embedding_data(prepared)
+    splits = {
+        "idx_semantic_fit": np.arange(0, 4),
+        "idx_semantic_select": np.arange(4, 8),
+        "idx_tcav_eval": np.arange(8, 10),
+        "idx_semantic_final": np.arange(10, 12),
+    }
+    trained_seeds = []
+    encoded_seeds = []
+
+    def fake_train_all_saes(*, embs, seeds, model_type, scaling_factor, **kwargs):
+        seed = int(seeds[0])
+        trained_seeds.append(seed)
+        torch.manual_seed(seed)
+        model = SAE(
+            data_dimension=embs.shape[1],
+            scaling_factor=scaling_factor,
+            use_decoder_bias=True,
+            type=model_type,
+        )
+        directions = model.encoder.weight.detach().numpy().copy()
+        return [
+            {
+                "idx": 0,
+                "run_id": "sae_0",
+                "seed": seed,
+                "model_type": model_type,
+                "model": model,
+                "mse": torch.tensor(0.1),
+                "encoded_embs": np.ones(
+                    (len(embs), model.num_latents), dtype=np.float32
+                ),
+                "sparsity_level": 0.5,
+                "encoder_weights": directions,
+                "decoder_directions": directions,
+                "dead_neurons": 0,
+                "high_activation_matrix": np.zeros(
+                    (len(embs), model.num_latents), dtype=bool
+                ),
+            }
+        ]
+
+    def fake_encode_sae(run, values, **kwargs):
+        seed = int(run["seed"])
+        encoded_seeds.append(seed)
+        return np.full(
+            (len(values), run["model"].num_latents),
+            seed / 1000.0,
+            dtype=np.float32,
+        )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sae_compare",
+        SimpleNamespace(
+            train_all_saes=fake_train_all_saes,
+            encode_sae=fake_encode_sae,
+            high_activation_matrix=lambda values, perc=90: (
+                values
+                > np.percentile(values, perc, axis=0, keepdims=True)
+            ),
+        ),
+    )
+    cache_root = tmp_path / "shared-cache"
+
+    def execute(seeds, workspace_name):
+        config_root = tmp_path / f"config-{workspace_name}"
+        config_root.mkdir()
+        workspace = tmp_path / workspace_name
+        workspace.mkdir()
+        config = replace(
+            _config(config_root),
+            accelerator=AcceleratorRunnerConfig(device="cpu"),
+            sae=replace(SAERunnerConfig(), seeds=tuple(seeds), epochs=1),
+        )
+        adapter = DefaultComparisonAdapter(
+            ComparisonCache(cache_root, verification="checksum")
+        )
+        return adapter.train_saes(
+            prepared,
+            embeddings,
+            splits,
+            config,
+            workspace,
+            force=False,
+        )
+
+    first = execute((42, 135), "first")
+    second = execute((42, 135, 246), "second")
+
+    assert trained_seeds == [42, 135, 246]
+    assert encoded_seeds == [42, 135, 246]
+    assert [run["seed"] for run in second.runs] == [42, 135, 246]
+    np.testing.assert_array_equal(first.activations[0], second.activations[0])
+    np.testing.assert_array_equal(first.activations[1], second.activations[1])

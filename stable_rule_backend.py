@@ -141,6 +141,7 @@ class RandomizedTreeRuleBackend:
         *,
         groups: ArrayLike | None = None,
         clinical_group_map: Mapping[str, Sequence[str]] | None = None,
+        bootstrap_ids: Sequence[int] | None = None,
     ) -> StableRuleDiscoveryResult:
         """Discover rules using fitting data only.
 
@@ -181,14 +182,32 @@ class RandomizedTreeRuleBackend:
         sorted_features = tuple(
             np.sort(X_array[:, index]) for index in range(X_array.shape[1])
         )
+        selected_bootstrap_ids = (
+            tuple(range(self.config.n_bootstraps))
+            if bootstrap_ids is None
+            else tuple(int(value) for value in bootstrap_ids)
+        )
+        if not selected_bootstrap_ids or any(
+            value < 0 or value >= self.config.n_bootstraps
+            for value in selected_bootstrap_ids
+        ):
+            raise ValueError(
+                "bootstrap_ids must select configured bootstrap indices"
+            )
+        if len(set(selected_bootstrap_ids)) != len(selected_bootstrap_ids):
+            raise ValueError("bootstrap_ids must be unique")
         seed_sequence = np.random.SeedSequence(self.config.random_state)
-        bootstrap_sequences = seed_sequence.spawn(self.config.n_bootstraps)
+        all_bootstrap_sequences = seed_sequence.spawn(self.config.n_bootstraps)
+        bootstrap_sequences = [
+            (bootstrap_id, all_bootstrap_sequences[bootstrap_id])
+            for bootstrap_id in selected_bootstrap_ids
+        ]
         occurrences: list[CandidateRuleOccurrence] = []
         diagnostics: list[BootstrapDiagnostic] = []
         single_class_bootstraps = 0
 
         bootstrap_iter = progress_iter(
-            enumerate(bootstrap_sequences),
+            bootstrap_sequences,
             enabled=self.config.show_progress,
             desc=self.config.progress_desc,
             total=len(bootstrap_sequences),
@@ -310,6 +329,7 @@ def discover_stable_rule_candidates(
     groups: ArrayLike | None = None,
     clinical_group_map: Mapping[str, Sequence[str]] | None = None,
     config: StableRuleBackendConfig | None = None,
+    bootstrap_ids: Sequence[int] | None = None,
 ) -> StableRuleDiscoveryResult:
     """Functional entry point for semantic-rule orchestration."""
 
@@ -319,6 +339,7 @@ def discover_stable_rule_candidates(
         feature_names,
         groups=groups,
         clinical_group_map=clinical_group_map,
+        bootstrap_ids=bootstrap_ids,
     )
 
 

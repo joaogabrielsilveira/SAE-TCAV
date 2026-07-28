@@ -157,6 +157,11 @@ Useful command-line overrides:
 # Recompute even when a complete cached result exists.
 python main-comparison.py --force --data tidy_event_data.feather
 
+# Recompute only one cache stage group. Repeat the option when needed.
+python main-comparison.py --force-stage sae --data tidy_event_data.feather
+python main-comparison.py --force-stage functional --force-stage semantic \
+  --data tidy_event_data.feather
+
 # Include every Hungarian assignment, regardless of cosine. This can be very
 # expensive with the standard bootstrap configuration.
 python main-comparison.py --all-pairs --data tidy_event_data.feather
@@ -175,6 +180,7 @@ The runner creates a content-addressed directory below
 `<artifact_dir>/<runner_hash>/`. Its main outputs are:
 
 - `summary.json` and `runner_manifest.json`;
+- `cache_refs.json`, identifying every shared stage artifact used by the run;
 - `prepared.pkl`, `embeddings.npz`, `activations.npz`, and `sae/run_<id>.pt`;
 - `splits.npz` and `semantic_inputs.npz`, preserving aligned records for audit
   or lower-level reruns;
@@ -184,14 +190,83 @@ The runner creates a content-addressed directory below
 - `semantic/<experiment_hash>/`, containing all semantic artifacts documented
   later in this file, including `pair_metrics_by_class.csv`.
 
-The runner hash includes the dataset bytes, scientific runner configuration,
-scientific semantic configuration, external clinical-group mapping bytes, and
-relevant source files; the presentation-only progress toggle is excluded. A
-matching `summary.json` is a complete-result cache;
-inner embedding, SAE, gradient, and semantic artifacts provide additional
-stage-level reuse.
+The runner hash includes dataset bytes, scientific runner/semantic
+configuration, external clinical-group mapping bytes, and relevant source
+files. Execution-only cache paths, verification policy, progress, device
+request, and inference batch sizes are excluded. A matching `summary.json` is
+the complete-result cache.
+
+### Stage-aware shared cache
+
+Expensive intermediate results live below
+`<artifact_dir>/_cache/v2/<stage>/<sha256>/`, outside runner-hash directories.
+Changing one configuration field therefore invalidates only stages whose
+scientific dependencies changed.
+
+Important examples:
+
+- adding an SAE seed reuses prepared data, splits, TabPFN, embeddings, existing
+  SAE models/activations, and existing SAE-pair matchings;
+- changing matching score limits reuses raw Hungarian matchings;
+- changing semantic objectives reuses randomized-tree bootstraps and rule
+  families, then reruns constrained selection;
+- increasing semantic bootstraps computes only new bootstrap IDs;
+- changing clinical groups reuses tree discovery and reclusters rule families;
+- changing class analysis reruns only final held-out evaluation;
+- changing DOT export, documentation, progress, or CSV formatting never
+  invalidates embeddings or SAE models.
+
+Every entry has a versioned manifest, dependency/source/environment identity,
+payload sizes and SHA-256 checksums, and a completion marker. Writes use a
+per-key POSIX lock and atomic directory publication. Missing, partial, corrupt,
+misaligned, or checksum-mismatched entries are quarantined and recomputed.
+Run-local legacy filenames remain compatibility/audit exports; lookup uses only
+the shared cache.
+
+Configuration remains backward compatible:
+
+```json
+{
+  "use_cache": true,
+  "cache_dir": null,
+  "cache_verification": "checksum"
+}
+```
+
+`cache_dir: null` means `<artifact_dir>/_cache/v2`.
+`cache_verification` accepts `checksum` (default) or `manifest`.
+`use_cache: false` bypasses shared reads and writes while retaining ordinary
+run artifacts.
+
+`--force` recomputes every stage. Repeatable `--force-stage` accepts
+`prepared`, `splits`, `tabpfn`, `embeddings`, `sae`, `activations`, `matching`,
+`functional`, or `semantic`. Forced computation never overwrites a valid
+canonical entry. If fresh output differs, `cache_refs.json` records the
+nondeterminism.
+
+Cache retention is explicit; nothing is automatically deleted:
+
+```bash
+python -m comparison_cache inspect --root stats/comparison/_cache/v2
+python -m comparison_cache prune --root stats/comparison/_cache/v2 \
+  --unreferenced
+python -m comparison_cache prune --root stats/comparison/_cache/v2 \
+  --older-than-days 90
+# Apply only after reviewing dry-run output.
+python -m comparison_cache prune --root stats/comparison/_cache/v2 \
+  --unreferenced --apply
+```
+
+Cache payloads include pickle/Torch files and are trusted-local artifacts.
+Never load a cache copied from an untrusted source.
 
 ## Implemented modules
+
+### `comparison_cache.py`
+
+Provides shared stage resolution through one deep interface. It owns
+content-derived keys, POSIX locks, atomic publication, checksums, quarantine,
+hit/miss/force reporting, `cache_refs.json`, inspection, and explicit pruning.
 
 ### `semantic_rules.py`
 
@@ -414,7 +489,7 @@ Written files:
 - `pair_metrics_by_class.csv`: additive one-row-per-pair/target/class analysis table, written only when class analysis is enabled.
 - `result.json`: complete cached return payload, including manifest, semantic models, and pair results.
 
-Experiment hash includes resolved configuration, semantic source fingerprint, tabular data, stratification outcome, patient groups, optional record keys, aligned activation matrices, split indices, clinical-group mapping, match rows, and feature names. Activation bytes therefore identify effective SAE outputs even though SAE weight files are not CLI inputs. `--force` recomputes. Never reuse a cache solely because record count matches; optional legacy gradient-cache shape check is only a minimum guard.
+Experiment hash includes resolved configuration, semantic source fingerprint, tabular data, stratification outcome, patient groups, optional record keys, aligned activation matrices, split indices, clinical-group mapping, match rows, and feature names. Activation bytes therefore identify effective SAE outputs even though SAE weight files are not CLI inputs. `--force` recomputes. Internal semantic caches are finer: one entry per bootstrap, family clustering, and constrained selection. Gradient reuse checks model identity, ordered record keys, feature matrix, domain vector, shape, and checksum rather than record count alone.
 
 ## Runtime profiles
 
@@ -424,7 +499,7 @@ Use explicit profile values in checked experiment JSON rather than hidden behavi
 - Standard: 30 outer bootstraps and 50-100 trees each; default development/research iteration.
 - Publication: 100 outer bootstraps and about 1,000 shallow trees each after runtime validation.
 
-Main cost scales with matched SAE runs, referenced factors, activation targets, bootstraps, trees, and candidate subsets. Orchestrator learns only factors referenced by match rows. It skips invalid/dead factors early, caps candidates per bootstrap using fitting/out-of-bag diagnostics, filters recurrence before subset search, uses exhaustive search only below configured candidate limit, switches to deterministic beam search above it, and caches complete matching experiments. Current backend runs sequentially and config rejects `n_jobs` values other than `1`; field reserves future deterministic parallel execution.
+Main cost scales with matched SAE runs, referenced factors, activation targets, bootstraps, trees, and candidate subsets. Orchestrator learns only factors referenced by match rows. It skips invalid/dead factors early, caps candidates per bootstrap using fitting/out-of-bag diagnostics, filters recurrence before subset search, uses exhaustive search only below configured candidate limit, switches to deterministic beam search above it, and caches both complete experiments and granular semantic stages. Current backend runs sequentially and config rejects `n_jobs` values other than `1`; field reserves future deterministic parallel execution.
 
 ## Reproducibility contract
 

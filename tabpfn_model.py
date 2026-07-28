@@ -91,9 +91,13 @@ def fit_dr_tabpfn(X_train: np.ndarray, y_train: np.ndarray, train_years: np.ndar
             drift_model.show_progress = eval_cfg.show_progress
         if hasattr(drift_model, "seed"):
             drift_model.seed = eval_cfg.rng_seed
+        model_source = "drift_resilient_best"
+        model_resolution_error = None
 
-    except Exception:
+    except Exception as error:
         drift_model = TabPFNClassifier(device=eval_cfg.device)
+        model_source = "fallback_classifier"
+        model_resolution_error = type(error).__name__
 
     t0 = time.perf_counter()
     drift_model = drift_model.fit(
@@ -114,6 +118,8 @@ def fit_dr_tabpfn(X_train: np.ndarray, y_train: np.ndarray, train_years: np.ndar
         'dist_shift_domain_train': dist_shift_domain_train_np,
         'model_add_x_device': model_add_x_device,
         'example_add_shape': example_add_shape,
+        'model_source': model_source,
+        'model_resolution_error': model_resolution_error,
     }
 
 

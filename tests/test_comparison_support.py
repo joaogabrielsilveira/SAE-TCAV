@@ -3,6 +3,7 @@ import sys
 import types
 
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 
@@ -120,6 +121,34 @@ def test_train_all_saes_requires_one_seed_per_run():
             np.ones((5, 3), dtype=np.float32),
             seeds=[11],
         )
+
+
+def test_forced_rule_graph_export_accepts_path_output_directory(tmp_path):
+    activations = np.arange(1, 9, dtype=np.float32).reshape(-1, 1)
+    features = np.arange(8, dtype=np.float32).reshape(-1, 1)
+    empty_rules = pd.DataFrame(
+        columns=[
+            "Factor",
+            "Rule",
+            "Class",
+            "Precision",
+            "Recall",
+            "Patients",
+            "Patients_concept",
+        ]
+    )
+
+    decision_tree.get_rules_forced(
+        train_activations=activations,
+        X=features,
+        surviving_concepts=np.asarray([0]),
+        tree_rules_df=empty_rules,
+        perc=50,
+        feature_names=["feature"],
+        graph_output_dir=tmp_path / "graphs",
+    )
+
+    assert (tmp_path / "graphs" / "0.dot").is_file()
 
 
 def test_encode_sae_batches_without_changing_outputs_or_model_device():
