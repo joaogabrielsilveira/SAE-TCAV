@@ -25,13 +25,14 @@ def get_model_gradients(model: TabPFNClassifier, dist_vec: np.ndarray, X: np.nda
                         cache_file: str | os.PathLike | None = None,
                         batch_size: int = 128,
                         device: str = "auto",
-                        show_progress: bool = False) -> np.ndarray:
+                        show_progress: bool = False,
+                        use_cache: bool = True) -> np.ndarray:
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
     gradient_device = resolve_torch_device(device)
     gradients_file = str(cache_file) if cache_file is not None else GRADS_FILE
 
-    if os.path.exists(gradients_file):
+    if use_cache and os.path.exists(gradients_file):
         with open(gradients_file, 'rb') as f:
             grads = load(f)
             if cache_file is not None and np.asarray(grads).shape[0] != X.shape[0]:
@@ -86,9 +87,10 @@ def get_model_gradients(model: TabPFNClassifier, dist_vec: np.ndarray, X: np.nda
     finally:
         model_decode_layer.to(original_device)
     
-    Path(gradients_file).parent.mkdir(parents=True, exist_ok=True)
-    with open(gradients_file, 'wb') as f:
-        dump(np.vstack(gradients), f)
+    if use_cache:
+        Path(gradients_file).parent.mkdir(parents=True, exist_ok=True)
+        with open(gradients_file, 'wb') as f:
+            dump(np.vstack(gradients), f)
     return np.vstack(gradients)
 
 def calculate_tcav_score(cav: np.ndarray, model_gradients: np.ndarray) -> float:

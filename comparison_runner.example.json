@@ -3,6 +3,8 @@
   "semantic_config_path": "semantic_experiment.example.json",
   "artifact_dir": "stats/comparison",
   "use_cache": true,
+  "cache_dir": null,
+  "cache_verification": "checksum",
   "show_progress": true,
   "seed": 42,
   "accelerator": {

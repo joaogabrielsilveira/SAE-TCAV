@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Sequence
 
 from comparison_runner import ComparisonRunnerConfig, run_comparison
+from comparison_cache import FORCE_STAGE_CHOICES
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -38,6 +39,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--force",
         action="store_true",
         help="Ignore complete and stage caches",
+    )
+    parser.add_argument(
+        "--force-stage",
+        action="append",
+        default=[],
+        choices=FORCE_STAGE_CHOICES,
+        help="Recompute one cache stage group; repeat for multiple groups",
     )
     parser.add_argument(
         "--no-progress",
@@ -71,7 +79,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.no_progress:
         config = replace(config, show_progress=False)
 
-    summary = run_comparison(config, force=args.force)
+    summary = run_comparison(
+        config,
+        force=args.force,
+        force_stages=tuple(args.force_stage),
+    )
     print(summary["artifact_dir"])
     return 0
 

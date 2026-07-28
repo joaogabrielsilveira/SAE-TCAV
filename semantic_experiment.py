@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import argparse
 import csv
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 from pathlib import Path
+import pickle
 from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
@@ -23,6 +24,7 @@ from semantic_artifacts import (
     environment_manifest,
     stable_hash,
 )
+from comparison_cache import ComparisonCache
 from semantic_compare import (
     RuleFamily,
     RuleSimilarityConfig,
@@ -46,6 +48,7 @@ from progress_utils import progress_iter
 from stable_rule_backend import (
     CandidateRuleOccurrence,
     StableRuleBackendConfig,
+    StableRuleDiscoveryResult,
     discover_stable_rule_candidates,
 )
 
@@ -58,6 +61,7 @@ _SEMANTIC_SOURCE_FILES = (
     "semantic_config.py",
     "semantic_splits.py",
     "semantic_artifacts.py",
+    "comparison_cache.py",
 )
 
 
@@ -212,6 +216,141 @@ def _empty_representation(
     )
 
 
+def _semantic_stage_source_fingerprint(*names: str) -> str:
+    digest = hashlib.sha256()
+    root = Path(__file__).resolve().parent
+    for name in names:
+        digest.update(name.encode())
+        digest.update((root / name).read_bytes())
+    return digest.hexdigest()
+
+
+def _pickle_read(path: Path) -> Any:
+    with path.open("rb") as handle:
+        return pickle.load(handle)
+
+
+def _pickle_write(path: Path, value: Any) -> None:
+    with path.open("wb") as handle:
+        pickle.dump(value, handle)
+
+
+def _occurrence_signature(value: CandidateRuleOccurrence) -> dict[str, Any]:
+    return {
+        **asdict(value),
+        "rule": value.rule.to_dict(),
+    }
+
+
+def _discovery_result_signature(
+    value: StableRuleDiscoveryResult,
+) -> dict[str, Any]:
+    return {
+        "occurrences": [
+            _occurrence_signature(item) for item in value.occurrences
+        ],
+        "bootstrap_diagnostics": [
+            asdict(item) for item in value.bootstrap_diagnostics
+        ],
+        "feature_names": value.feature_names,
+        "n_samples": value.n_samples,
+        "n_positive": value.n_positive,
+        "bootstrap_unit": value.bootstrap_unit,
+        "warnings": value.warnings,
+    }
+
+
+def _validate_bootstrap_result(value: Any) -> None:
+    if not isinstance(value, StableRuleDiscoveryResult):
+        raise ValueError("Cached semantic bootstrap has invalid type")
+    bootstrap_ids = {
+        item.bootstrap_id for item in value.bootstrap_diagnostics
+    } | {item.bootstrap_id for item in value.occurrences}
+    if len(bootstrap_ids) > 1:
+        raise ValueError("Cached semantic bootstrap contains multiple IDs")
+
+
+def _combine_bootstrap_results(
+    values: Sequence[StableRuleDiscoveryResult],
+    *,
+    feature_names: Sequence[str],
+    n_samples: int,
+    n_positive: int,
+) -> StableRuleDiscoveryResult:
+    occurrences = tuple(
+        item for value in values for item in value.occurrences
+    )
+    diagnostics = tuple(
+        item for value in values for item in value.bootstrap_diagnostics
+    )
+    warnings: list[str] = []
+    if any(
+        "one_or_more_bootstraps_have_single_class" in value.warnings
+        for value in values
+    ):
+        warnings.append("one_or_more_bootstraps_have_single_class")
+    if not occurrences:
+        warnings.append("no_valid_rule_candidates")
+    units = {value.bootstrap_unit for value in values}
+    if len(units) != 1:
+        raise ValueError("Semantic bootstrap sampling units differ")
+    return StableRuleDiscoveryResult(
+        occurrences=occurrences,
+        bootstrap_diagnostics=diagnostics,
+        feature_names=tuple(feature_names),
+        n_samples=n_samples,
+        n_positive=n_positive,
+        bootstrap_unit=next(iter(units)),
+        warnings=tuple(warnings),
+    )
+
+
+def _annotate_occurrence_groups(
+    occurrences: Sequence[CandidateRuleOccurrence],
+    clinical_groups: Mapping[str, Sequence[str]],
+) -> tuple[CandidateRuleOccurrence, ...]:
+    annotated: list[CandidateRuleOccurrence] = []
+    for occurrence in occurrences:
+        conditions = []
+        for condition in occurrence.rule.conditions:
+            configured = clinical_groups.get(
+                condition.feature_name,
+                (f"feature:{condition.feature_name}",),
+            )
+            if isinstance(configured, str):
+                configured = (configured,)
+            conditions.append(
+                replace(
+                    condition,
+                    clinical_groups=tuple(
+                        sorted(set(str(value) for value in configured))
+                    ),
+                )
+            )
+        annotated.append(
+            replace(
+                occurrence,
+                rule=replace(
+                    occurrence.rule,
+                    conditions=tuple(conditions),
+                ),
+            )
+        )
+    return tuple(annotated)
+
+
+def _validate_family_result(value: Any) -> None:
+    if not hasattr(value, "families") or not hasattr(
+        value, "total_bootstraps"
+    ):
+        raise ValueError("Cached semantic families are invalid")
+
+
+def _validate_selection_result(value: Any) -> None:
+    if not isinstance(value, RuleSetSelection):
+        raise ValueError("Cached semantic selection has invalid type")
+
+
 def learn_factor_semantics(
     *,
     run_id: str | int,
@@ -225,6 +364,7 @@ def learn_factor_semantics(
     feature_names: Sequence[str],
     clinical_groups: Mapping[str, Sequence[str]],
     config: SemanticExperimentConfig,
+    shared_cache: ComparisonCache | None = None,
 ) -> FactorSemanticRepresentation:
     """Fit one factor/threshold representation without access to final data."""
 
@@ -242,41 +382,206 @@ def learn_factor_semantics(
             run_name, factor_id, target, "insufficient_high_activation_targets", X_selection, selection_target
         )
     seed = derive_seed(config.runtime.seed, "semantic", run_name, factor_id, spec.name)
-    discovery = discover_stable_rule_candidates(
-        X_fit,
-        fit_target,
-        feature_names,
-        groups=patient_groups_fit,
-        clinical_group_map=clinical_groups,
-        config=_backend_config(
-            config,
-            seed,
-            progress_desc=f"Rules {run_name}:{factor_id} {spec.name}",
-        ),
+    backend_config = _backend_config(
+        config,
+        seed,
+        progress_desc=f"Rules {run_name}:{factor_id} {spec.name}",
     )
+    if shared_cache is None:
+        discovery = discover_stable_rule_candidates(
+            X_fit,
+            fit_target,
+            feature_names,
+            groups=patient_groups_fit,
+            clinical_group_map=clinical_groups,
+            config=backend_config,
+        )
+    else:
+        bootstrap_results = []
+        environment_values = environment_manifest()
+        semantic_environment = stable_hash(
+            {
+                name: environment_values.get(name)
+                for name in ("python", "numpy", "sklearn")
+            }
+        )
+        backend_dependencies = {
+            key: value
+            for key, value in asdict(backend_config).items()
+            if key
+            not in {
+                "n_bootstraps",
+                "show_progress",
+                "progress_desc",
+            }
+        }
+        for bootstrap_id in range(config.discovery.n_bootstraps):
+            def compute_bootstrap(current_id=bootstrap_id):
+                return discover_stable_rule_candidates(
+                    X_fit,
+                    fit_target,
+                    feature_names,
+                    groups=patient_groups_fit,
+                    # Group annotation belongs to family clustering so taxonomy
+                    # edits do not repeat randomized-tree fitting.
+                    clinical_group_map={},
+                    config=backend_config,
+                    bootstrap_ids=[current_id],
+                )
+
+            bootstrap_result = shared_cache.resolve(
+                stage="semantic_bootstrap",
+                item=(
+                    f"run:{run_name}-factor:{factor_id}-"
+                    f"target:{spec.name}-bootstrap:{bootstrap_id}"
+                ),
+                dependencies={
+                    "X_fit": array_fingerprint(np.asarray(X_fit)),
+                    "target_fit": array_fingerprint(
+                        np.asarray(fit_target, dtype=bool)
+                    ),
+                    "patient_groups": array_fingerprint(
+                        np.asarray(patient_groups_fit)
+                    ),
+                    "feature_names": tuple(feature_names),
+                    "backend": backend_dependencies,
+                    "bootstrap_id": bootstrap_id,
+                },
+                source_fingerprint=_semantic_stage_source_fingerprint(
+                    "stable_rule_backend.py", "semantic_rules.py"
+                ),
+                environment_fingerprint=semantic_environment,
+                load=lambda directory: _pickle_read(
+                    directory / "bootstrap.pkl"
+                ),
+                compute=compute_bootstrap,
+                store=lambda directory, value: _pickle_write(
+                    directory / "bootstrap.pkl", value
+                ),
+                validate=_validate_bootstrap_result,
+                fingerprint=lambda value: {
+                    "bootstrap": stable_hash(
+                        _discovery_result_signature(value)
+                    )
+                },
+            )
+            bootstrap_results.append(bootstrap_result.value)
+        discovery = _combine_bootstrap_results(
+            bootstrap_results,
+            feature_names=feature_names,
+            n_samples=len(X_fit),
+            n_positive=int(fit_target.sum()),
+        )
     occurrences = _cap_occurrences(
         discovery.occurrences, config.discovery.max_candidates_per_bootstrap
     )
-    clustering = cluster_rule_families(
-        occurrences,
-        X_selection,
-        RuleSimilarityConfig(
-            similarity_threshold=config.discovery.family_similarity_threshold,
-            min_recurrence=config.discovery.min_family_recurrence,
-        ),
-        total_bootstraps=config.discovery.n_bootstraps,
+    occurrences = _annotate_occurrence_groups(occurrences, clinical_groups)
+    similarity_config = RuleSimilarityConfig(
+        similarity_threshold=config.discovery.family_similarity_threshold,
+        min_recurrence=config.discovery.min_family_recurrence,
     )
+
+    def compute_families():
+        return cluster_rule_families(
+            occurrences,
+            X_selection,
+            similarity_config,
+            total_bootstraps=config.discovery.n_bootstraps,
+        )
+
+    if shared_cache is None:
+        clustering = compute_families()
+    else:
+        family_result = shared_cache.resolve(
+            stage="semantic_families",
+            item=f"run:{run_name}-factor:{factor_id}-target:{spec.name}",
+            dependencies={
+                "occurrences": stable_hash(
+                    [_occurrence_signature(value) for value in occurrences]
+                ),
+                "X_selection": array_fingerprint(np.asarray(X_selection)),
+                "clinical_groups": {
+                    str(name): (
+                        (str(values),)
+                        if isinstance(values, str)
+                        else tuple(str(value) for value in values)
+                    )
+                    for name, values in sorted(clinical_groups.items())
+                },
+                "similarity": asdict(similarity_config),
+                "total_bootstraps": config.discovery.n_bootstraps,
+            },
+            source_fingerprint=_semantic_stage_source_fingerprint(
+                "semantic_compare.py", "semantic_rules.py"
+            ),
+            environment_fingerprint=semantic_environment,
+            load=lambda directory: _pickle_read(directory / "families.pkl"),
+            compute=compute_families,
+            store=lambda directory, value: _pickle_write(
+                directory / "families.pkl", value
+            ),
+            validate=_validate_family_result,
+            fingerprint=lambda value: {
+                "families": stable_hash(
+                    [family.to_dict() for family in value.families]
+                )
+            },
+        )
+        clustering = family_result.value
     families = clustering.families
     recurrent_rules = recurrent_representatives(
         families, config.discovery.min_family_recurrence
     )
-    selection = select_rule_set(
-        recurrent_rules,
-        X_selection,
-        selection_target,
-        _selection_config(config),
-        threshold_name=spec.name,
-    )
+    selection_config = _selection_config(config)
+
+    def compute_selection():
+        return select_rule_set(
+            recurrent_rules,
+            X_selection,
+            selection_target,
+            selection_config,
+            threshold_name=spec.name,
+        )
+
+    if shared_cache is None:
+        selection = compute_selection()
+    else:
+        selection_result = shared_cache.resolve(
+            stage="semantic_selection",
+            item=f"run:{run_name}-factor:{factor_id}-target:{spec.name}",
+            dependencies={
+                "recurrent_rules": [
+                    rule.to_dict() for rule in recurrent_rules
+                ],
+                "X_selection": array_fingerprint(np.asarray(X_selection)),
+                "selection_target": array_fingerprint(
+                    np.asarray(selection_target, dtype=bool)
+                ),
+                "selection_config": asdict(selection_config),
+                "threshold_name": spec.name,
+            },
+            source_fingerprint=_semantic_stage_source_fingerprint(
+                "semantic_rules.py"
+            ),
+            environment_fingerprint=semantic_environment,
+            load=lambda directory: _pickle_read(
+                directory / "selection.pkl"
+            ),
+            compute=compute_selection,
+            store=lambda directory, value: _pickle_write(
+                directory / "selection.pkl", value
+            ),
+            validate=_validate_selection_result,
+            fingerprint=lambda value: {
+                "selection": stable_hash(
+                    value.rule_set.to_dict(),
+                    value.metrics.to_dict(),
+                    value.feasible,
+                    value.reason,
+                )
+            },
+        )
+        selection = selection_result.value
     recurrent_count = sum(
         family.recurrence_frequency + 1e-15 >= config.discovery.min_family_recurrence
         for family in families
@@ -492,9 +797,17 @@ def run_semantic_comparison(
     functional_by_factor: Mapping[Any, Any] | None = None,
     record_keys: Sequence[Any] | None = None,
     force: bool = False,
+    shared_cache: ComparisonCache | None = None,
 ) -> dict[str, Any]:
     """Learn per-factor semantics, evaluate matched pairs, persist artifacts."""
 
+    if shared_cache is None:
+        shared_cache = ComparisonCache(
+            Path(config.runtime.artifact_dir) / "_cache" / "v2",
+            enabled=config.runtime.cache,
+            forced_stages=("semantic",) if force else (),
+        )
+    cache_event_start = len(shared_cache.events)
     X = np.asarray(X, dtype=float)
     y_stratify = np.asarray(outcome_for_stratification)
     patients = np.asarray(patient_ids)
@@ -520,7 +833,8 @@ def run_semantic_comparison(
     }
     source_fingerprint = _source_fingerprint()
     hash_config = config.to_dict()
-    hash_config["runtime"].pop("show_progress", None)
+    for name in ("artifact_dir", "cache", "show_progress", "n_jobs"):
+        hash_config["runtime"].pop(name, None)
     experiment_hash = stable_hash(
         hash_config,
         array_fingerprint(X),
@@ -579,6 +893,7 @@ def run_semantic_comparison(
             feature_names=names,
             clinical_groups=group_map,
             config=config,
+            shared_cache=shared_cache,
         )
 
     pair_results: list[dict[str, Any]] = []
@@ -709,6 +1024,25 @@ def run_semantic_comparison(
         },
         "n_records": len(X),
         "n_pairs": len(pairs),
+        "stage_cache": {
+            "root": str(shared_cache.root),
+            "hits": sum(
+                event.status == "hit"
+                for event in shared_cache.events[cache_event_start:]
+            ),
+            "misses": sum(
+                event.status == "miss"
+                for event in shared_cache.events[cache_event_start:]
+            ),
+            "forced": sum(
+                event.status == "forced"
+                for event in shared_cache.events[cache_event_start:]
+            ),
+            "disabled": sum(
+                event.status == "disabled"
+                for event in shared_cache.events[cache_event_start:]
+            ),
+        },
     }
     if config.class_analysis.enabled:
         class_values, class_counts = np.unique(final_outcomes, return_counts=True)
@@ -724,6 +1058,7 @@ def run_semantic_comparison(
             },
         }
     store.write_json("manifest.json", manifest)
+    shared_cache.write_refs(store.root / "cache_refs.json")
     store.write_npz(
         "splits.npz",
         record_hashes=record_hashes,

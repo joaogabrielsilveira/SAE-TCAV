@@ -40,6 +40,33 @@ def test_discovery_is_deterministic_including_provenance():
     assert first.bootstrap_diagnostics
 
 
+def test_selected_bootstraps_match_same_ids_from_complete_discovery():
+    rng = np.random.default_rng(14)
+    X = rng.normal(size=(70, 3))
+    y = (X[:, 0] - X[:, 1] > 0).astype(int)
+    config = _config(n_bootstraps=7, trees_per_bootstrap=3)
+
+    complete = discover_stable_rule_candidates(
+        X, y, ("a", "b", "noise"), config=config
+    )
+    selected = discover_stable_rule_candidates(
+        X,
+        y,
+        ("a", "b", "noise"),
+        config=config,
+        bootstrap_ids=[2, 5],
+    )
+
+    assert selected.occurrences == tuple(
+        item for item in complete.occurrences if item.bootstrap_id in {2, 5}
+    )
+    assert selected.bootstrap_diagnostics == tuple(
+        item
+        for item in complete.bootstrap_diagnostics
+        if item.bootstrap_id in {2, 5}
+    )
+
+
 def test_progress_reporting_does_not_change_discovery_result():
     rng = np.random.default_rng(18)
     X = rng.normal(size=(60, 2))
