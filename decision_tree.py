@@ -171,7 +171,7 @@ def extrair_regras_resumidas(modelo_arvore, nomes_das_features, scaler=None, dic
 
 def get_binary_targets(train_activations: np.ndarray, perc=50, model_type:str='ReLU') -> list[tuple[int, float]]:
     bin_targets = []
-    print(f'model_type: {model_type}')
+    # print(f'model_type: {model_type}')
 
     for col in range(train_activations.shape[1]):
         # lista com todas as ativações para o embedding atual

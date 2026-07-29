@@ -709,17 +709,6 @@ def calculate_concept_correlation_drift(X_test_df: pd.DataFrame, test_embs: np.n
         with torch.no_grad():
             codes_ref, reconstruction_reference = baseline_sae(embs_reference)
         
-        nan_tensor = torch.tensor(float('nan'), dtype=codes_ref.dtype, device=codes_ref.device)
-        codes_ref_pos = torch.where(codes_ref > 0, codes_ref, nan_tensor)
-        medians = torch.nanquantile(input=codes_ref_pos, q=torch.tensor(0.5), dim=0)
-        above_thresh_mask_reference = (codes_ref >= medians)
-        high_activations_reference = torch.sum(above_thresh_mask_reference, dim=0)
-        high_activations_sum_reference = torch.sum(above_thresh_mask_reference * codes_ref, dim=0)
-        high_activations_mean_reference = high_activations_sum_reference / torch.clamp(high_activations_reference, 1)
-        
-        active_features_mask_reference = (codes_ref > 1e-5).sum(dim=0) > 0
-        active_indices_reference = torch.where(active_features_mask_reference)[0].cpu().numpy()
-
         if undersample:
             pos_idx = np.where(y_ref == 1)[0]
             neg_idx = np.where(y_ref == 0)[0]
@@ -749,6 +738,28 @@ def calculate_concept_correlation_drift(X_test_df: pd.DataFrame, test_embs: np.n
         baseline_tabpfn = tabpfn_fit_out['model']
         model_add_x_device = tabpfn_fit_out['model_add_x_device']
         example_add_shape = tabpfn_fit_out['example_add_shape']
+        dist_dom = np.asarray([year_to_domain_combined[int(y)] for y in years_ref], dtype=np.int64)
+
+        significant_df = get_stable_concepts_year(
+            year=reference_year, X_np_scaled=np.asarray(X_reference_df, dtype=np.float32),
+            X_df_scaled=X_reference_df, tabpfn=baseline_tabpfn,
+            embs=np.asarray(embs_reference, dtype=np.float32),
+            codes=codes_ref, y_np=y_ref, dist_np=dist_dom,
+            embs_scaler=emb_scaler, feature_cols=features
+        )
+
+        nan_tensor = torch.tensor(float('nan'), dtype=codes_ref.dtype, device=codes_ref.device)
+        codes_ref_pos = torch.where(codes_ref > 0, codes_ref, nan_tensor)
+        medians = torch.nanquantile(input=codes_ref_pos, q=torch.tensor(0.5), dim=0)
+        above_thresh_mask_reference = (codes_ref >= medians)
+        high_activations_reference = torch.sum(above_thresh_mask_reference, dim=0)
+        high_activations_sum_reference = torch.sum(above_thresh_mask_reference * codes_ref, dim=0)
+        high_activations_mean_reference = high_activations_sum_reference / torch.clamp(high_activations_reference, 1)
+        
+        # active_features_mask_reference = (codes_ref > 1e-5).sum(dim=0) > 0
+        # active_indices_reference = torch.where(active_features_mask_reference)[0].cpu().numpy()
+        active_indices_reference = significant_df['Factor'].values.tolist()
+        active_features_mask_reference = torch.isin(torch.tensor(range(codes_ref.shape[1])), torch.tensor(active_indices_reference))
 
         reference_associations = []
         for feat in range(codes_ref.shape[1]):
@@ -980,4 +991,24 @@ def plotar_termometro_drift(df_agg: pd.DataFrame):
     
     plt.tight_layout()
     plt.savefig('graphs/sae_drift_normalizado.png')
-    plt.close()
+
+from decision_tree import *
+from tcav import *
+def get_stable_concepts_year(year: int, X_df_scaled: pd.DataFrame, X_np_scaled: np.ndarray, tabpfn: TabPFNClassifier, embs: np.ndarray, codes: np.ndarray, y_np: np.ndarray, dist_np: np.ndarray, embs_scaler: StandardScaler, feature_cols: list[str]):
+    tree_rules = train_binary_trees(embs, X_np_scaled, feature_cols)
+    best_p = max(tree_rules.keys(), key=lambda p: len(tree_rules[p]))
+    rules_df = pd.DataFrame(tree_rules[best_p])
+    high_quantile = 1.0 - (best_p / 100.0)
+
+    grads = get_model_gradients(model=tabpfn, X=X_np_scaled, dist_vec=dist_np, year=year)
+    cavs = train_cavs_from_rules(rules_per_percentile=tree_rules[best_p], X_cav_train_df=X_df_scaled, cav_train_emb=embs,
+                                 cav_train_emb_encoded=codes, y_cav_train=y_np,
+                                 feature_cols=feature_cols, emb_scaler=embs_scaler, high_quantile=high_quantile, min_pos_samples=50, random_state=42)
+    tcav_scores = get_tcav_scores(cavs=cavs.values(), grads=grads)
+
+    significant_concepts, significant_df = get_significant_concepts(
+        cavs=cavs, tcav_scores=tcav_scores, best_rules=tree_rules[best_p],
+        grads=grads, embs=embs, scaler=embs_scaler
+    )
+    
+    return significant_df

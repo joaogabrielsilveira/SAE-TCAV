@@ -552,3 +552,27 @@ def scale_df_data(train_rows: pd.DataFrame, test_rows:pd.DataFrame, feature_cols
     )
 
     return scaler, X_train_norm, X_test_norm
+
+def plot_deaths_distribution(results_per_year: dict[str]) -> None:
+    from math import ceil
+    results_per_year_df = pd.DataFrame(results_per_year)
+    years = results_per_year_df['year']
+    p_deaths = (results_per_year_df['n_deaths'] * 100) / results_per_year_df['n_samples']
+    p_alive = (100.0) - p_deaths
+    distribution_df = pd.DataFrame({'Mortes': p_deaths, 'Sobreviventes': p_alive}).set_index(results_per_year_df['year'])
+    fig, ax = plt.subplots()
+    distribution_df.plot(kind='bar', stacked=True, ax=ax, edgecolor='black')
+    ax.set_ylim(0, 100)
+    ax.set_ylabel('Occurrence (%)')
+    ax.set_xlabel('Year')
+    ax.set_title('Class Distribution Through the Time')
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig('graphs/class_dist.png', dpi=300)
+    fig, ax = plt.subplots()
+    ax.plot(years, p_deaths, marker='o', linestyle='-', color='red')
+    ax.set_xlabel('Year')
+    ax.set_ylabel('Deaths (%)')
+    ax.set_title('Occurrence of DEATH per year')
+    ax.set_ylim(0, ceil(max(p_deaths)))
+    plt.savefig('graphs/death_perc.png')

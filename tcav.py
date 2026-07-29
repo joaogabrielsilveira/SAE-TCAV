@@ -18,13 +18,19 @@ import warnings
 CAVS_FILE = get_env_path('models/tcav/cavs.pkl')
 GRADS_FILE = get_env_path('models/tcav/grads.pkl')
 
-def get_model_gradients(model: TabPFNClassifier, dist_vec: np.ndarray, X: np.ndarray) -> np.ndarray:
+def get_model_gradients(model: TabPFNClassifier, dist_vec: np.ndarray, X: np.ndarray, year: int = None) -> np.ndarray:
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    if os.path.exists(GRADS_FILE):
-        with open(GRADS_FILE, 'rb') as f:
+    if year is None:
+        grads_path = GRADS_FILE
+    else:
+        grads_name, grads_ext = GRADS_FILE.split('.')
+        grads_path = f'{grads_name}_{year}.{grads_ext}'
+
+    if os.path.exists(grads_path):
+        with open(grads_path, 'rb') as f:
             grads = load(f)
-            print(f'Carregando grads de {GRADS_FILE}')
+            print(f'Carregando grads de {grads_path}')
             return grads
 
     model_decode_layer = model.model_processed_.decoder_dict['standard'].to(device)
@@ -60,7 +66,7 @@ def get_model_gradients(model: TabPFNClassifier, dist_vec: np.ndarray, X: np.nda
             gradients.append(batch_grad.detach().cpu().numpy())
             print(gradients[0].shape)
     
-    with open(GRADS_FILE, 'wb') as f:
+    with open(grads_path, 'wb') as f:
         dump(np.vstack(gradients), f)
     return np.vstack(gradients)
 
@@ -110,9 +116,14 @@ def extract_rule_conditions(path: str):
 def get_rule_mask(X_df: pd.DataFrame, conditions: list[Any], feature_cols: list[str]) -> np.ndarray:
     mask = np.ones(X_df.shape[0], dtype=bool)
 
+
     for cond in conditions:
         feat, op, thresh = cond
         # feat_idx = feature_cols.index(feat)
+        if feat not in X_df.columns:
+            for col in X_df.columns:
+                if feat in col:
+                    feat = col
         values = X_df[feat].values
         if op == '>':
             mask = mask & (values > thresh)
@@ -551,7 +562,38 @@ def run_sparse_readout_dual_split(significant_factors: pd.DataFrame, cav_train_c
     summary_df = pd.DataFrame(summary_rows).sort_values('concept').reset_index()
     return sparse_readout_results, sparse_readout_validation, summary_df
 
+def get_significant_concepts(cavs: dict[str], tcav_scores: list[float], best_rules: dict[str], grads: np.ndarray, embs: np.ndarray, scaler: StandardScaler):
+    for cav in cavs.values():
+        idx = cav['Factor']
+        cav['TCAV_score'] = tcav_scores[idx]
+    
+    for rule in best_rules:
+        idx = rule['Factor']
+        if idx in cavs:
+            prec, rec = rule['Precision'], rule['Recall']
+            cavs[idx]['Precision'] = prec
+            cavs[idx]['Recall'] = rec
+    
+    robust_tcav_results = {}
+    for idx, info in cavs.items():
+        robust_result = robust_tcav_significance_test(
+            concept_idx=idx, embs=embs,
+            idx_pos=info['positive_idx'],
+            idx_neg=info['negative_idx'],
+            model_grads=grads, scaler_emb=scaler,
+            sample_fraction=1.0, rng_seed=42
+        )
+        robust_tcav_results[idx] = robust_result
+    
+    significant_concepts = {}
+    for idx in cavs:
+        if robust_tcav_results[idx]['is_significant'] and abs(cavs[idx]['TCAV_score'] - 0.5) > 0.1:
+            significant_concepts[idx] = cavs[idx]
+            significant_concepts[idx]['p_value'] = robust_tcav_results[idx]['p_value']
+            significant_concepts[idx]['t_stat'] = robust_tcav_results[idx]['t_stat']
+            significant_concepts[idx]['Precision'] = cavs[idx]['Precision']
+            significant_concepts[idx]['Recall'] = cavs[idx]['Recall']
+    
+    significant_df = pd.DataFrame([val for _, val in significant_concepts.items()])
 
-
-        
-
+    return significant_concepts, significant_df

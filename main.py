@@ -9,13 +9,14 @@ from sae import train_sae_model
 from tabpfn_model import fit_dr_tabpfn, walkforward_evaluate_tabpfn, TabPFNEvalConfig, load_or_extract_embeddings, \
     EmbeddingExtractConfig, scale_embeddings, scale_embeddings_l2, temporal_test_subsplits, TRAINING_EMBEDDING_FILE, TEST_EMBEDDING_FILE, PRED_PROB_FILE
 from decision_tree import train_binary_trees, get_binary_targets, extrair_regras_resumidas, get_rules_forced
-from tcav import train_cavs_from_rules, get_model_gradients, get_tcav_scores, robust_tcav_significance_test, run_feature_association_dual_split, run_sparse_readout_dual_split
+from tcav import train_cavs_from_rules, get_model_gradients, get_tcav_scores, robust_tcav_significance_test, run_feature_association_dual_split, run_sparse_readout_dual_split, get_significant_concepts
 from filepaths import get_env_path
 from pickle import dump, load
 import os
 import pandas as pd
 from tabpfn import TabPFNClassifier
 from results import cid10_dict, translate_event_name, events_dict, tcav_result_df_from_concepts, translate_event_names
+import matplotlib.pyplot as plt
 
 PREPARED_DB_PATH = get_env_path('data/renal/prep.pkl')
 
@@ -153,21 +154,29 @@ if __name__ == '__main__':
     test_emb = emb_out['test_emb_flat'].astype(np.float32)
     train_emb_scaled, test_emb_scaled, scaler_emb = scale_embeddings(train_emb, test_emb, fit_test=False)
 
-    from sae_compare import calculate_concept_correlation_drift, plotar_termometro_drift
-    # with open('stats/concept_drift.pkl','rb') as f:
-    #     dist_df = load(f)
-    # plotar_termometro_drift(dist_df)
-    # exit()
-
-    full_df, dist_df = calculate_concept_correlation_drift(
-        X_test_df=test_rows,
-        test_embs=test_emb,
-        test_years_np=years_test_np,
-        features=feature_cols,
-        alpha=1.0,
-        undersample=True
+    from instance_selection import infer_with_selected_instances
+    test_indices = range(0, len(test_rows))
+    np.random.seed(42)
+    infer_indices = np.random.choice(test_indices, size=50, replace=False)
+    X_infer_np = X_test_np[infer_indices, :]
+    y_infer_np = y_test_np[infer_indices]
+    years_infer_np = years_test_np[infer_indices]
+    data = infer_with_selected_instances(
+        base_model=drift_model,
+        base_sae=train_sae_model(inputs=torch.tensor(train_emb_scaled, dtype=torch.float32), save_data=False, use_cache=False, alpha=1.0),
+        X_train_np=X_train_np,
+        years_train_np=years_train_np,
+        y_train_np=y_train_np,
+        train_embs=train_emb_scaled,
+        X_infer_np=X_infer_np,
+        y_infer_np=y_infer_np,
+        years_infer_np=years_infer_np,
+        emb_scaler=scaler_emb,
+        add_x_device=model_add_x_device,
+        add_x_shape=example_add_shape
     )
-    exit()
+    for key, val in data.items():
+        print(f'{key}: {val}')
 
     mean_train = np.mean(train_emb, axis=0)
     std_train = np.std(train_emb, axis=0)
@@ -365,38 +374,10 @@ if __name__ == '__main__':
                                  feature_cols=feature_cols, emb_scaler=scaler, high_quantile=high_quantile, min_pos_samples=50, random_state=42)
     tcav_scores = get_tcav_scores(cavs=cavs.values(), grads=grads)
 
-    for cav in cavs.values():
-        idx = cav['Factor']
-        cav['TCAV_score'] = tcav_scores[idx]
-    
-    for rule in tree_rules[best_p]:
-        idx = rule['Factor']
-        if idx in cavs:
-            prec, rec = rule['Precision'], rule['Recall']
-            cavs[idx]['Precision'] = prec
-            cavs[idx]['Recall'] = rec
-    
-    robust_tcav_results = {}
-    for idx, info in cavs.items():
-        robust_result = robust_tcav_significance_test(
-            concept_idx=idx, embs=embeddings_cav_training,
-            idx_pos=info['positive_idx'],
-            idx_neg=info['negative_idx'],
-            model_grads=grads, scaler_emb=scaler,
-            sample_fraction=1.0, rng_seed=42
-        )
-        robust_tcav_results[idx] = robust_result
-    
-    significant_concepts = {}
-    for idx in cavs:
-        if robust_tcav_results[idx]['is_significant'] and abs(cavs[idx]['TCAV_score'] - 0.5) > 0.1:
-            significant_concepts[idx] = cavs[idx]
-            significant_concepts[idx]['p_value'] = robust_tcav_results[idx]['p_value']
-            significant_concepts[idx]['t_stat'] = robust_tcav_results[idx]['t_stat']
-            significant_concepts[idx]['Precision'] = cavs[idx]['Precision']
-            significant_concepts[idx]['Recall'] = cavs[idx]['Recall']
-    
-    significant_df = pd.DataFrame([val for _, val in significant_concepts.items()])
+    significant_concepts, significant_df = get_significant_concepts(
+        cavs=cavs, tcav_scores=tcav_scores, best_rules=tree_rules[best_p],
+        grads=grads, scaler=scaler_emb
+    )
 
     significant_concepts = pd.merge(
         significant_df,
