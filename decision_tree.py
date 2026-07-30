@@ -30,7 +30,7 @@ def extrair_regras_positivas(modelo_arvore, nomes_das_features, scaler: Standard
     contendo apenas as regras que levam à previsão da classe positiva (1).
     """
     tree_ = modelo_arvore.tree_
-    
+
     # Mapeia os IDs das features para os nomes reais passados
     feature_names = [
         nomes_das_features[i] if i != -2 else "undefined!"
@@ -51,39 +51,39 @@ def extrair_regras_positivas(modelo_arvore, nomes_das_features, scaler: Standard
                 mean = scaler.mean_[feature_idx]
                 stdev = scaler.scale_[feature_idx]
 
-                limiar = (limiar * stdev) + mean  
-            
+                limiar = (limiar * stdev) + mean
+
             # 1. Desce para a esquerda (regra: <= limiar)
             regra_esquerda = f"{nome_feature} <= {limiar:.3f}"
             percorrer_arvore(tree_.children_left[node], caminho_atual + [regra_esquerda])
-            
+
             # 2. Desce para a direita (regra: > limiar)
             regra_direita = f"{nome_feature} > {limiar:.3f}"
             percorrer_arvore(tree_.children_right[node], caminho_atual + [regra_direita])
-            
+
         # Se for uma folha final
         else:
             # Pega a distribuição dos PESOS (para calcular a confiança)
-            valores_classes = tree_.value[node][0] 
+            valores_classes = tree_.value[node][0]
             classe_prevista = np.argmax(valores_classes)
-            
+
             if classe_prevista == 1:
                 # Usa os pesos para calcular a porcentagem de confiança
                 peso_total = np.sum(valores_classes)
                 confianca = valores_classes[1] / peso_total
-                
+
                 # A MÁGICA AQUI: Pega a contagem física real de pacientes!
                 qtd_pacientes_reais = tree_.n_node_samples[node]
-                
+
                 regra_completa = " E ".join(caminho_atual)
-                
+
                 # Atualiza a frase para mostrar a quantidade real
                 frase = f"SE ( {regra_completa} ) ENTÃO Conceito Ativo [Confiança: {confianca:.0%} | Casos: {qtd_pacientes_reais}]"
                 regras_positivas.append(frase)
 
     # Inicia a busca a partir da raiz (nó 0) com um caminho vazio
     percorrer_arvore(0, [])
-    
+
     return regras_positivas
 
 # igualmente à função anterior; será revisitada
@@ -97,11 +97,11 @@ def extrair_regras_resumidas(modelo_arvore, nomes_das_features, scaler=None, dic
         if tree_.feature[node] == -2: # É uma folha
             valores = tree_.value[node][0]
             return np.argmax(valores) == 1 # Retorna True se prever classe 1
-        
+
         # Olha para os dois filhos
         esq_positivo = sub_arvore_pura_positiva(tree_.children_left[node])
         dir_positivo = sub_arvore_pura_positiva(tree_.children_right[node])
-        
+
         # Só resume se TODOS os caminhos abaixo levarem à classe 1
         return esq_positivo and dir_positivo
 
@@ -117,19 +117,19 @@ def extrair_regras_resumidas(modelo_arvore, nomes_das_features, scaler=None, dic
         return nome
 
     def percorrer_arvore(node, limites_atuais):
-        
+
         # Se este galho inteiro só leva para a Classe 1, podemos resumir agora!
         if sub_arvore_pura_positiva(node):
             valores = tree_.value[node][0]
             confianca = valores[1] / np.sum(valores) # Confiança média ponderada
             casos = tree_.n_node_samples[node]       # Soma total de casos das folhas filhas
-            
+
             condicoes = []
             for feat, bounds in limites_atuais.items():
                 nome_traduzido = traduzir(feat)
                 b_min = bounds['min']
                 b_max = bounds['max']
-                
+
                 # Monta a regra de forma inteligente (X > min, X <= max, ou min < X <= max)
                 if b_min != -np.inf and b_max != np.inf:
                     condicoes.append(f"{b_min:.2f} < {nome_traduzido} ({feat}) <= {b_max:.2f}")
@@ -137,10 +137,10 @@ def extrair_regras_resumidas(modelo_arvore, nomes_das_features, scaler=None, dic
                     condicoes.append(f"{nome_traduzido} ({feat}) > {b_min:.2f}")
                 elif b_max != np.inf:
                     condicoes.append(f"{nome_traduzido} ({feat}) <= {b_max:.2f}")
-            
+
             regra_str = " E ".join(condicoes) if condicoes else "TODOS OS CASOS"
             regras_positivas.append(f"SE ( {regra_str}) ENTÃO Conceito Ativo [Confiança Média: {confianca:.0%} | Casos Totais: {casos}]")
-            
+
             return # Interrompe a descida (Resume a árvore)
 
         # Se a árvore for "mista" (tem positivos e negativos), continua descendo
@@ -148,20 +148,20 @@ def extrair_regras_resumidas(modelo_arvore, nomes_das_features, scaler=None, dic
             feature_idx = tree_.feature[node]
             nome_feature = feature_names[node]
             limiar_escalado = tree_.threshold[node]
-            
+
             if scaler is not None:
                 limiar = (limiar_escalado * scaler.scale_[feature_idx]) + scaler.mean_[feature_idx]
             else:
                 limiar = limiar_escalado
 
             # MÁGICA 2: Gravar Mínimos e Máximos em vez de empilhar strings
-            
+
             # Caminho da Esquerda (<= limiar)
             limites_esq = {k: dict(v) for k, v in limites_atuais.items()}
             if nome_feature not in limites_esq: limites_esq[nome_feature] = {'min': -np.inf, 'max': np.inf}
             limites_esq[nome_feature]['max'] = min(limites_esq[nome_feature]['max'], limiar)
             percorrer_arvore(tree_.children_left[node], limites_esq)
-            
+
             # Caminho da Direita (> limiar)
             limites_dir = {k: dict(v) for k, v in limites_atuais.items()}
             if nome_feature not in limites_dir: limites_dir[nome_feature] = {'min': -np.inf, 'max': np.inf}
@@ -174,6 +174,7 @@ def extrair_regras_resumidas(modelo_arvore, nomes_das_features, scaler=None, dic
 
 def get_binary_targets(train_activations: np.ndarray, perc=50, model_type:str='ReLU') -> list[tuple[int, float]]:
     bin_targets = []
+    # print(f'model_type: {model_type}')
 
     for col in range(train_activations.shape[1]):
         # lista com todas as ativações para o embedding atual
@@ -184,15 +185,15 @@ def get_binary_targets(train_activations: np.ndarray, perc=50, model_type:str='R
         if model_type == 'ReLU':
             if cur_concept_positive.shape[0] > 0:
                 threshold = np.percentile(cur_concept_positive, perc)
-                bin_targets.append((col, threshold)) 
+                bin_targets.append((col, threshold))
         elif model_type == 'TopK':
             if cur_concept_positive.shape[0] > 0:
                 threshold = np.min(cur_concept_positive)
-                bin_targets.append((col, threshold)) 
+                bin_targets.append((col, threshold))
         else:
             raise ValueError('Invalid model type')
-        
-           
+
+
 
     return bin_targets
 
@@ -205,7 +206,7 @@ def mask_from_rule(rule: str, X: np.ndarray, feature_names: list[str]) -> np.nda
         condition = condition.strip()
         if not condition:
             continue
-    
+
         if '<=' in condition:
             feature, threshold = condition.split(' <= ')
             threshold = float(threshold)
@@ -213,7 +214,7 @@ def mask_from_rule(rule: str, X: np.ndarray, feature_names: list[str]) -> np.nda
                 continue
             feature_idx = feature_names.index(feature)
             mask = mask & (X[:, feature_idx] <= threshold)
-        
+
         elif '>' in condition:
             feature, threshold = condition.split(' > ')
             threshold = float(threshold)
@@ -221,7 +222,7 @@ def mask_from_rule(rule: str, X: np.ndarray, feature_names: list[str]) -> np.nda
                 continue
             feature_idx = feature_names.index(feature)
             mask = mask & (X[:, feature_idx] > threshold)
-    
+
     return mask
 
 def get_rules_from_text(text_rules: str) -> pd.DataFrame:
@@ -230,12 +231,12 @@ def get_rules_from_text(text_rules: str) -> pd.DataFrame:
 
     for line in text_rules.split('\n'):
         depth = line.count('|   ')
-        
+
         # "class:" indica um nó folha (o final de uma regra)
         if 'class' in line:
             cls = line.split('class:')[1].strip()
             tree_rules.append({'Path': ' AND '.join(path), 'Class': cls})
-        
+
         # nós com filhos indicam a continuação de uma regra
         else:
             cond = line.split('|--- ')[-1].strip()
@@ -375,7 +376,7 @@ def get_rules_forced(train_activations: np.ndarray, X: np.ndarray, surviving_con
 
             if n_high == 0:
                 continue
-        
+
         clf = DecisionTreeClassifier(
             max_depth=15,
             min_samples_leaf=0.01,
@@ -419,7 +420,7 @@ def get_rules_forced(train_activations: np.ndarray, X: np.ndarray, surviving_con
             if true_mask.sum() == 0:
                 # print('No true patients for rule')
                 continue
-                
+
             n_true_positive = (true_mask & y_high).sum()
             recall = n_true_positive / max(n_high, 1)
             precision = float(y_high[true_mask].mean())

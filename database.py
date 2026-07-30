@@ -382,7 +382,7 @@ def compare_distributions(x_i: np.ndarray, x_j: np.ndarray, top_k_events: list[s
         if not(is_different):
             features_to_keep_name.append(feat)
         data_shift_df = pd.DataFrame(rows)
-    
+
     return data_shift_df, features_to_keep, features_to_keep_name
 
 def prepare_tabpfn_rows(df: pd.DataFrame, cfg: TabPFNPrepConfig, lgbm_params: dict) -> dict[str, object]:
@@ -434,16 +434,16 @@ def prepare_tabpfn_rows(df: pd.DataFrame, cfg: TabPFNPrepConfig, lgbm_params: di
 
     top_k_events = select_top_events_lgbm(df, selected_train_patients, train_years,
                                           cfg.m_candidates, final_top_k=cfg.final_top_k, lgb_params=lgbm_params)
-    
+
     top_k_events_test = select_top_events_lgbm(df=df, selected_train_patients=test_patients, train_years=test_years,
                                                 m_candidates=cfg.m_candidates, final_top_k=cfg.final_top_k, lgb_params=lgbm_params)
-    
+
     plot_feature_importance(top_k_events=top_k_events, data_source='training')
     plot_feature_importance(top_k_events=top_k_events_test, data_source='test')
 
     top_k_events_training_start = select_top_events_lgbm(df, selected_train_patients, [2000],
                                           cfg.m_candidates, final_top_k=cfg.final_top_k, lgb_params=lgbm_params)
-    
+
     top_k_events_training_end = select_top_events_lgbm(df, selected_train_patients, [max(train_years)],
                                           cfg.m_candidates, final_top_k=cfg.final_top_k, lgb_params=lgbm_params)
 
@@ -485,7 +485,7 @@ def prepare_database(
     print(f'Years: {df["year"].min()} - {df["year"].max()}')
     print(f'Distinct events: {df["event"].nunique():,}')
     print(df.head())
-    
+
     if cfg is None:
         cfg = TabPFNPrepConfig()
     lgb_params = {
@@ -560,3 +560,27 @@ def scale_df_data(train_rows: pd.DataFrame, test_rows:pd.DataFrame, feature_cols
     )
 
     return scaler, X_train_norm, X_test_norm
+
+def plot_deaths_distribution(results_per_year: dict[str]) -> None:
+    from math import ceil
+    results_per_year_df = pd.DataFrame(results_per_year)
+    years = results_per_year_df['year']
+    p_deaths = (results_per_year_df['n_deaths'] * 100) / results_per_year_df['n_samples']
+    p_alive = (100.0) - p_deaths
+    distribution_df = pd.DataFrame({'Mortes': p_deaths, 'Sobreviventes': p_alive}).set_index(results_per_year_df['year'])
+    fig, ax = plt.subplots()
+    distribution_df.plot(kind='bar', stacked=True, ax=ax, edgecolor='black')
+    ax.set_ylim(0, 100)
+    ax.set_ylabel('Occurrence (%)')
+    ax.set_xlabel('Year')
+    ax.set_title('Class Distribution Through the Time')
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig('graphs/class_dist.png', dpi=300)
+    fig, ax = plt.subplots()
+    ax.plot(years, p_deaths, marker='o', linestyle='-', color='red')
+    ax.set_xlabel('Year')
+    ax.set_ylabel('Deaths (%)')
+    ax.set_title('Occurrence of DEATH per year')
+    ax.set_ylim(0, ceil(max(p_deaths)))
+    plt.savefig('graphs/death_perc.png')
