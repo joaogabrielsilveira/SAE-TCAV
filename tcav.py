@@ -35,6 +35,7 @@ def get_model_gradients(model: TabPFNClassifier, dist_vec: np.ndarray, X: np.nda
     if use_cache and os.path.exists(gradients_file):
         with open(gradients_file, 'rb') as f:
             grads = load(f)
+            print(f'Carregando grads de {gradients_file}')
             if cache_file is not None and np.asarray(grads).shape[0] != X.shape[0]:
                 raise ValueError('Cached gradient count does not match requested records')
             return grads
@@ -86,7 +87,7 @@ def get_model_gradients(model: TabPFNClassifier, dist_vec: np.ndarray, X: np.nda
                 gradients.append(batch_grad.detach().cpu().numpy())
     finally:
         model_decode_layer.to(original_device)
-    
+
     if use_cache:
         Path(gradients_file).parent.mkdir(parents=True, exist_ok=True)
         with open(gradients_file, 'wb') as f:
@@ -102,7 +103,7 @@ def get_tcav_scores(cavs: list[dict], grads: np.ndarray) -> dict[int, float]:
     for cav in cavs:
         idx, v = cav['Factor'], cav['CAV']
         scores[idx] = calculate_tcav_score(v, grads)
-    
+
     return scores
 
 
@@ -166,17 +167,22 @@ def extract_rule_conditions(path: str):
             continue
         thresh = float(thresh.strip())
         conds_list.append((feat.strip(), op, thresh))
-    
+
     # print(conds_list)
-        
+
     return conds_list
 
 def get_rule_mask(X_df: pd.DataFrame, conditions: list[Any], feature_cols: list[str]) -> np.ndarray:
     mask = np.ones(X_df.shape[0], dtype=bool)
 
+
     for cond in conditions:
         feat, op, thresh = cond
         # feat_idx = feature_cols.index(feat)
+        if feat not in X_df.columns:
+            for col in X_df.columns:
+                if feat in col:
+                    feat = col
         values = X_df[feat].values
         if op == '>':
             mask = mask & (values > thresh)
@@ -186,10 +192,10 @@ def get_rule_mask(X_df: pd.DataFrame, conditions: list[Any], feature_cols: list[
             mask = mask & (values < thresh)
         elif op == '<=':
             mask = mask & (values <= thresh)
-    
+
     return mask
 
-def train_cavs_from_rules(rules_per_percentile: dict[str, Any], X_cav_train_df: pd.DataFrame, 
+def train_cavs_from_rules(rules_per_percentile: dict[str, Any], X_cav_train_df: pd.DataFrame,
                           cav_train_emb: np.ndarray, cav_train_emb_encoded: np.ndarray, y_cav_train: np.ndarray,
                           feature_cols: list[str], emb_scaler: StandardScaler,
                            high_quantile: float=0.5, min_pos_samples: int=50, random_state: int=42) -> dict[Any, Any]:
@@ -208,7 +214,7 @@ def train_cavs_from_rules(rules_per_percentile: dict[str, Any], X_cav_train_df: 
 
         conds = extract_rule_conditions(path)
         mask = get_rule_mask(X_cav_train_df, conds, feature_cols)
-        
+
         # pacientes que seguem a regra
         true_idx = np.where(mask == True)[0]
 
@@ -230,15 +236,15 @@ def train_cavs_from_rules(rules_per_percentile: dict[str, Any], X_cav_train_df: 
         # o "alvo", quantidade ideal de negativos, é igual à de positivos (balanceamento de classes)
         n_neg_target = len(true_idx)
 
-        
+
         # se possível, pegamops um número equivalente de amostras negativas
         if len(idx_neg_low) >= n_neg_target:
             idx_negative = rng.choice(idx_neg_low, size=n_neg_target, replace=False)
-        
+
         # caso contrário, havendo o mínimo necessário, pegamos todas
         elif len(idx_neg_low) >= min_pos_samples:
             idx_negative = idx_neg_low
-        
+
         # se nem o mínimo puder ser alcançado, desista
         else:
             continue
@@ -248,20 +254,20 @@ def train_cavs_from_rules(rules_per_percentile: dict[str, Any], X_cav_train_df: 
         # cria os vetores combinados de entrada e pred para a regressão
         X = np.vstack([cav_train_emb[idx_positive], cav_train_emb[idx_negative]])
         y = np.hstack([np.ones(len(idx_positive)), np.zeros(len(idx_negative))])
-        
+
         # treina a regressão com os dados balanceados (simula fronteira que separa entradas que seguem e não seguem a regra)
         # essencialemente, ela aprende como as regras criadas a partir dos conceitos esparsos aparecem nos embeddings originais do modelo
         clf = LogisticRegression(C=0.1, solver='liblinear',penalty='l2', class_weight='balanced',
                                  max_iter=1000, random_state=random_state)
         clf.fit(X, y)
-        
+
         # o vetor com coeficientes desta regressão, então, aponta para onde essa regra aumenta
         # essa direção é depois comparada com os gradientes do modelo
         cav = clf.coef_[0]
         nrm = np.linalg.norm(cav)
         if (nrm) > 0:
             cav /= nrm
-        
+
         cav_list.append(cav)
         cav_dict[factor] = {
             'Factor': factor,
@@ -272,7 +278,7 @@ def train_cavs_from_rules(rules_per_percentile: dict[str, Any], X_cav_train_df: 
             'negative_idx': idx_negative,
             'Rule': path
         }
-    
+
     return cav_dict
 
 def train_cav_from_subset(embs: np.ndarray, idx_pos: np.ndarray, idx_neg: np.ndarray,
@@ -287,7 +293,7 @@ def train_cav_from_subset(embs: np.ndarray, idx_pos: np.ndarray, idx_neg: np.nda
     n_target_neg = len(idx_pos_sample)
     if n_neg == 0:
         return None
-    
+
     idx_neg_sample = rng.choice(idx_neg, size=min(n_target_neg, n_neg), replace=False)
     emb_pos = embs[idx_pos_sample]
     y_pos = np.ones(len(idx_pos_sample))
@@ -305,7 +311,7 @@ def train_cav_from_subset(embs: np.ndarray, idx_pos: np.ndarray, idx_neg: np.nda
     nrm = np.linalg.norm(v)
     if nrm > 0:
         v /= nrm
-    
+
     return v
 
 def generate_random_cav(embs: np.ndarray, scaler_emb: StandardScaler, n_samples: int, rng_seed: int=42) -> np.ndarray:
@@ -336,13 +342,13 @@ def generate_random_cav(embs: np.ndarray, scaler_emb: StandardScaler, n_samples:
     nrm = np.linalg.norm(v)
     if nrm > 0:
         v /= nrm
-    
+
     return v
 
 def robust_tcav_significance_test(concept_idx: int, embs: np.ndarray, idx_pos: np.ndarray,
                                   idx_neg: np.ndarray, model_grads: np.ndarray, scaler_emb: StandardScaler,
                                   n_runs: int=15, sample_fraction: float =1.0, rng_seed: int=42) -> dict[str, Any]:
-    
+
     # testes com dados negativos (que não obedecem à regra) aleatórios,
     # em vez de selecionar os que mais se distanciam da outra classe
 
@@ -366,7 +372,7 @@ def robust_tcav_significance_test(concept_idx: int, embs: np.ndarray, idx_pos: n
 
     random_cavs = []
     random_scores = []
-    
+
     n_random_samples = max(20, min(len(idx_pos), len(idx_neg)) // 2)
     for i in range(n_runs):
         seed = rng_seed + 10000 + i * 100
@@ -383,7 +389,7 @@ def robust_tcav_significance_test(concept_idx: int, embs: np.ndarray, idx_pos: n
 
         score = calculate_tcav_score(cav=new_cav, model_gradients=model_grads)
         random_scores.append(score)
-    
+
     concept_tcav_scores = np.asarray(concept_tcav_scores)
     random_scores = np.asarray(random_scores)
 
@@ -402,7 +408,7 @@ def robust_tcav_significance_test(concept_idx: int, embs: np.ndarray, idx_pos: n
                     ) / (len(concept_tcav_scores) + len(random_scores) - 2)
                 )
     d = (np.mean(concept_tcav_scores) - np.mean(random_scores)) / (pooled_std_dev + 1e-10)
-    
+
 
     return {
         'Factor': concept_idx,
@@ -415,7 +421,7 @@ def robust_tcav_significance_test(concept_idx: int, embs: np.ndarray, idx_pos: n
         'is_significant': (not np.isnan(p_value) or p_value < 0.05),
         'cohens_d': d
     }
-    
+
 def compute_feature_associations(concept_activations: np.ndarray, X_features: np.ndarray, feature_names: list[str], quantile: float=0.1):
     high_thresh = np.quantile(concept_activations, 1.0 - quantile)
     low_thresh = np.quantile(concept_activations, quantile)
@@ -461,7 +467,7 @@ def compute_feature_associations(concept_activations: np.ndarray, X_features: np
                 'n_low': len(low_idx)
             }
         )
-    
+
     df = pd.DataFrame(rows)
     df['significant'] = df['p_value'] < 0.05
     df = df.sort_values('cohens_d', key=lambda s: np.abs(s), ascending=False).reset_index(drop=True)
@@ -479,7 +485,7 @@ def run_feature_association_dual_split(significant_factors: pd.DataFrame, tcav_e
         factor_activations_tcav = tcav_eval_concept_activations[:, factor]
         df_fa_eval, _, _ = compute_feature_associations(concept_activations=factor_activations_tcav, X_features=X_tcav_eval, feature_names=feature_cols, quantile=quantile)
         fa_results_eval[factor] = df_fa_eval
-    
+
         factor_activations_held_out = held_out_concept_activations[:, factor]
         df_fa_held_out, _, _ = compute_feature_associations(concept_activations=factor_activations_held_out, X_features=X_held_out, feature_names=feature_cols, quantile=quantile)
         fa_results_held_out[factor] = df_fa_held_out
@@ -519,10 +525,10 @@ def sparse_readout(concept_activations: np.ndarray, X_features: np.ndarray, feat
 
     cv_scores = cross_val_score(estimator=Lasso(alpha=model.alpha_, max_iter=10000),
                                 X=X_scaled, y=concept_activations, cv=cv, scoring='r2')
-    
+
     r2_cv = float(cv_scores.mean())
     r2_cv_std = float(np.std(cv_scores))
-    
+
     idx = (np.abs(coefs) > 1e-10)
     selected_features = [feature_names[i] for i in idx]
     selected_coefs = coefs[idx]
@@ -615,6 +621,38 @@ def run_sparse_readout_dual_split(significant_factors: pd.DataFrame, cav_train_c
     summary_df = pd.DataFrame(summary_rows).sort_values('concept').reset_index()
     return sparse_readout_results, sparse_readout_validation, summary_df
 
+def get_significant_concepts(cavs: dict[str], tcav_scores: list[float], best_rules: dict[str], grads: np.ndarray, embs: np.ndarray, scaler: StandardScaler):
+    for cav in cavs.values():
+        idx = cav['Factor']
+        cav['TCAV_score'] = tcav_scores[idx]
 
+    for rule in best_rules:
+        idx = rule['Factor']
+        if idx in cavs:
+            prec, rec = rule['Precision'], rule['Recall']
+            cavs[idx]['Precision'] = prec
+            cavs[idx]['Recall'] = rec
 
-        
+    robust_tcav_results = {}
+    for idx, info in cavs.items():
+        robust_result = robust_tcav_significance_test(
+            concept_idx=idx, embs=embs,
+            idx_pos=info['positive_idx'],
+            idx_neg=info['negative_idx'],
+            model_grads=grads, scaler_emb=scaler,
+            sample_fraction=1.0, rng_seed=42
+        )
+        robust_tcav_results[idx] = robust_result
+
+    significant_concepts = {}
+    for idx in cavs:
+        if robust_tcav_results[idx]['is_significant'] and abs(cavs[idx]['TCAV_score'] - 0.5) > 0.1:
+            significant_concepts[idx] = cavs[idx]
+            significant_concepts[idx]['p_value'] = robust_tcav_results[idx]['p_value']
+            significant_concepts[idx]['t_stat'] = robust_tcav_results[idx]['t_stat']
+            significant_concepts[idx]['Precision'] = cavs[idx]['Precision']
+            significant_concepts[idx]['Recall'] = cavs[idx]['Recall']
+
+    significant_df = pd.DataFrame([val for _, val in significant_concepts.items()])
+
+    return significant_concepts, significant_df
