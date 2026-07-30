@@ -213,6 +213,90 @@ def test_tcav_gradient_batch_size_must_be_positive(tmp_path):
         )
 
 
+def test_stable_concepts_uses_year_specific_gradient_cache(monkeypatch, tmp_path):
+    gradient_calls = []
+
+    monkeypatch.setattr(sae_compare, "GRADS_FILE", tmp_path / "grads.pkl")
+    monkeypatch.setattr(
+        sae_compare,
+        "train_binary_trees",
+        lambda *_args, **_kwargs: {10: []},
+    )
+    monkeypatch.setattr(
+        sae_compare,
+        "get_model_gradients",
+        lambda **kwargs: gradient_calls.append(kwargs) or np.zeros((2, 3)),
+    )
+    monkeypatch.setattr(
+        sae_compare,
+        "train_cavs_from_rules",
+        lambda **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        sae_compare,
+        "get_tcav_scores",
+        lambda **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        sae_compare,
+        "get_significant_concepts",
+        lambda **_kwargs: ([], pd.DataFrame()),
+    )
+
+    sae_compare.get_stable_concepts_year(
+        year=2007,
+        X_df_scaled=pd.DataFrame(np.zeros((2, 3))),
+        X_np_scaled=np.zeros((2, 3)),
+        tabpfn=object(),
+        embs=np.zeros((2, 3)),
+        codes=np.zeros((2, 3)),
+        y_np=np.zeros(2),
+        dist_np=np.zeros(2),
+        embs_scaler=object(),
+        feature_cols=["a", "b", "c"],
+    )
+
+    assert len(gradient_calls) == 1
+    assert gradient_calls[0]["cache_file"] == tmp_path / "grads_2007.pkl"
+    assert "year" not in gradient_calls[0]
+
+
+def test_plot_run_results_creates_output_directory(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    full_results = {
+        (1.5, 3, 0.1): {
+            "relevant_pairs_fraction": 0.5,
+            "mean_cos_sim": 0.8,
+            "mean_overlap": 0.4,
+        }
+    }
+    model_results = {
+        (1.5, 0.1): {
+            "mean_mse": 0.01,
+            "mean_sparsity": 0.1,
+            "mean_dead_neurons": 2,
+        }
+    }
+
+    sae_compare.plot_run_results(
+        full_results=full_results,
+        model_results=model_results,
+        hyper_param=0.1,
+        scaling_factors=[1.5],
+        model_n=[3],
+        model_type="ReLU",
+    )
+
+    assert (
+        tmp_path
+        / "stats"
+        / "sae"
+        / "ReLU"
+        / "good_pairs_cos_sim[Alpha=0.1,scale=1.5].png"
+    ).is_file()
+    sae_compare.plt.close("all")
+
+
 def test_train_binary_trees_restricts_factor_ids_and_preserves_ids():
     X = np.concatenate([np.zeros(20), np.ones(20)]).reshape(-1, 1)
     activations = np.zeros((40, 3), dtype=float)

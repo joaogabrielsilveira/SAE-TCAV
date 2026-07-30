@@ -12,6 +12,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.optimize import linear_sum_assignment
 from matplotlib.ticker import PercentFormatter
+from pathlib import Path
 from pickle import dump, load
 from typing import Sequence
 from tabpfn_model import load_or_extract_embeddings, scale_embeddings, temporal_test_subsplits, fit_dr_tabpfn, walkforward_evaluate_tabpfn, TabPFNClassifier, TabPFNEvalConfig, EmbeddingExtractConfig
@@ -430,6 +431,9 @@ def plot_run_results(full_results: dict[tuple[int, int, int]], model_results: di
     elif model_type == 'TopK':
         hyper = 'K'
 
+    plot_dir = Path('stats/sae') / model_type
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
     if len(scaling_factors) == 1:
         rel = []
         cos_sims = []
@@ -487,10 +491,12 @@ def plot_run_results(full_results: dict[tuple[int, int, int]], model_results: di
         )
 
         plt.grid()
-        print(
-            f'Salvando grafico em stats/sae/{model_type}/good_pairs_{pair_criteria}[{hyper}={hyper_param},scale={scaling_factor}].png')
-        plt.savefig(
-            f'stats/sae/{model_type}/good_pairs_{pair_criteria}[{hyper}={hyper_param},scale={scaling_factor}].png', bbox_inches='tight')
+        plot_path = plot_dir / (
+            f'good_pairs_{pair_criteria}'
+            f'[{hyper}={hyper_param},scale={scaling_factor}].png'
+        )
+        print(f'Salvando grafico em {plot_path}')
+        plt.savefig(plot_path, bbox_inches='tight')
 
     else:
         rel = {s: [] for s in scaling_factors}
@@ -553,8 +559,11 @@ def plot_run_results(full_results: dict[tuple[int, int, int]], model_results: di
             f'Relevant pairs (by {pair_criteria}) fraction  x number of SAE models trained\n{hyper} = {hyper_param}, Scaling factors = {[s for s in scaling_factors]}')
         plt.grid()
         plt.legend(loc='best')
-        plt.savefig(
-            f'stats/sae/{model_type}/good_pairs_{pair_criteria}[{hyper}={hyper_param}].png', bbox_inches='tight')
+        plot_path = plot_dir / (
+            f'good_pairs_{pair_criteria}[{hyper}={hyper_param}].png'
+        )
+        print(f'Salvando grafico em {plot_path}')
+        plt.savefig(plot_path, bbox_inches='tight')
 
 
 def run_random_comparison_year_differences(model_nums: list[int], hyper_param: int | float, scaling_factor: float, pair_criteria: str = 'cos_sim', relevant_pair_threshold: float = 0.7, model_type: str = 'ReLU',
@@ -1258,8 +1267,16 @@ def get_stable_concepts_year(year: int, X_df_scaled: pd.DataFrame, X_np_scaled: 
     rules_df = pd.DataFrame(tree_rules[best_p])
     high_quantile = 1.0 - (best_p / 100.0)
 
+    gradients_path = Path(GRADS_FILE)
+    year_gradients_path = gradients_path.with_name(
+        f'{gradients_path.stem}_{year}{gradients_path.suffix}'
+    )
     grads = get_model_gradients(
-        model=tabpfn, X=X_np_scaled, dist_vec=dist_np, year=year)
+        model=tabpfn,
+        X=X_np_scaled,
+        dist_vec=dist_np,
+        cache_file=year_gradients_path,
+    )
     cavs = train_cavs_from_rules(rules_per_percentile=tree_rules[best_p], X_cav_train_df=X_df_scaled, cav_train_emb=embs,
                                  cav_train_emb_encoded=codes, y_cav_train=y_np,
                                  feature_cols=feature_cols, emb_scaler=embs_scaler, high_quantile=high_quantile, min_pos_samples=50, random_state=42)
