@@ -14,13 +14,16 @@ from filepaths import get_env_path
 from pickle import dump, load
 import os
 import pandas as pd
+from pathlib import Path
 from tabpfn import TabPFNClassifier
 from results import cid10_dict, translate_event_name, events_dict, tcav_result_df_from_concepts, translate_event_names
 import matplotlib.pyplot as plt
 
 PREPARED_DB_PATH = get_env_path('data/renal/prep.pkl')
+CONCEPT_STATS_DIR = Path('stats/concepts')
 
 if __name__ == '__main__':
+    CONCEPT_STATS_DIR.mkdir(parents=True, exist_ok=True)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     df = open_feather(RENAL_DB_PATH)
     if not os.path.exists(PREPARED_DB_PATH):
@@ -263,7 +266,7 @@ if __name__ == '__main__':
     original_survivors = first_pairing_survivors['original_concept'].tolist()
     pairs = first_pairing_survivors['best_pair'].tolist()
 
-    with open(f'stats/concepts/surviving_concepts_{model_type}_sae.pkl', 'wb') as out:
+    with open(CONCEPT_STATS_DIR / f'surviving_concepts_{model_type}_sae.pkl', 'wb') as out:
         dump(surviving_concepts, out)
     if model_type == 'ReLU':
         for alpha in alphas:
@@ -346,13 +349,13 @@ if __name__ == '__main__':
     rules_paired_df['original_rule'] = [translate_event_names(full_text=rule, cid_dict=cid) for rule in rules_paired_df['original_rule']]
     rules_paired_df['pair_rule'] = [translate_event_names(full_text=rule, cid_dict=cid) for rule in rules_paired_df['pair_rule']]
 
-    with open(f'stats/concepts/paired_rules_{model_type}_sae.pkl', 'wb') as out:
+    with open(CONCEPT_STATS_DIR / f'paired_rules_{model_type}_sae.pkl', 'wb') as out:
         dump(rules_paired_df, out)
     print(rules_paired_df)
 
     forced_rules_df = pd.DataFrame(forced_rules)
 
-    with open(f'stats/concepts/forced_rules_{model_type}_sae.pkl', 'wb') as out:
+    with open(CONCEPT_STATS_DIR / f'forced_rules_{model_type}_sae.pkl', 'wb') as out:
         dump(forced_rules_df, out)
 
     all_rules_df = pd.concat([rules_df, forced_rules_df])
@@ -376,7 +379,7 @@ if __name__ == '__main__':
 
     significant_concepts, significant_df = get_significant_concepts(
         cavs=cavs, tcav_scores=tcav_scores, best_rules=tree_rules[best_p],
-        grads=grads, scaler=scaler_emb
+        grads=grads, embs=embeddings_cav_training, scaler=scaler_emb
     )
 
     significant_concepts = pd.merge(
@@ -398,7 +401,7 @@ if __name__ == '__main__':
         print()
     
     graph_columns = ['Factor', 'Precision', 'Recall', 'TCAV_score', 'survival_rate', 'mean_cos_sim', 'mean_overlap', 'translated_rule']
-    with open(f'stats/concepts/significant_factors_{model_type}_sae.pkl', 'wb') as out:
+    with open(CONCEPT_STATS_DIR / f'significant_factors_{model_type}_sae.pkl', 'wb') as out:
         dump(significant_concepts[graph_columns], out)
     
     num_latents = int(192 * max(scaling_factors))
