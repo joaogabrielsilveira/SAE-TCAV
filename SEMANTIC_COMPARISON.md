@@ -8,7 +8,7 @@ Existing behavior remains authoritative for CAV construction:
 
 - `decision_tree.train_binary_trees` produces the precision-constrained primary single rule; `decision_tree.get_rules_forced` preserves the existing fallback path.
 - `tcav.train_cavs_from_rules` uses those rules to choose clean positive examples, then learns CAVs in TabPFN embedding space.
-- `sae_compare.get_concepts_matching` continues one-to-one Hungarian matching by decoder-direction cosine or high-activation cohort overlap.
+- The configured selector continues one-to-one Hungarian matching by decoder-direction cosine or high-activation cohort overlap. Independent robustness artifacts never expand or replace selected pairs.
 - Existing `main.py` execution and legacy files remain unchanged. Semantic experiments write to a separate namespace.
 
 Semantic rule sets serve cross-run description and transfer only. They are recall-oriented OR-of-ANDs models and must not feed `train_cavs_from_rules`. Keeping both paths separate avoids contaminating CAV positives with broader, lower-precision semantic coverage.
@@ -81,13 +81,16 @@ builds patient-year count rows and derives the binary `DEATH` outcome.
 The default complete run:
 
 1. Prepares the renal train/test rows and fits Drift-Resilient TabPFN.
-2. Evaluates TabPFN by test year and extracts aligned train/test embeddings.
+2. Evaluates TabPFN by test year and extracts aligned train/test embeddings. A
+   `StandardScaler` is fitted only on raw test embeddings in `semantic_fit`,
+   then frozen and applied to all train/test embeddings.
 3. Makes one patient-grouped four-way split of test records.
 4. Trains one SAE per configured seed on `semantic_fit` (the example uses
    seeds `42` and `135`).
 5. Re-encodes every test record through every frozen SAE.
-6. Performs one-to-one Hungarian matching and keeps pairs with cosine at least
-   `0.7`.
+6. Computes cosine and 70/80/90-percentile overlap robustness analyses for all
+   run pairs, then independently applies the configured Hungarian selector
+   (cosine at least `0.60` in the example).
 7. Learns the existing precision-first single rule for each selected factor,
    constructs CAVs on `semantic_select`, and evaluates TCAV on `tcav_eval`.
 8. Learns recurrent recall-oriented semantic rule sets and evaluates pooled
@@ -162,10 +165,6 @@ python main-comparison.py --force-stage sae --data tidy_event_data.feather
 python main-comparison.py --force-stage functional --force-stage semantic \
   --data tidy_event_data.feather
 
-# Include every Hungarian assignment, regardless of cosine. This can be very
-# expensive with the standard bootstrap configuration.
-python main-comparison.py --all-pairs --data tidy_event_data.feather
-
 # Run geometry and stable semantic rules without rebuilding CAV/TCAV.
 python main-comparison.py --skip-functional --data tidy_event_data.feather
 ```
@@ -181,10 +180,14 @@ The runner creates a content-addressed directory below
 
 - `summary.json` and `runner_manifest.json`;
 - `cache_refs.json`, identifying every shared stage artifact used by the run;
-- `prepared.pkl`, `embeddings.npz`, `activations.npz`, and `sae/run_<id>.pt`;
+- `prepared.pkl`, `embeddings.npz`, `embedding_scaler.pkl`, scaler provenance,
+  `activations.npz`, `high_activation_profiles.npz`, and `sae/run_<id>.pt`;
 - `splits.npz` and `semantic_inputs.npz`, preserving aligned records for audit
   or lower-level reruns;
 - `matches_all.{json,csv}` and `matched_factors.{json,csv}`;
+- `matching/manifest.json`, per-pair matrices, fixed cosine-Hungarian matches,
+  percentile-specific overlap-Hungarian matches, directed nearest-neighbor
+  candidates, and matching diagnostics in JSON/CSV;
 - `high_precision_rules.jsonl`, `functional.json`,
   `functional_cavs.npz`, and scoped decision-tree/gradient artifacts;
 - `semantic/<experiment_hash>/`, containing all semantic artifacts documented
@@ -207,7 +210,8 @@ Important examples:
 
 - adding an SAE seed reuses prepared data, splits, TabPFN, embeddings, existing
   SAE models/activations, and existing SAE-pair matchings;
-- changing matching score limits reuses raw Hungarian matchings;
+- changing matching score thresholds or alternative deltas reuses raw matrices,
+  assignments, and rankings;
 - changing semantic objectives reuses randomized-tree bootstraps and rule
   families, then reruns constrained selection;
 - increasing semantic bootstraps computes only new bootstrap IDs;
@@ -260,6 +264,60 @@ python -m comparison_cache prune --root stats/comparison/_cache/v2 \
 Cache payloads include pickle/Torch files and are trusted-local artifacts.
 Never load a cache copied from an untrusted source.
 
+### Multi-percentile matching robustness
+
+`matching.criterion` and `max_pairs_per_run_pair` control only `matches_all` and
+`matched_factors`; functional and semantic stages receive only
+`matched_factors`. `minimum_score` no longer exists. Cosine selection uses
+`cosine_analysis_threshold`; overlap selection uses
+`overlap_analysis_threshold`.
+
+For overlap selection, the runner computes a separate Hungarian assignment at
+every `analysis_percentiles` value, applies the overlap threshold to each, then
+keeps the percentile with the most qualifying factors and that percentile's
+assignment. Ties choose the highest percentile, preserving deterministic,
+conservative behavior. `matches_all` records that complete assignment;
+`matched_factors` records its threshold-qualified rows. For cosine selection,
+the cosine-Hungarian assignment is filtered by the cosine threshold; its legacy
+`overlap` annotation uses the percentile with the most threshold-qualified
+overlaps on those fixed pairs, again breaking ties toward the highest value.
+
+Robustness analysis is unfiltered. For each unordered run pair it stores one
+decoder-direction cosine matrix and one activation-cohort Jaccard matrix per
+configured percentile. Activation cutoffs use strictly positive
+`semantic_select` activations only; masks use strict `activation > cutoff`, and
+dead factors have infinite cutoffs plus all-false masks. Cosine-Hungarian is
+fixed while overlaps at 70, 80, and 90 are attached to its pairs. Separate
+overlap-Hungarian assignments are also computed for every percentile.
+
+Directed nearest neighbors rank by descending score, then ascending target
+factor ID. Threshold equality passes: cosine `>= 0.60`, overlap `>= 0.70` by
+default. Rank two or three is an alternative at delta `d` when it passes its
+metric threshold and `best_score - candidate_score <= d`. Diagnostics retain
+raw and threshold-qualified reciprocity/collision fields plus
+`nearest_minus_hungarian`. Rectangular matrices are supported; unassigned
+factors remain missing and fail recurrence comparisons.
+
+`robustness_analysis.ipynb` requires `matching.scope="all"`, exact `R choose 2`
+coverage, valid matrix fingerprints, and score/matrix equality. For each factor,
+recurrence denominator is always `R-1`; missing assignments count as failures.
+Primary overlap recurrence evaluates each percentile on fixed cosine-Hungarian
+pairs. Cross-percentile consistency passes a target run when at least two of
+three overlaps pass. Secondary overlap recurrence uses that percentile's own
+Hungarian assignment. Highlighting is strict: `recurrence > 0.50`. These labels
+remain distinct from the notebook's existing semantic `robust` subset.
+
+Matrix storage is quadratic in run count: `R(R-1)/2` bundles. For `F` factors
+per run and `P` overlap percentiles, dense storage is approximately
+`R(R-1)/2 * (P+1) * F^2 * bytes_per_score` before NPZ compression.
+
+`matching/manifest.json` records thresholds, percentiles, shape/row metadata,
+file names, and fingerprints. `cosine_hungarian_matches`,
+`overlap_hungarian_matches`, `nearest_neighbor_candidates`, and
+`matching_diagnostics` each have JSON and CSV forms. Notebook exports add
+primary/secondary recurrence, highlights, nearest-neighbor summaries,
+collisions, ambiguities, and comparison plots.
+
 ## Implemented modules
 
 ### `comparison_cache.py`
@@ -267,6 +325,21 @@ Never load a cache copied from an untrusted source.
 Provides shared stage resolution through one deep interface. It owns
 content-derived keys, POSIX locks, atomic publication, checksums, quarantine,
 hit/miss/force reporting, `cache_refs.json`, inspection, and explicit pruning.
+
+### `robustness_matching.py`
+
+Provides one pure interface, `analyze_run_pair`, owning cosine/Jaccard matrices,
+cosine and per-percentile overlap Hungarian assignments, deterministic directed
+top-k rankings, reciprocal/collision diagnostics, rectangular assignments, and
+nearest-neighbor/Hungarian gaps. Policy thresholds are deliberately applied by
+the runner after cached raw analysis loads.
+
+### `robustness_recurrence.py`
+
+Strictly validates the complete matching bundle and matrix-indexed scores,
+computes primary fixed-cosine and secondary overlap recurrence in both pair
+orientations, treats missing assignments as failures, and writes notebook
+tables plus recurrence/nearest-neighbor diagnostic plots.
 
 ### `semantic_rules.py`
 

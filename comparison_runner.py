@@ -31,7 +31,8 @@ class AcceleratorRunnerConfig:
 
     def __post_init__(self) -> None:
         if self.device not in {"auto", "cpu", "cuda"}:
-            raise ValueError("accelerator.device must be 'auto', 'cpu', or 'cuda'")
+            raise ValueError(
+                "accelerator.device must be 'auto', 'cpu', or 'cuda'")
 
 
 @dataclass(frozen=True)
@@ -63,9 +64,11 @@ class SAERunnerConfig:
     encoding_batch_size: int = 4096
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "seeds", tuple(int(seed) for seed in self.seeds))
+        object.__setattr__(self, "seeds", tuple(int(seed)
+                           for seed in self.seeds))
         if len(self.seeds) < 2 or len(set(self.seeds)) != len(self.seeds):
-            raise ValueError("sae.seeds must contain at least two unique values")
+            raise ValueError(
+                "sae.seeds must contain at least two unique values")
         if self.model_type not in {"ReLU", "TopK"}:
             raise ValueError("sae.model_type must be 'ReLU' or 'TopK'")
         if self.epochs < 1:
@@ -75,28 +78,69 @@ class SAERunnerConfig:
         if self.learning_rate <= 0 or self.weight_decay < 0:
             raise ValueError("sae optimizer values are invalid")
         if self.k < 1 or self.k_aux < 1 or self.encoding_batch_size < 1:
-            raise ValueError("sae k and encoding batch values must be positive")
+            raise ValueError(
+                "sae k and encoding batch values must be positive")
 
 
 @dataclass(frozen=True)
 class MatchingRunnerConfig:
     scope: str = "all"
     criterion: str = "cos_sim"
-    minimum_score: float | None = 0.70
     max_pairs_per_run_pair: int | None = None
+    analysis_percentiles: tuple[int, ...] = (70, 80, 90)
+    cosine_analysis_threshold: float = 0.60
+    overlap_analysis_threshold: float = 0.70
+    nearest_neighbor_top_k: int = 3
+    alternative_score_deltas: tuple[float, ...] = (0.05, 0.10)
 
     def __post_init__(self) -> None:
+        raw_percentiles = tuple(self.analysis_percentiles)
+        percentiles = tuple(int(value) for value in raw_percentiles)
+        deltas = tuple(float(value) for value in self.alternative_score_deltas)
+        object.__setattr__(self, "analysis_percentiles", percentiles)
+        object.__setattr__(self, "alternative_score_deltas", deltas)
         if self.scope not in {"all", "baseline"}:
             raise ValueError("matching.scope must be 'all' or 'baseline'")
         if self.criterion not in {"cos_sim", "overlap"}:
-            raise ValueError("matching.criterion must be 'cos_sim' or 'overlap'")
-        if self.minimum_score is not None and not -1 <= self.minimum_score <= 1:
-            raise ValueError("matching.minimum_score must be null or lie in [-1, 1]")
+            raise ValueError(
+                "matching.criterion must be 'cos_sim' or 'overlap'")
         if (
             self.max_pairs_per_run_pair is not None
             and self.max_pairs_per_run_pair < 1
         ):
-            raise ValueError("matching.max_pairs_per_run_pair must be positive")
+            raise ValueError(
+                "matching.max_pairs_per_run_pair must be positive")
+        if (
+            not percentiles
+            or any(
+                isinstance(value, bool) or float(value) != int(value)
+                for value in raw_percentiles
+            )
+            or percentiles != tuple(sorted(set(percentiles)))
+            or any(not 0 <= value <= 100 for value in percentiles)
+        ):
+            raise ValueError(
+                "matching.analysis_percentiles must be ordered, unique, and lie in [0, 100]"
+            )
+        if not -1 <= self.cosine_analysis_threshold <= 1:
+            raise ValueError(
+                "matching.cosine_analysis_threshold must lie in [-1, 1]"
+            )
+        if not 0 <= self.overlap_analysis_threshold <= 1:
+            raise ValueError(
+                "matching.overlap_analysis_threshold must lie in [0, 1]"
+            )
+        if self.nearest_neighbor_top_k < 1:
+            raise ValueError(
+                "matching.nearest_neighbor_top_k must be positive")
+        if (
+            not deltas
+            or deltas != tuple(sorted(set(deltas)))
+            or any(not 0 < value <= 2 for value in deltas)
+        ):
+            raise ValueError(
+                "matching.alternative_score_deltas must be ordered, unique, and lie in (0, 2]"
+            )
 
 
 @dataclass(frozen=True)
@@ -138,12 +182,15 @@ class ComparisonRunnerConfig:
     )
     tabpfn: TabPFNRunnerConfig = field(default_factory=TabPFNRunnerConfig)
     sae: SAERunnerConfig = field(default_factory=SAERunnerConfig)
-    matching: MatchingRunnerConfig = field(default_factory=MatchingRunnerConfig)
-    functional: FunctionalRunnerConfig = field(default_factory=FunctionalRunnerConfig)
+    matching: MatchingRunnerConfig = field(
+        default_factory=MatchingRunnerConfig)
+    functional: FunctionalRunnerConfig = field(
+        default_factory=FunctionalRunnerConfig)
 
     def __post_init__(self) -> None:
         if not self.dataset_path or not self.semantic_config_path or not self.artifact_dir:
-            raise ValueError("dataset, semantic config, and artifact paths are required")
+            raise ValueError(
+                "dataset, semantic config, and artifact paths are required")
         if not isinstance(self.use_cache, bool) or not isinstance(
             self.show_progress, bool
         ):
@@ -177,7 +224,8 @@ class ComparisonRunnerConfig:
         }
         unknown = set(raw) - known
         if unknown:
-            raise ValueError(f"Unknown comparison config fields: {sorted(unknown)}")
+            raise ValueError(
+                f"Unknown comparison config fields: {sorted(unknown)}")
         return cls(
             dataset_path=str(raw.get("dataset_path", cls.dataset_path)),
             semantic_config_path=str(
@@ -241,6 +289,10 @@ def _nested_config(config_type, raw: Any, name: str):
     values = dict(raw)
     if config_type is SAERunnerConfig and "seeds" in values:
         values["seeds"] = tuple(values["seeds"])
+    if config_type is MatchingRunnerConfig:
+        for field_name in ("analysis_percentiles", "alternative_score_deltas"):
+            if field_name in values:
+                values[field_name] = tuple(values[field_name])
     return config_type(**values)
 
 
@@ -293,7 +345,7 @@ class _EmbeddingData:
             processed = getattr(self.model, "model_processed_", None)
             decoder_dict = getattr(processed, "decoder_dict", None)
             if (
-                not isinstance(decoder_dict, Mapping)
+                decoder_dict is None
                 or "standard" not in decoder_dict
             ):
                 raise ValueError(
@@ -330,7 +382,8 @@ class DefaultComparisonAdapter:
 
         dataset_path = Path(config.dataset_path)
         if not dataset_path.is_file():
-            raise FileNotFoundError(f"Renal Feather file not found: {dataset_path}")
+            raise FileNotFoundError(
+                f"Renal Feather file not found: {dataset_path}")
         preparation_config = TabPFNPrepConfig()
         preparation_config.rng_seed = config.seed
 
@@ -343,12 +396,14 @@ class DefaultComparisonAdapter:
                     f"Renal Feather missing columns: {sorted(missing)}"
                 )
             if not frame["event"].astype(str).eq("DEATH").any():
-                raise ValueError("Renal Feather must contain an exact 'DEATH' event")
+                raise ValueError(
+                    "Renal Feather must contain an exact 'DEATH' event")
             prepared_rows = prepare_database(frame, cfg=preparation_config)
             arrays = get_tabpfn_arrays(prepared_rows)
             train_rows = prepared_rows["train_rows"].reset_index(drop=True)
             test_rows = prepared_rows["test_rows"].reset_index(drop=True)
-            features = tuple(str(name) for name in prepared_rows["top_k_events"])
+            features = tuple(str(name)
+                             for name in prepared_rows["top_k_events"])
             patient_ids = test_rows["patient_id"].astype(str).to_numpy()
             years_test = np.asarray(arrays["years_test"], dtype=int)
             record_keys = np.asarray(
@@ -399,7 +454,8 @@ class DefaultComparisonAdapter:
                     ),
                 },
                 source_fingerprint=_source_files_fingerprint("database.py"),
-                load=lambda directory: _pickle_load(directory / "prepared.pkl"),
+                load=lambda directory: _pickle_load(
+                    directory / "prepared.pkl"),
                 compute=compute,
                 store=lambda directory, value: _pickle_dump(
                     directory / "prepared.pkl", value
@@ -416,6 +472,7 @@ class DefaultComparisonAdapter:
     def embeddings(
         self,
         prepared: _PreparedData,
+        splits: Mapping[str, np.ndarray],
         config: ComparisonRunnerConfig,
         workspace: Path,
         *,
@@ -431,7 +488,6 @@ class DefaultComparisonAdapter:
             flatten_embeddings,
             infer_model_additional_x_info,
             make_dist_tensor,
-            scale_embeddings,
             walkforward_evaluate_tabpfn,
         )
 
@@ -478,7 +534,9 @@ class DefaultComparisonAdapter:
             ensure_test_feature_columns,
             make_dist_tensor,
         )
-        scaling_source = _callable_source_fingerprint(scale_embeddings)
+        scaling_source = _callable_source_fingerprint(
+            _scale_embeddings_from_semantic_fit
+        )
         model_identity = stable_hash(
             model_dependencies,
             fit_source,
@@ -583,7 +641,8 @@ class DefaultComparisonAdapter:
                 load=_load_embedding_pair,
                 compute=compute_raw,
                 store=_store_embedding_pair,
-                validate=lambda value: _validate_embedding_pair(value, prepared),
+                validate=lambda value: _validate_embedding_pair(
+                    value, prepared),
                 fingerprint=lambda value: {
                     "train_raw": array_fingerprint(value[0]),
                     "test_raw": array_fingerprint(value[1]),
@@ -620,7 +679,8 @@ class DefaultComparisonAdapter:
                         "model": model_dependencies,
                         "test_rows": array_fingerprint(
                             prepared.test_rows[
-                                list(prepared.feature_names) + ["DEATH", "year"]
+                                list(prepared.feature_names) +
+                                ["DEATH", "year"]
                             ].to_numpy()
                         ),
                         "record_keys": array_fingerprint(
@@ -645,9 +705,20 @@ class DefaultComparisonAdapter:
                 )
                 walkforward_metrics = walk_result.value
 
+        fit_indices = np.asarray(splits["idx_semantic_fit"], dtype=int)
+        if (
+            fit_indices.ndim != 1
+            or len(fit_indices) == 0
+            or np.any(fit_indices < 0)
+            or np.any(fit_indices >= len(test_raw))
+            or len(np.unique(fit_indices)) != len(fit_indices)
+        ):
+            raise ValueError(
+                "idx_semantic_fit must contain unique test row indices")
+
         def compute_scaled():
-            return scale_embeddings(
-                np.asarray(train_raw), np.asarray(test_raw), fit_test=False
+            return _scale_embeddings_from_semantic_fit(
+                np.asarray(train_raw), np.asarray(test_raw), fit_indices
             )
 
         if self.cache is None:
@@ -659,7 +730,8 @@ class DefaultComparisonAdapter:
                 dependencies={
                     "train_raw": array_fingerprint(train_raw),
                     "test_raw": array_fingerprint(test_raw),
-                    "fit_test": False,
+                    "fit_split": "idx_semantic_fit",
+                    "fit_indices": array_fingerprint(fit_indices),
                     "sklearn": _package_versions("sklearn"),
                 },
                 source_fingerprint=scaling_source,
@@ -672,20 +744,41 @@ class DefaultComparisonAdapter:
                 fingerprint=lambda value: {
                     "train_scaled": array_fingerprint(value[0]),
                     "test_scaled": array_fingerprint(value[1]),
+                    "scaler_mean": array_fingerprint(
+                        np.asarray(value[2].mean_)
+                    ),
+                    "scaler_scale": array_fingerprint(
+                        np.asarray(value[2].scale_)
+                    ),
                 },
+                stage_schema_version=2,
             )
             train_scaled, test_scaled, scaler = scaled_result.value
 
         if len(train_scaled) != len(prepared.X_train) or len(test_scaled) != len(
             prepared.X_test
         ):
-            raise ValueError("TabPFN embedding rows do not align with prepared data")
+            raise ValueError(
+                "TabPFN embedding rows do not align with prepared data")
         if not np.isfinite(train_scaled).all() or not np.isfinite(test_scaled).all():
             raise ValueError("TabPFN embeddings contain non-finite values")
         np.savez_compressed(
             workspace / "embeddings.npz",
             train_raw=train_raw,
             test_raw=test_raw,
+            train_scaled=train_scaled,
+            test_scaled=test_scaled,
+        )
+        scaler_provenance = {
+            "fit_split": "idx_semantic_fit",
+            "fit_row_count": int(len(fit_indices)),
+            "fit_indices_fingerprint": array_fingerprint(fit_indices),
+            "mean_fingerprint": array_fingerprint(np.asarray(scaler.mean_)),
+            "scale_fingerprint": array_fingerprint(np.asarray(scaler.scale_)),
+        }
+        _pickle_dump(workspace / "embedding_scaler.pkl", scaler)
+        _write_json(
+            workspace / "embedding_scaler_provenance.json", scaler_provenance
         )
         _write_json(workspace / "tabpfn_metrics.json", walkforward_metrics)
         fit = fit_holder.get("fit")
@@ -724,7 +817,7 @@ class DefaultComparisonAdapter:
         import torch
 
         from sae import SAE, train_sae_model
-        from sae_compare import encode_sae, high_activation_matrix, train_all_saes
+        from sae_compare import encode_sae, high_activation_profiles, train_all_saes
 
         fit_indices = splits["idx_semantic_fit"]
         matching_indices = splits["idx_semantic_select"]
@@ -856,9 +949,14 @@ class DefaultComparisonAdapter:
             run["run_id"] = f"sae_{run_index}"
             run["seed"] = int(seed)
             run["encoded_embs"] = np.asarray(activation_matrix[fit_indices])
-            run["high_activation_matrix"] = high_activation_matrix(
-                np.asarray(activation_matrix[matching_indices]), perc=90
+            profiles = high_activation_profiles(
+                np.asarray(activation_matrix[matching_indices]),
+                config.matching.analysis_percentiles,
             )
+            run["high_activation_profiles"] = profiles
+            run["high_activation_matrix"] = profiles[
+                max(config.matching.analysis_percentiles)
+            ]["masks"]
             runs.append(run)
             activations[run_index] = np.asarray(activation_matrix)
 
@@ -867,10 +965,20 @@ class DefaultComparisonAdapter:
         state_dir = workspace / "sae"
         state_dir.mkdir(parents=True, exist_ok=True)
         for run in runs:
-            torch.save(run["model"].state_dict(), state_dir / f"run_{run['idx']}.pt")
+            torch.save(run["model"].state_dict(),
+                       state_dir / f"run_{run['idx']}.pt")
         np.savez_compressed(
             workspace / "activations.npz",
             **{f"run_{run_id}": matrix for run_id, matrix in activations.items()},
+        )
+        np.savez_compressed(
+            workspace / "high_activation_profiles.npz",
+            **{
+                f"run_{int(run['idx'])}_p{percentile}_{name}": np.asarray(value)
+                for run in runs
+                for percentile, profile in run["high_activation_profiles"].items()
+                for name, value in profile.items()
+            },
         )
         _write_json(
             workspace / "sae_manifest.json",
@@ -895,22 +1003,19 @@ class DefaultComparisonAdapter:
         config: ComparisonRunnerConfig,
         workspace: Path,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        from sae_compare import (
-            cosine_similarity_matrix,
-            get_concepts_matching,
-            get_overlap,
-            overlap_matrix,
-        )
+        from robustness_matching import analyze_run_pair, validate_analysis
 
         all_matches: list[dict[str, Any]] = []
         selected: list[dict[str, Any]] = []
+        cosine_rows: list[dict[str, Any]] = []
+        overlap_rows: list[dict[str, Any]] = []
+        nearest_rows: list[dict[str, Any]] = []
+        diagnostic_rows: list[dict[str, Any]] = []
+        matrix_entries: list[dict[str, Any]] = []
         run_pairs = _run_pairs(len(sae_data.runs), config.matching.scope)
-        matching_source = _callable_source_fingerprint(
-            get_concepts_matching,
-            cosine_similarity_matrix,
-            overlap_matrix,
-            get_overlap,
-        )
+        matching_source = _source_files_fingerprint("robustness_matching.py")
+        matrices_dir = workspace / "matching" / "matrices"
+        matrices_dir.mkdir(parents=True, exist_ok=True)
         from progress_utils import progress_iter
 
         for left_index, right_index in progress_iter(
@@ -922,28 +1027,30 @@ class DefaultComparisonAdapter:
         ):
             left_run = sae_data.runs[left_index]
             right_run = sae_data.runs[right_index]
+            left_profiles = {
+                int(percentile): np.asarray(profile["masks"], dtype=bool)
+                for percentile, profile in left_run[
+                    "high_activation_profiles"
+                ].items()
+            }
+            right_profiles = {
+                int(percentile): np.asarray(profile["masks"], dtype=bool)
+                for percentile, profile in right_run[
+                    "high_activation_profiles"
+                ].items()
+            }
 
-            def compute_pair_rows():
-                frame = get_concepts_matching(
-                    left_run,
-                    right_run,
-                    pair_criteria=config.matching.criterion,
+            def compute_analysis():
+                return analyze_run_pair(
+                    np.asarray(left_run["decoder_directions"]),
+                    np.asarray(right_run["decoder_directions"]),
+                    left_profiles,
+                    right_profiles,
+                    config.matching.nearest_neighbor_top_k,
                 )
-                return [
-                    {
-                        key: _jsonable(row[key])
-                        for key in (
-                            "original_concept",
-                            "best_pair",
-                            "cos_sim",
-                            "overlap",
-                        )
-                    }
-                    for row in frame.to_dict(orient="records")
-                ]
 
             if self.cache is None:
-                cached_rows = compute_pair_rows()
+                analysis = compute_analysis()
             else:
                 pair_result = self.cache.resolve(
                     stage="matching_pair",
@@ -957,54 +1064,87 @@ class DefaultComparisonAdapter:
                         "right_directions": array_fingerprint(
                             np.asarray(right_run["decoder_directions"])
                         ),
-                        "left_high_activations": array_fingerprint(
-                            np.asarray(left_run["high_activation_matrix"])
-                        ),
-                        "right_high_activations": array_fingerprint(
-                            np.asarray(right_run["high_activation_matrix"])
-                        ),
-                        "criterion": config.matching.criterion,
+                        "left_profiles": {
+                            str(percentile): array_fingerprint(matrix)
+                            for percentile, matrix in left_profiles.items()
+                        },
+                        "right_profiles": {
+                            str(percentile): array_fingerprint(matrix)
+                            for percentile, matrix in right_profiles.items()
+                        },
+                        "top_k": config.matching.nearest_neighbor_top_k,
                     },
                     source_fingerprint=matching_source,
                     environment_fingerprint=stable_hash(
-                        _package_versions("numpy", "scipy", "sklearn")
+                        _package_versions("numpy", "scipy")
                     ),
-                    load=lambda directory: _read_json(
-                        directory / "matches.json"
-                    ),
-                    compute=compute_pair_rows,
-                    store=lambda directory, value: _write_json(
-                        directory / "matches.json", value
-                    ),
-                    validate=_validate_matching_rows,
+                    load=_load_pair_matching_analysis,
+                    compute=compute_analysis,
+                    store=_store_pair_matching_analysis,
+                    validate=validate_analysis,
                     fingerprint=lambda value: {
-                        "matches": stable_hash(value)
+                        "cosine": array_fingerprint(value.cosine),
+                        **{
+                            f"overlap_p{percentile}": array_fingerprint(matrix)
+                            for percentile, matrix in value.overlaps.items()
+                        },
+                        "raw_assignments_and_rankings": stable_hash(
+                            _pair_matching_metadata(value)
+                        ),
                     },
+                    stage_schema_version=2,
                 )
-                cached_rows = pair_result.value
-            pair_rows = [
-                {
-                    **row,
-                    "sae_i_idx": left_index,
-                    "sae_j_idx": right_index,
-                }
-                for row in cached_rows
-            ]
-            pair_rows.sort(
-                key=lambda row: (
-                    int(row["sae_i_idx"]),
-                    int(row["sae_j_idx"]),
-                    int(row["original_concept"]),
-                )
+                analysis = pair_result.value
+
+            matrix_path = matrices_dir / (
+                f"run_{left_index}__run_{right_index}.npz"
             )
+            np.savez_compressed(
+                matrix_path,
+                cosine=analysis.cosine,
+                **{
+                    f"overlap_p{percentile}": matrix
+                    for percentile, matrix in analysis.overlaps.items()
+                },
+            )
+            matrix_entry = {
+                "run_i": left_index,
+                "run_j": right_index,
+                "shape": list(analysis.cosine.shape),
+                "filename": str(matrix_path.relative_to(workspace)),
+                "row_count": int(analysis.cosine.shape[0]),
+                "column_count": int(analysis.cosine.shape[1]),
+                "fingerprints": {
+                    "cosine": array_fingerprint(analysis.cosine),
+                    **{
+                        f"overlap_p{percentile}": array_fingerprint(matrix)
+                        for percentile, matrix in analysis.overlaps.items()
+                    },
+                },
+            }
+            matrix_entries.append(matrix_entry)
+            pair_artifacts = _matching_artifact_rows(
+                analysis, left_index, right_index, config.matching
+            )
+            cosine_rows.extend(pair_artifacts["cosine_hungarian"])
+            overlap_rows.extend(pair_artifacts["overlap_hungarian"])
+            nearest_rows.extend(pair_artifacts["nearest_neighbors"])
+            diagnostic_rows.extend(pair_artifacts["diagnostics"])
+
+            pair_rows, filtered, selected_percentile = _select_matching_rows(
+                analysis, left_index, right_index, config.matching
+            )
+            matrix_entry["selector"] = {
+                "criterion": config.matching.criterion,
+                "threshold": (
+                    config.matching.cosine_analysis_threshold
+                    if config.matching.criterion == "cos_sim"
+                    else config.matching.overlap_analysis_threshold
+                ),
+                "selected_overlap_percentile": selected_percentile,
+                "threshold_qualified_factor_count": len(filtered),
+            }
             all_matches.extend(pair_rows)
-            filtered = [
-                row
-                for row in pair_rows
-                if config.matching.minimum_score is None
-                or float(row[config.matching.criterion])
-                >= config.matching.minimum_score
-            ]
             if config.matching.max_pairs_per_run_pair is not None:
                 filtered = sorted(
                     filtered,
@@ -1014,7 +1154,42 @@ class DefaultComparisonAdapter:
                     ),
                 )[: config.matching.max_pairs_per_run_pair]
                 filtered.sort(key=lambda row: int(row["original_concept"]))
+            matrix_entry["selector"]["downstream_factor_count"] = len(filtered)
             selected.extend(filtered)
+
+        matching_manifest = {
+            "schema_version": 1,
+            "scope": config.matching.scope,
+            "n_runs": len(sae_data.runs),
+            "expected_run_pair_count": len(run_pairs),
+            "analysis_percentiles": list(config.matching.analysis_percentiles),
+            "cosine_threshold": config.matching.cosine_analysis_threshold,
+            "overlap_threshold": config.matching.overlap_analysis_threshold,
+            "nearest_neighbor_top_k": config.matching.nearest_neighbor_top_k,
+            "alternative_score_deltas": list(
+                config.matching.alternative_score_deltas
+            ),
+            "selector_thresholds": {
+                "cos_sim": config.matching.cosine_analysis_threshold,
+                "overlap": config.matching.overlap_analysis_threshold,
+            },
+            "overlap_percentile_tie_break": "highest_percentile",
+            "profile_artifact": "high_activation_profiles.npz",
+            "profile_artifact_fingerprint": _file_fingerprint(
+                workspace / "high_activation_profiles.npz"
+            ),
+            "run_pairs": matrix_entries,
+        }
+        _write_json(workspace / "matching" /
+                    "manifest.json", matching_manifest)
+        for stem, rows in (
+            ("cosine_hungarian_matches", cosine_rows),
+            ("overlap_hungarian_matches", overlap_rows),
+            ("nearest_neighbor_candidates", nearest_rows),
+            ("matching_diagnostics", diagnostic_rows),
+        ):
+            _write_json(workspace / "matching" / f"{stem}.json", rows)
+            _write_csv(workspace / "matching" / f"{stem}.csv", rows)
         _write_json(workspace / "matches_all.json", all_matches)
         _write_json(workspace / "matched_factors.json", selected)
         _write_csv(workspace / "matches_all.csv", all_matches)
@@ -1267,6 +1442,7 @@ class DefaultComparisonAdapter:
                 {key: value for key, value in rule.items() if key != "Provenance"}
                 for rule in combined
             ]
+
             def compute_cavs():
                 return train_cavs_from_rules(
                     rules_per_percentile=cav_rules,
@@ -1345,7 +1521,8 @@ class DefaultComparisonAdapter:
                             "available" if rule is not None else "no_valid_rule"
                         ),
                         "rule_provenance": (
-                            rule.get("Provenance") if rule is not None else None
+                            rule.get(
+                                "Provenance") if rule is not None else None
                         ),
                         "cav_status": (
                             "available"
@@ -1361,7 +1538,8 @@ class DefaultComparisonAdapter:
             return {}, diagnostics
 
         dist_eval = np.asarray(
-            [embeddings.year_to_domain[int(year)] for year in prepared.years_test[tcav_indices]],
+            [embeddings.year_to_domain[int(year)]
+             for year in prepared.years_test[tcav_indices]],
             dtype=np.int64,
         )
 
@@ -1556,7 +1734,8 @@ class DefaultComparisonAdapter:
         _write_jsonl(workspace / "high_precision_rules.jsonl", rule_rows)
         _write_json(workspace / "functional.json", diagnostics)
         if cav_arrays:
-            np.savez_compressed(workspace / "functional_cavs.npz", **cav_arrays)
+            np.savez_compressed(
+                workspace / "functional_cavs.npz", **cav_arrays)
         return functional, diagnostics
 
     def semantic(
@@ -1590,7 +1769,8 @@ class DefaultComparisonAdapter:
         )
         clinical_path = semantic.clinical_groups_path
         if clinical_path is not None:
-            clinical_path = str(_resolve_path(semantic_path.parent, clinical_path))
+            clinical_path = str(_resolve_path(
+                semantic_path.parent, clinical_path))
         clinical_groups = load_clinical_groups(clinical_path)
         return run_semantic_comparison(
             X=prepared.X_test,
@@ -1619,10 +1799,12 @@ def run_comparison(
 
     dataset_path = Path(config.dataset_path)
     if not dataset_path.is_file():
-        raise FileNotFoundError(f"Renal Feather file not found: {dataset_path}")
+        raise FileNotFoundError(
+            f"Renal Feather file not found: {dataset_path}")
     semantic_path = Path(config.semantic_config_path)
     if not semantic_path.is_file():
-        raise FileNotFoundError(f"Semantic configuration not found: {semantic_path}")
+        raise FileNotFoundError(
+            f"Semantic configuration not found: {semantic_path}")
 
     accelerator_info = accelerator_manifest(config.accelerator.device)
     print(
@@ -1748,7 +1930,7 @@ def run_comparison(
         )
     with telemetry.measure("tabpfn_and_embeddings"):
         embeddings = active_adapter.embeddings(
-            prepared, config, workspace, force=force
+            prepared, splits, config, workspace, force=force
         )
     with telemetry.measure("sae_training_and_encoding"):
         sae_data = active_adapter.train_saes(
@@ -1891,7 +2073,8 @@ def _callable_source_fingerprint(*values: Any) -> str:
     digest = hashlib.sha256()
     for value in values:
         digest.update(str(getattr(value, "__module__", "")).encode())
-        digest.update(str(getattr(value, "__qualname__", repr(value))).encode())
+        digest.update(
+            str(getattr(value, "__qualname__", repr(value))).encode())
         digest.update(inspect.getsource(value).encode())
     return digest.hexdigest()
 
@@ -2021,6 +2204,22 @@ def _validate_walkforward(value: Any) -> None:
         raise ValueError("Walk-forward cache must contain metric rows")
 
 
+def _scale_embeddings_from_semantic_fit(
+    train_raw: np.ndarray,
+    test_raw: np.ndarray,
+    fit_indices: np.ndarray,
+):
+    """Fit one scaler on semantic-fit test rows; transform every embedding row."""
+
+    from sklearn.preprocessing import StandardScaler
+
+    train = np.asarray(train_raw)
+    test = np.asarray(test_raw)
+    indices = np.asarray(fit_indices, dtype=int)
+    scaler = StandardScaler().fit(test[indices])
+    return scaler.transform(train), scaler.transform(test), scaler
+
+
 def _load_scaled_embeddings(directory: Path):
     with np.load(directory / "scaled.npz", allow_pickle=False) as values:
         train = np.asarray(values["train_scaled"])
@@ -2131,6 +2330,366 @@ def _validate_matching_rows(rows: Any) -> None:
             float(row["overlap"])
         ):
             raise ValueError("Cached matching scores must be finite")
+
+
+def _pair_matching_metadata(analysis: Any) -> dict[str, Any]:
+    return {
+        "top_k": int(analysis.top_k),
+        "percentiles": sorted(int(value) for value in analysis.overlaps),
+        "cosine_assignment": asdict(analysis.cosine_assignment),
+        "overlap_assignments": {
+            str(percentile): asdict(assignment)
+            for percentile, assignment in analysis.overlap_assignments.items()
+        },
+        "nearest_neighbors": {
+            metric: [asdict(row) for row in rows]
+            for metric, rows in analysis.nearest_neighbors.items()
+        },
+        "nearest_hungarian_gaps": {
+            metric: [asdict(row) for row in rows]
+            for metric, rows in analysis.nearest_hungarian_gaps.items()
+        },
+    }
+
+
+def _store_pair_matching_analysis(directory: Path, analysis: Any) -> None:
+    np.savez_compressed(
+        directory / "matrices.npz",
+        cosine=analysis.cosine,
+        **{
+            f"overlap_p{percentile}": matrix
+            for percentile, matrix in analysis.overlaps.items()
+        },
+    )
+    _write_json(directory / "raw_analysis.json",
+                _pair_matching_metadata(analysis))
+
+
+def _load_pair_matching_analysis(directory: Path) -> Any:
+    from robustness_matching import (
+        Assignment,
+        NearestHungarianGap,
+        NearestNeighbor,
+        PairMatchingAnalysis,
+    )
+
+    metadata = _read_json(directory / "raw_analysis.json")
+    with np.load(directory / "matrices.npz", allow_pickle=False) as values:
+        cosine = np.asarray(values["cosine"])
+        overlaps = {
+            int(name.removeprefix("overlap_p")): np.asarray(values[name])
+            for name in values.files
+            if name.startswith("overlap_p")
+        }
+
+    def assignment(raw: Mapping[str, Any]) -> Assignment:
+        return Assignment(
+            pairs=tuple(tuple(int(value) for value in pair)
+                        for pair in raw["pairs"]),
+            left_to_right=tuple(
+                None if value is None else int(value)
+                for value in raw["left_to_right"]
+            ),
+            right_to_left=tuple(
+                None if value is None else int(value)
+                for value in raw["right_to_left"]
+            ),
+        )
+
+    return PairMatchingAnalysis(
+        cosine=cosine,
+        overlaps=overlaps,
+        cosine_assignment=assignment(metadata["cosine_assignment"]),
+        overlap_assignments={
+            int(percentile): assignment(raw)
+            for percentile, raw in metadata["overlap_assignments"].items()
+        },
+        nearest_neighbors={
+            metric: tuple(NearestNeighbor(**row) for row in rows)
+            for metric, rows in metadata["nearest_neighbors"].items()
+        },
+        nearest_hungarian_gaps={
+            metric: tuple(NearestHungarianGap(**row) for row in rows)
+            for metric, rows in metadata["nearest_hungarian_gaps"].items()
+        },
+        top_k=int(metadata["top_k"]),
+    )
+
+
+def _select_matching_rows(
+    analysis: Any,
+    left_run: int,
+    right_run: int,
+    matching: MatchingRunnerConfig,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    """Apply selector threshold; overlap chooses percentile with most survivors."""
+
+    if matching.criterion == "overlap":
+        percentile_choices = []
+        for percentile, assignment in analysis.overlap_assignments.items():
+            matrix = analysis.overlaps[percentile]
+            qualifying = sum(
+                matrix[left_factor, right_factor]
+                >= matching.overlap_analysis_threshold
+                for left_factor, right_factor in assignment.pairs
+            )
+            percentile_choices.append(
+                (qualifying, int(percentile), assignment))
+        _, selected_percentile, assignment = max(
+            percentile_choices, key=lambda choice: (choice[0], choice[1])
+        )
+        selection_threshold = matching.overlap_analysis_threshold
+        selection_field = "overlap"
+    else:
+        assignment = analysis.cosine_assignment
+        selection_threshold = matching.cosine_analysis_threshold
+        selection_field = "cos_sim"
+        selected_percentile = max(
+            analysis.overlaps,
+            key=lambda percentile: (
+                sum(
+                    analysis.overlaps[percentile][left_factor, right_factor]
+                    >= matching.overlap_analysis_threshold
+                    for left_factor, right_factor in assignment.pairs
+                ),
+                int(percentile),
+            ),
+        )
+
+    selection_overlap = analysis.overlaps[selected_percentile]
+    rows = [
+        {
+            "sae_i_idx": left_run,
+            "sae_j_idx": right_run,
+            "original_concept": left_factor,
+            "best_pair": right_factor,
+            "cos_sim": float(analysis.cosine[left_factor, right_factor]),
+            "overlap": float(selection_overlap[left_factor, right_factor]),
+            "overlap_percentile": int(selected_percentile),
+            "selection_criterion": matching.criterion,
+            "selection_threshold": float(selection_threshold),
+            "selection_threshold_pass": bool(
+                (
+                    analysis.cosine[left_factor, right_factor]
+                    if selection_field == "cos_sim"
+                    else selection_overlap[left_factor, right_factor]
+                )
+                >= selection_threshold
+            ),
+        }
+        for left_factor, right_factor in assignment.pairs
+    ]
+    selected = [row for row in rows if row["selection_threshold_pass"]]
+    return rows, selected, int(selected_percentile)
+
+
+def _matching_artifact_rows(
+    analysis: Any,
+    left_run: int,
+    right_run: int,
+    matching: MatchingRunnerConfig,
+) -> dict[str, list[dict[str, Any]]]:
+    cosine_rows: list[dict[str, Any]] = []
+    overlap_rows: list[dict[str, Any]] = []
+    for left_factor, right_factor in analysis.cosine_assignment.pairs:
+        overlaps = {
+            percentile: float(matrix[left_factor, right_factor])
+            for percentile, matrix in analysis.overlaps.items()
+        }
+        consistency_count = sum(
+            score >= matching.overlap_analysis_threshold
+            for score in overlaps.values()
+        )
+        cosine_rows.append(
+            {
+                "run_i": left_run,
+                "run_j": right_run,
+                "factor_i": left_factor,
+                "factor_j": right_factor,
+                "cos_sim": float(analysis.cosine[left_factor, right_factor]),
+                **{
+                    f"overlap_p{percentile}": score
+                    for percentile, score in overlaps.items()
+                },
+                "cosine_threshold_pass": bool(
+                    analysis.cosine[left_factor, right_factor]
+                    >= matching.cosine_analysis_threshold
+                ),
+                "overlap_consistency_count": consistency_count,
+                "overlap_consistency_pass": bool(consistency_count >= 2),
+            }
+        )
+    for percentile, assignment in analysis.overlap_assignments.items():
+        matrix = analysis.overlaps[percentile]
+        for left_factor, right_factor in assignment.pairs:
+            overlap_rows.append(
+                {
+                    "run_i": left_run,
+                    "run_j": right_run,
+                    "percentile": percentile,
+                    "factor_i": left_factor,
+                    "factor_j": right_factor,
+                    "overlap": float(matrix[left_factor, right_factor]),
+                    "cos_sim": float(
+                        analysis.cosine[left_factor, right_factor]
+                    ),
+                    "overlap_threshold_pass": bool(
+                        matrix[left_factor, right_factor]
+                        >= matching.overlap_analysis_threshold
+                    ),
+                }
+            )
+
+    nearest_rows: list[dict[str, Any]] = []
+    diagnostics: list[dict[str, Any]] = []
+    for metric, candidates in analysis.nearest_neighbors.items():
+        percentile = (
+            None if metric == "cosine" else int(
+                metric.removeprefix("overlap_p"))
+        )
+        threshold = (
+            matching.cosine_analysis_threshold
+            if metric == "cosine"
+            else matching.overlap_analysis_threshold
+        )
+        grouped: dict[tuple[str, int], list[Any]] = {}
+        for candidate in candidates:
+            grouped.setdefault(
+                (candidate.source_side, candidate.source_factor), []
+            ).append(candidate)
+        for rows in grouped.values():
+            rows.sort(key=lambda row: row.rank)
+        best = {key: rows[0] for key, rows in grouped.items()}
+        qualified_collisions: dict[tuple[str, int], int] = {}
+        for side in ("left", "right"):
+            counts: dict[int, int] = {}
+            for (source_side, _), candidate in best.items():
+                if source_side == side and candidate.score >= threshold:
+                    counts[candidate.target_factor] = (
+                        counts.get(candidate.target_factor, 0) + 1
+                    )
+            qualified_collisions.update(
+                {(side, target): count for target, count in counts.items()}
+            )
+
+        gap_by_source = {
+            (row.source_side, row.source_factor): row
+            for row in analysis.nearest_hungarian_gaps[metric]
+        }
+        for key, rows in sorted(grouped.items()):
+            source_side, source_factor = key
+            best_score = rows[0].score
+            target_run = right_run if source_side == "left" else left_run
+            source_run = left_run if source_side == "left" else right_run
+            reverse_side = "right" if source_side == "left" else "left"
+            for candidate in rows:
+                reverse = best.get((reverse_side, candidate.target_factor))
+                reciprocal_qualified = bool(
+                    candidate.rank == 1
+                    and candidate.reciprocal_raw
+                    and candidate.score >= threshold
+                    and reverse is not None
+                    and reverse.score >= threshold
+                )
+                qualified_collision_count = qualified_collisions.get(
+                    (source_side, candidate.target_factor), 0
+                )
+                row = {
+                    "metric": metric,
+                    "percentile": percentile,
+                    "source_side": source_side,
+                    "source_run": source_run,
+                    "target_run": target_run,
+                    "source_factor": source_factor,
+                    "target_factor": candidate.target_factor,
+                    "rank": candidate.rank,
+                    "score": candidate.score,
+                    "threshold": threshold,
+                    "passes_threshold": bool(candidate.score >= threshold),
+                    "best_score": best_score,
+                    "score_delta_from_best": best_score - candidate.score,
+                    "reciprocal_raw": candidate.reciprocal_raw,
+                    "reciprocal_threshold_qualified": reciprocal_qualified,
+                    "target_collision_count_raw": (
+                        candidate.target_collision_count_raw
+                    ),
+                    "target_collision_count_threshold_qualified": (
+                        qualified_collision_count
+                    ),
+                    "target_collision_raw": bool(
+                        candidate.target_collision_count_raw > 1
+                    ),
+                    "target_collision_threshold_qualified": bool(
+                        qualified_collision_count > 1
+                    ),
+                }
+                for delta in matching.alternative_score_deltas:
+                    row[_delta_field(delta)] = bool(
+                        candidate.rank > 1
+                        and candidate.score >= threshold
+                        and best_score - candidate.score <= delta + 1e-12
+                    )
+                nearest_rows.append(row)
+
+            gap = gap_by_source[key]
+            diagnostic = {
+                "metric": metric,
+                "percentile": percentile,
+                "source_side": source_side,
+                "source_run": source_run,
+                "target_run": target_run,
+                "source_factor": source_factor,
+                "best_target": rows[0].target_factor,
+                "best_score": rows[0].score,
+                "second_score": rows[1].score if len(rows) > 1 else None,
+                "third_score": rows[2].score if len(rows) > 2 else None,
+                "best_minus_second": (
+                    rows[0].score - rows[1].score if len(rows) > 1 else None
+                ),
+                "second_minus_third": (
+                    rows[1].score - rows[2].score if len(rows) > 2 else None
+                ),
+                "threshold": threshold,
+                "threshold_valid": bool(rows[0].score >= threshold),
+                "reciprocal_raw": rows[0].reciprocal_raw,
+                "target_collision_count_raw": (
+                    rows[0].target_collision_count_raw
+                ),
+                "target_collision_count_threshold_qualified": (
+                    qualified_collisions.get(
+                        (source_side, rows[0].target_factor), 0
+                    )
+                ),
+                "hungarian_target": gap.hungarian_target,
+                "hungarian_score": gap.hungarian_score,
+                "nearest_minus_hungarian": gap.nearest_minus_hungarian,
+            }
+            reverse = best.get((reverse_side, rows[0].target_factor))
+            diagnostic["reciprocal_threshold_qualified"] = bool(
+                rows[0].reciprocal_raw
+                and rows[0].score >= threshold
+                and reverse is not None
+                and reverse.score >= threshold
+            )
+            for delta in matching.alternative_score_deltas:
+                diagnostic[_delta_field(delta)] = any(
+                    candidate.rank > 1
+                    and candidate.score >= threshold
+                    and rows[0].score - candidate.score <= delta + 1e-12
+                    for candidate in rows
+                )
+            diagnostics.append(diagnostic)
+
+    return {
+        "cosine_hungarian": cosine_rows,
+        "overlap_hungarian": overlap_rows,
+        "nearest_neighbors": nearest_rows,
+        "diagnostics": diagnostics,
+    }
+
+
+def _delta_field(delta: float) -> str:
+    return f"valid_alternative_delta_{delta:.2f}".replace(".", "_")
 
 
 def _normalize_percentile_rules(value: Any) -> dict[int, list[dict[str, Any]]]:
@@ -2302,9 +2861,11 @@ def _validate_activations(
     for run_id, matrix in activations.items():
         value = np.asarray(matrix)
         if value.ndim != 2 or len(value) != n_records:
-            raise ValueError(f"SAE run {run_id} activations are not row-aligned")
+            raise ValueError(
+                f"SAE run {run_id} activations are not row-aligned")
         if not np.isfinite(value).all():
-            raise ValueError(f"SAE run {run_id} activations contain non-finite values")
+            raise ValueError(
+                f"SAE run {run_id} activations contain non-finite values")
 
 
 def _run_pairs(n_runs: int, scope: str) -> list[tuple[int, int]]:
@@ -2436,6 +2997,7 @@ def _runner_source_fingerprint() -> str:
         "tabpfn_model.py",
         "sae.py",
         "sae_compare.py",
+        "robustness_matching.py",
         "decision_tree.py",
         "tcav.py",
         "semantic_artifacts.py",
@@ -2486,7 +3048,8 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows([{key: _jsonable(row.get(key)) for key in fieldnames} for row in rows])
+        writer.writerows([{key: _jsonable(row.get(key))
+                         for key in fieldnames} for row in rows])
 
 
 def _jsonable(value: Any) -> Any:

@@ -165,9 +165,10 @@ class _FakeAdapter:
         self.calls.append(("prepare", force))
         return self.prepared
 
-    def embeddings(self, prepared, config, workspace, *, force):
+    def embeddings(self, prepared, splits, config, workspace, *, force):
         self.calls.append(("embeddings", force))
         assert prepared is self.prepared
+        assert len(splits["idx_semantic_fit"]) > 0
         return self.embedded
 
     def train_saes(
@@ -263,11 +264,25 @@ def test_config_defaults_and_strict_nested_validation():
     assert ComparisonRunnerConfig.from_dict(
         {"show_progress": False}
     ).show_progress is False
+    normalized_matching = ComparisonRunnerConfig.from_dict(
+        {
+            "matching": {
+                "analysis_percentiles": [60, 75, 90],
+                "alternative_score_deltas": [0.02, 0.2],
+            }
+        }
+    ).matching
+    assert normalized_matching.analysis_percentiles == (60, 75, 90)
+    assert normalized_matching.alternative_score_deltas == (0.02, 0.2)
 
     with pytest.raises(ValueError, match="Unknown comparison config fields"):
         ComparisonRunnerConfig.from_dict({"unexpected": True})
     with pytest.raises(ValueError, match="Unknown sae fields"):
         ComparisonRunnerConfig.from_dict({"sae": {"surprise": 1}})
+    with pytest.raises(ValueError, match="Unknown matching fields"):
+        ComparisonRunnerConfig.from_dict(
+            {"matching": {"minimum_score": 0.7}}
+        )
     with pytest.raises(ValueError, match="accelerator.device"):
         ComparisonRunnerConfig.from_dict(
             {"accelerator": {"device": "quantum"}}
@@ -282,6 +297,8 @@ def test_config_defaults_and_strict_nested_validation():
         ComparisonRunnerConfig.from_dict(
             {"cache_verification": "hope-for-the-best"}
         )
+    with pytest.raises(ValueError, match="ordered, unique"):
+        MatchingRunnerConfig(analysis_percentiles=(90, 70, 70))
 
 
 def test_config_json_resolves_all_paths_relative_to_config(tmp_path):
@@ -639,10 +656,18 @@ def test_adding_seed_reuses_existing_sae_models_and_activations(
         SimpleNamespace(
             train_all_saes=fake_train_all_saes,
             encode_sae=fake_encode_sae,
-            high_activation_matrix=lambda values, perc=90: (
-                values
-                > np.percentile(values, perc, axis=0, keepdims=True)
-            ),
+            high_activation_profiles=lambda values, percentiles: {
+                percentile: {
+                    "masks": values
+                    > np.percentile(
+                        values, percentile, axis=0, keepdims=True
+                    ),
+                    "thresholds": np.percentile(
+                        values, percentile, axis=0
+                    ),
+                }
+                for percentile in percentiles
+            },
         ),
     )
     cache_root = tmp_path / "shared-cache"
