@@ -2344,7 +2344,7 @@ def _runtime_estimate(
     with Path(config.semantic_config_path).open(encoding="utf-8") as handle:
         semantic_raw = json.load(handle)
     fractions = semantic_raw.get("activation_targets", {}).get(
-        "positive_fractions", [0.1, 0.25, 0.5]
+        "positive_fractions", [0.1, 0.2, 0.3, 0.4, 0.5]
     )
     discovery = semantic_raw.get("discovery", {})
     tree_fits = (

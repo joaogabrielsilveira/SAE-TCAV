@@ -17,7 +17,7 @@ from typing import Any, Mapping
 class ActivationTargetConfig:
     """Positive-activation fractions represented by each binary target."""
 
-    positive_fractions: tuple[float, ...] = (0.10, 0.25, 0.50)
+    positive_fractions: tuple[float, ...] = (0.1, 0.2, 0.3, 0.4, 0.5)
     min_positive_samples: int = 20
 
     def __post_init__(self) -> None:
@@ -34,7 +34,7 @@ class RuleObjectiveConfig:
     min_precision: float = 0.50
     min_lift: float = 1.50
     max_rules: int = 5
-    max_rule_length: int = 3
+    max_rule_length: int = 5
     min_marginal_recall: float = 0.02
     exhaustive_candidate_limit: int = 20
     beam_width: int = 64

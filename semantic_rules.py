@@ -395,7 +395,7 @@ class RuleSetSelectionConfig:
     min_precision: float = 0.5
     min_lift: float = 1.5
     max_rules: int = 5
-    max_rule_length: int = 3
+    max_rule_length: int = 5
     min_marginal_recall: float = 0.02
     exhaustive_max_candidates: int = 20
     beam_width: int = 64
@@ -648,6 +648,9 @@ def select_rule_set(
 
 DEFAULT_ACTIVATION_TARGETS: tuple[ActivationTargetSpec, ...] = (
     ActivationTargetSpec("top_10pct_positive", 0.10),
-    ActivationTargetSpec("top_25pct_positive", 0.25),
+    # ActivationTargetSpec("top_25pct_positive", 0.25),
+    ActivationTargetSpec("top_20pct_positive", 0.20),
+    ActivationTargetSpec("top_30pct_positive", 0.30),
+    ActivationTargetSpec("top_40pct_positive", 0.40),
     ActivationTargetSpec("top_50pct_positive", 0.50),
 )
