@@ -27,15 +27,41 @@ def activation_threshold(concept: np.ndarray, perc: int = 90):
     return np.percentile(pos_act, perc)
 
 
-def high_activation_matrix(concepts: np.ndarray, perc: int = 90):
-    matrix = []
-    for k in range(concepts.shape[1]):
-        concept_k = concepts[:, k]
-        thresh = activation_threshold(concept_k, perc)
-        mask = (concept_k > thresh)
-        matrix.append(mask)
+def high_activation_profiles(
+    concepts: np.ndarray,
+    percentiles: Sequence[int] = (70, 80, 90),
+) -> dict[int, dict[str, np.ndarray]]:
+    """Return positive-only thresholds and strict masks at each percentile."""
 
-    return np.asarray(matrix, dtype=bool).transpose()
+    values = np.asarray(concepts)
+    if values.ndim != 2:
+        raise ValueError("concepts must be a two-dimensional array")
+    normalized = tuple(int(percentile) for percentile in percentiles)
+    if not normalized:
+        raise ValueError("percentiles cannot be empty")
+    if normalized != tuple(sorted(set(normalized))):
+        raise ValueError("percentiles must be ordered and unique")
+    if any(not 0 <= percentile <= 100 for percentile in normalized):
+        raise ValueError("percentiles must lie in [0, 100]")
+
+    thresholds = np.full((len(normalized), values.shape[1]), np.inf, dtype=float)
+    for factor in range(values.shape[1]):
+        positive = values[:, factor][values[:, factor] > 0]
+        if len(positive):
+            thresholds[:, factor] = np.percentile(positive, normalized)
+    return {
+        percentile: {
+            "masks": np.asarray(values > thresholds[index], dtype=bool),
+            "thresholds": thresholds[index].copy(),
+        }
+        for index, percentile in enumerate(normalized)
+    }
+
+
+def high_activation_matrix(concepts: np.ndarray, perc: int = 90):
+    """Compatibility adapter for legacy single-percentile callers."""
+
+    return high_activation_profiles(concepts, (int(perc),))[int(perc)]["masks"]
 
 
 def encode_sae(

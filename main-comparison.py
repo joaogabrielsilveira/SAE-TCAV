@@ -26,11 +26,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Override accelerator device; 'cuda' fails early if unavailable",
     )
     parser.add_argument(
-        "--all-pairs",
-        action="store_true",
-        help="Disable geometry filtering; can increase semantic runtime greatly",
-    )
-    parser.add_argument(
         "--skip-functional",
         action="store_true",
         help="Skip high-precision rule, CAV, and TCAV stages",
@@ -65,11 +60,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = replace(
             config,
             accelerator=replace(config.accelerator, device=args.device),
-        )
-    if args.all_pairs:
-        config = replace(
-            config,
-            matching=replace(config.matching, minimum_score=None),
         )
     if args.skip_functional:
         config = replace(
