@@ -9,7 +9,7 @@ def test_config_round_trip_and_unknown_field(tmp_path):
     path = tmp_path / "config.json"
     path.write_text(json.dumps(SemanticExperimentConfig().to_dict()))
     loaded = SemanticExperimentConfig.from_json(path)
-    assert loaded.activation_targets.positive_fractions == [0.10, 0.25, 0.50] or loaded.activation_targets.positive_fractions == (0.10, 0.25, 0.50)
+    assert loaded.activation_targets.positive_fractions == [0.1, 0.2, 0.3, 0.4, 0.5] or loaded.activation_targets.positive_fractions == (0.1, 0.2, 0.3, 0.4, 0.5)
     assert loaded.class_analysis == ClassAnalysisConfig(enabled=True)
     with pytest.raises(ValueError, match="Unknown"):
         SemanticExperimentConfig.from_dict({"typo": True})

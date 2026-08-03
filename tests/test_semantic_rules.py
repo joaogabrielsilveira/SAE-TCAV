@@ -36,7 +36,7 @@ def test_or_metrics_use_union_not_mean_of_rule_metrics():
 def test_activation_cutoff_is_fit_once_then_frozen():
     target = fit_activation_target(
         np.array([0.0, 1.0, 2.0, 3.0, 4.0]),
-        ActivationTargetSpec("core", 0.25),
+        ActivationTargetSpec("core", 0.2),
     )
     original_cutoff = target.cutoff
     selected = target.apply(np.array([0.0, 3.1, 1000.0]))

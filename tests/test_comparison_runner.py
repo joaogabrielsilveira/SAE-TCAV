@@ -518,7 +518,7 @@ def test_semantic_config_content_invalidates_complete_result_cache(
         json.dumps(
             {
                 "activation_targets": {
-                    "positive_fractions": [0.1, 0.25, 0.5],
+                    "positive_fractions": [0.1, 0.2, 0.3, 0.4, 0.5],
                 },
                 "discovery": {
                     "n_bootstraps": 2,
