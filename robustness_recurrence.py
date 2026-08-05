@@ -44,22 +44,18 @@ def compute_factor_recurrence(
             assigned = 0
             cosine_passes = 0
             overlap_passes = {percentile: 0 for percentile in normalized_percentiles}
-            consistency_passes = 0
             for target_run in target_runs:
                 row = cosine_index.get((run, target_run, factor))
                 if row is None:
                     continue
                 assigned += 1
                 cosine_passes += float(row["cos_sim"]) >= cosine_threshold
-                target_overlap_passes = 0
                 for percentile in normalized_percentiles:
                     passed = (
                         float(row[f"overlap_p{percentile}"])
                         >= overlap_threshold
                     )
                     overlap_passes[percentile] += passed
-                    target_overlap_passes += passed
-                consistency_passes += target_overlap_passes >= 2
 
             row = {
                 "run_id": run,
@@ -69,13 +65,6 @@ def compute_factor_recurrence(
                 "cosine_pass_count": cosine_passes,
                 "cosine_recurrence": cosine_passes / denominator,
                 "cosine_recurrent": bool(cosine_passes / denominator > 0.50),
-                "cross_percentile_consistency_pass_count": consistency_passes,
-                "cross_percentile_consistency_recurrence": (
-                    consistency_passes / denominator
-                ),
-                "cross_percentile_consistency_recurrent": bool(
-                    consistency_passes / denominator > 0.50
-                ),
             }
             for percentile in normalized_percentiles:
                 recurrence = overlap_passes[percentile] / denominator
@@ -254,9 +243,6 @@ def _append_highlights(
 ) -> None:
     metrics = {
         "cosine": primary["cosine_recurrence"],
-        "cross_percentile_consistency": primary[
-            "cross_percentile_consistency_recurrence"
-        ],
         **{
             f"primary_overlap_p{percentile}": primary[
                 f"primary_overlap_p{percentile}_recurrence"
@@ -421,13 +407,8 @@ def _write_plots(
     histogram_specs = {
         "recurrence_distributions.png": [
             [float(row["cosine_recurrence"]) for row in primary],
-            [float(row["cross_percentile_consistency_recurrence"]) for row in primary],
             [float(row["recurrence"]) for row in secondary],
         ],
-        "cross_percentile_consistency.png": [[
-            float(row["cross_percentile_consistency_recurrence"])
-            for row in primary
-        ]],
         "nearest_hungarian_gaps.png": [
             [
                 float(row["nearest_minus_hungarian"])
@@ -449,7 +430,6 @@ def _write_plots(
 
     recurrence_fields = [
         "cosine_recurrence",
-        "cross_percentile_consistency_recurrence",
         *sorted(
             {
                 key

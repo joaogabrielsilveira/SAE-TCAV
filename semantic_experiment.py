@@ -798,6 +798,7 @@ def run_semantic_comparison(
     record_keys: Sequence[Any] | None = None,
     force: bool = False,
     shared_cache: ComparisonCache | None = None,
+    predefined_splits: Mapping[str, np.ndarray] | None = None,
 ) -> dict[str, Any]:
     """Learn per-factor semantics, evaluate matched pairs, persist artifacts."""
 
@@ -825,7 +826,39 @@ def run_semantic_comparison(
             raise ValueError(f"Activations for run {run_id!r} are not aligned with X")
 
     group_map = dict(clinical_groups or {})
-    splits = semantic_test_subsplits(y_stratify, patients, rng_seed=config.runtime.seed)
+    if predefined_splits is None:
+        splits = semantic_test_subsplits(
+            y_stratify, patients, rng_seed=config.runtime.seed
+        )
+    else:
+        required_splits = {
+            "idx_semantic_fit", "idx_semantic_select", "idx_semantic_final"
+        }
+        missing_splits = required_splits - set(predefined_splits)
+        if missing_splits:
+            raise ValueError(
+                f"predefined semantic splits missing: {sorted(missing_splits)}"
+            )
+        splits = {
+            name: np.asarray(indices, dtype=int)
+            for name, indices in predefined_splits.items()
+        }
+        selected = [splits[name] for name in sorted(required_splits)]
+        for indices in selected:
+            if (
+                indices.ndim != 1
+                or np.any(indices < 0)
+                or np.any(indices >= len(X))
+                or len(indices) != len(np.unique(indices))
+            ):
+                raise ValueError("predefined semantic split indices are invalid")
+        patient_sets = [set(patients[indices].astype(str)) for indices in selected]
+        if any(
+            patient_sets[left] & patient_sets[right]
+            for left in range(len(patient_sets))
+            for right in range(left + 1, len(patient_sets))
+        ):
+            raise ValueError("patient leakage in predefined semantic splits")
     split_fingerprint = stable_hash({name: indices.tolist() for name, indices in splits.items() if name.startswith("idx_semantic")})
     activation_fingerprints = {
         str(run): array_fingerprint(np.asarray(matrix))

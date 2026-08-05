@@ -314,6 +314,7 @@ class _PreparedData:
     years_test: np.ndarray
     patient_ids: np.ndarray
     record_keys: np.ndarray
+    domain_reference_year: int | None = None
 
 
 @dataclass
@@ -497,15 +498,14 @@ class DefaultComparisonAdapter:
         evaluation.batch_size_predict = config.tabpfn.batch_size
         evaluation.device = config.accelerator.device
         evaluation.show_progress = config.show_progress
-        domain_map = {
-            int(year): index
-            for index, year in enumerate(
-                sorted(
-                    set(prepared.years_train.tolist())
-                    | set(prepared.years_test.tolist())
-                )
-            )
-        }
+        all_years = sorted(
+            set(prepared.years_train.tolist()) | set(prepared.years_test.tolist())
+        )
+        domain_map = (
+            {int(year): int(year) - prepared.domain_reference_year for year in all_years}
+            if prepared.domain_reference_year is not None
+            else {int(year): index for index, year in enumerate(all_years)}
+        )
 
         numerical_environment = _numerical_environment_fingerprint(
             config.accelerator.device, "numpy", "torch", "tabpfn"
@@ -820,7 +820,12 @@ class DefaultComparisonAdapter:
         from sae_compare import encode_sae, high_activation_profiles, train_all_saes
 
         fit_indices = splits["idx_semantic_fit"]
-        matching_indices = splits["idx_semantic_select"]
+        matching_fit_indices = splits.get(
+            "idx_matching_fit", splits["idx_semantic_select"]
+        )
+        matching_apply_indices = splits.get(
+            "idx_matching_apply", splits["idx_semantic_select"]
+        )
         sae = config.sae
         fit_embeddings = embeddings.test_scaled[fit_indices]
         numerical_environment = _numerical_environment_fingerprint(
@@ -950,8 +955,11 @@ class DefaultComparisonAdapter:
             run["seed"] = int(seed)
             run["encoded_embs"] = np.asarray(activation_matrix[fit_indices])
             profiles = high_activation_profiles(
-                np.asarray(activation_matrix[matching_indices]),
+                np.asarray(activation_matrix[matching_fit_indices]),
                 config.matching.analysis_percentiles,
+                apply_concepts=np.asarray(
+                    activation_matrix[matching_apply_indices]
+                ),
             )
             run["high_activation_profiles"] = profiles
             run["high_activation_matrix"] = profiles[
@@ -1250,8 +1258,12 @@ class DefaultComparisonAdapter:
             get_tcav_scores, robust_tcav_significance_test
         )
 
-        fit_indices = splits["idx_semantic_fit"]
-        select_indices = splits["idx_semantic_select"]
+        fit_indices = splits.get(
+            "idx_rule_discovery", splits["idx_semantic_fit"]
+        )
+        select_indices = splits.get(
+            "idx_rule_selection_cav", splits["idx_semantic_select"]
+        )
         tcav_indices = splits["idx_tcav_eval"]
         factors_by_run = _matched_factors_by_run(matches)
         rule_rows: list[dict[str, Any]] = []

@@ -51,9 +51,7 @@ def test_recurrence_uses_r_minus_one_reverse_orientation_and_missing_failures():
     assert run0_factor0["comparison_count"] == 2
     assert run0_factor0["cosine_recurrence"] == 0.5
     assert run0_factor0["cosine_recurrent"] is False
-    assert run0_factor0["cross_percentile_consistency_recurrence"] == 1.0
     assert run1_factor1["cosine_recurrence"] == 1.0
     assert missing["assigned_count"] == 0
     assert missing["cosine_recurrence"] == 0.0
-    assert any(row["metric"] == "cross_percentile_consistency" for row in highlights)
     assert all(row["comparison_count"] == 2 for row in secondary)
