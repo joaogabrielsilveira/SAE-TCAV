@@ -182,11 +182,15 @@ def run_reference_experiment(
 def run_temporal_robustness(
     config: TemporalRobustnessConfig,
     *,
-    adapter: TemporalExperimentAdapter,
+    adapter: TemporalExperimentAdapter | None = None,
     fail_fast: bool = False,
 ) -> dict[str, Any]:
     """Run all reference years and valid patient splits; index every outcome."""
 
+    if adapter is None:
+        from temporal_production import ProductionTemporalAdapter
+
+        adapter = ProductionTemporalAdapter()
     population = adapter.load_population(config)
     population.validate()
     feature_year = population.feature_selection_max_year
@@ -259,6 +263,17 @@ def run_temporal_robustness(
                 )
                 if fail_fast:
                     raise
+    from temporal_reporting import build_parent_reports
+
+    reports = build_parent_reports(root, successful, config)
+    for name, rows in reports.items():
+        _write_json(root / "aggregate" / f"{name}.json", rows)
+        _write_csv(root / "aggregate" / f"{name}.csv", rows)
+    aggregate_artifacts = _aggregate_artifacts(root, successful)
+    aggregate_artifacts.update({
+        name: str(root / "aggregate" / f"{name}.csv")
+        for name in reports
+    })
     parent = {
         "schema_version": config.schema_version,
         "runner_hash": root_hash,
@@ -271,6 +286,7 @@ def run_temporal_robustness(
         "skipped_references": skipped,
         "failed_experiments": failed,
         "split_attempts": split_attempts,
+        "aggregate_artifacts": aggregate_artifacts,
     }
     _write_json(root / "parent_manifest.json", parent)
     _write_json(root / "summary.json", {
@@ -281,6 +297,26 @@ def run_temporal_robustness(
         "failed_count": len(failed),
     })
     return parent
+
+
+def _aggregate_artifacts(root: Path, successful) -> dict[str, str]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for experiment in successful:
+        manifest_path = Path(experiment["manifest"])
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for name in manifest.get("artifacts", {}):
+            csv_path = manifest_path.parent / f"{name}.csv"
+            if not csv_path.is_file():
+                continue
+            with csv_path.open(newline="", encoding="utf-8") as handle:
+                grouped.setdefault(name, []).extend(csv.DictReader(handle))
+    output = root / "aggregate"
+    files = {}
+    for name, rows in sorted(grouped.items()):
+        path = output / f"{name}.csv"
+        _write_csv(path, rows)
+        files[name] = str(path)
+    return files
 
 
 def _jsonable(value):
