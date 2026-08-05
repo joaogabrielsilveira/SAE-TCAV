@@ -119,6 +119,12 @@ class TemporalRobustnessConfig:
     schema_version: str = "2.0"
     dataset_path: str = "tidy_event_data.feather"
     artifact_dir: str = "stats/temporal_robustness"
+    comparison_config_path: str = "comparison_runner.example.json"
+    semantic_config_path: str = "semantic_experiment.example.json"
+    use_cache: bool = True
+    show_progress: bool = True
+    device: str = "auto"
+    force: bool = False
     reference_years: tuple[int, ...] = tuple(range(2007, 2016))
     patient_split_seeds: tuple[int, ...] = (42, 43, 44, 45, 46)
     sae_seeds: tuple[int, ...] = (42, 43, 44, 45, 46)
@@ -149,6 +155,11 @@ class TemporalRobustnessConfig:
             raise ValueError("maximum_split_attempts cannot be smaller than requested splits")
         if self.bootstrap_replicates < 1:
             raise ValueError("bootstrap_replicates must be positive")
+        if self.device not in {"auto", "cpu", "cuda"}:
+            raise ValueError("device must be auto, cpu, or cuda")
+        for name in ("use_cache", "show_progress", "force"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be boolean")
         if (
             self.feature_selection_max_year is not None
             and self.feature_selection_max_year > min(self.reference_years)
@@ -198,4 +209,12 @@ class TemporalRobustnessConfig:
             artifact_dir=str((config_path.parent / config.artifact_dir).resolve())
             if not Path(config.artifact_dir).is_absolute()
             else config.artifact_dir,
+            comparison_config_path=str(
+                (config_path.parent / config.comparison_config_path).resolve()
+            ) if not Path(config.comparison_config_path).is_absolute()
+            else config.comparison_config_path,
+            semantic_config_path=str(
+                (config_path.parent / config.semantic_config_path).resolve()
+            ) if not Path(config.semantic_config_path).is_absolute()
+            else config.semantic_config_path,
         )

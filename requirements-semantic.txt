@@ -24,3 +24,4 @@ drift-resilient-tabpfn @ git+https://github.com/automl/Drift-Resilient_TabPFN@a6
 
 # Test suite.
 pytest>=8,<10
+jupyterlab>=4,<5
