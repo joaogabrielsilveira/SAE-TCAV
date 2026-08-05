@@ -247,6 +247,7 @@ class FittedActivationTarget:
         return {
             "name": self.spec.name,
             "positive_fraction": self.spec.positive_fraction,
+            "compatibility_H": 100.0 * (1.0 - self.spec.positive_fraction),
             "minimum_positive_samples": self.spec.minimum_positive_samples,
             "cutoff": None if not self.valid else self.cutoff,
             "n_fit_samples": self.n_fit_samples,

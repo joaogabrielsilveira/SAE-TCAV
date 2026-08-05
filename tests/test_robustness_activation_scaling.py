@@ -46,3 +46,19 @@ def test_profiles_use_positive_values_strict_thresholds_and_dead_factors():
     np.testing.assert_array_equal(
         high_activation_matrix(concepts, perc=90), profiles[90]["masks"]
     )
+
+
+def test_profiles_fit_cutoffs_on_discovery_and_apply_to_selection():
+    discovery = np.asarray([[1.0, 0.0], [2.0, 1.0], [3.0, 2.0]])
+    selection = np.asarray([[100.0, 1.5], [0.5, 3.0]])
+
+    profile = high_activation_profiles(
+        discovery, (50,), apply_concepts=selection
+    )[50]
+
+    np.testing.assert_allclose(profile["thresholds"], [2.0, 1.5])
+    np.testing.assert_array_equal(
+        profile["masks"], [[True, False], [False, True]]
+    )
+    assert profile["fit_record_count"].item() == 3
+    assert profile["apply_record_count"].item() == 2

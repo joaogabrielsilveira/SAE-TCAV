@@ -30,8 +30,10 @@ def activation_threshold(concept: np.ndarray, perc: int = 90):
 def high_activation_profiles(
     concepts: np.ndarray,
     percentiles: Sequence[int] = (70, 80, 90),
+    *,
+    apply_concepts: np.ndarray | None = None,
 ) -> dict[int, dict[str, np.ndarray]]:
-    """Return positive-only thresholds and strict masks at each percentile."""
+    """Fit positive-only thresholds, optionally applying them to another cohort."""
 
     values = np.asarray(concepts)
     if values.ndim != 2:
@@ -44,6 +46,9 @@ def high_activation_profiles(
     if any(not 0 <= percentile <= 100 for percentile in normalized):
         raise ValueError("percentiles must lie in [0, 100]")
 
+    applied = values if apply_concepts is None else np.asarray(apply_concepts)
+    if applied.ndim != 2 or applied.shape[1] != values.shape[1]:
+        raise ValueError("apply_concepts must be two-dimensional with matching factors")
     thresholds = np.full((len(normalized), values.shape[1]), np.inf, dtype=float)
     for factor in range(values.shape[1]):
         positive = values[:, factor][values[:, factor] > 0]
@@ -51,8 +56,10 @@ def high_activation_profiles(
             thresholds[:, factor] = np.percentile(positive, normalized)
     return {
         percentile: {
-            "masks": np.asarray(values > thresholds[index], dtype=bool),
+            "masks": np.asarray(applied > thresholds[index], dtype=bool),
             "thresholds": thresholds[index].copy(),
+            "fit_record_count": np.asarray([len(values)], dtype=int),
+            "apply_record_count": np.asarray([len(applied)], dtype=int),
         }
         for index, percentile in enumerate(normalized)
     }
