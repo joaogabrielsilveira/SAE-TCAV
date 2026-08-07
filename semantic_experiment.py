@@ -14,17 +14,23 @@ import json
 from pathlib import Path
 import pickle
 from typing import Any, Iterable, Mapping, Sequence
+import uuid
 
 import numpy as np
 
 from semantic_artifacts import (
     SemanticArtifactStore,
     array_fingerprint,
+    build_semantic_result_index,
     derive_seed,
     environment_manifest,
+    load_semantic_result,
+    semantic_bundle_descriptors,
     stable_hash,
+    write_semantic_result_index,
 )
 from comparison_cache import ComparisonCache
+from artifact_storage import STORAGE_EQUIVALENT_SEMANTIC_FINGERPRINT
 from semantic_compare import (
     RuleFamily,
     RuleSimilarityConfig,
@@ -53,22 +59,24 @@ from stable_rule_backend import (
 )
 
 
-_SEMANTIC_SOURCE_FILES = (
+_SEMANTIC_SCIENTIFIC_SOURCE_FILES = (
     "semantic_experiment.py",
     "semantic_rules.py",
     "stable_rule_backend.py",
     "semantic_compare.py",
     "semantic_config.py",
     "semantic_splits.py",
-    "semantic_artifacts.py",
-    "comparison_cache.py",
+)
+
+_LEGACY_STORAGE_SOURCE_FINGERPRINT = (
+    "1ecc980962abd54ab0074785b2f0fc08d3312eb8294ec634b5616176b6c961c6"
 )
 
 
 def _source_fingerprint() -> str:
     digest = hashlib.sha256()
     root = Path(__file__).resolve().parent
-    for name in _SEMANTIC_SOURCE_FILES:
+    for name in _SEMANTIC_SCIENTIFIC_SOURCE_FILES:
         path = root / name
         digest.update(name.encode())
         digest.update(path.read_bytes())
@@ -868,7 +876,7 @@ def run_semantic_comparison(
     hash_config = config.to_dict()
     for name in ("artifact_dir", "cache", "show_progress", "n_jobs"):
         hash_config["runtime"].pop(name, None)
-    experiment_hash = stable_hash(
+    experiment_identity = (
         hash_config,
         array_fingerprint(X),
         array_fingerprint(y_stratify),
@@ -880,13 +888,35 @@ def run_semantic_comparison(
         pairs,
         names,
         list(record_keys) if record_keys is not None else None,
-        source_fingerprint,
-    )[:20]
+    )
+    experiment_hash = stable_hash(*experiment_identity, source_fingerprint)[:20]
     store = SemanticArtifactStore(config.runtime.artifact_dir, experiment_hash)
-    if config.runtime.cache and not force and store.exists("result.json"):
-        cached = store.read_json("result.json")
-        cached["cache_hit"] = True
-        return cached
+    cache_stores = [store]
+    if source_fingerprint == STORAGE_EQUIVALENT_SEMANTIC_FINGERPRINT:
+        legacy_hash = stable_hash(
+            *experiment_identity, _LEGACY_STORAGE_SOURCE_FINGERPRINT
+        )[:20]
+        legacy_root = Path(config.runtime.artifact_dir) / legacy_hash
+        if legacy_hash != experiment_hash and legacy_root.is_dir():
+            cache_stores.append(
+                SemanticArtifactStore(config.runtime.artifact_dir, legacy_hash)
+            )
+    if config.runtime.cache and not force:
+        for candidate in cache_stores:
+            if not candidate.exists("result.json"):
+                continue
+            try:
+                cached = load_semantic_result(
+                    candidate, expected_experiment_hash=candidate.root.name
+                )
+            except Exception:
+                invalid = candidate.root / (
+                    f"result.invalid-{uuid.uuid4().hex[:12]}.json"
+                )
+                (candidate.root / "result.json").replace(invalid)
+                continue
+            cached["cache_hit"] = True
+            return cached
 
     fit_indices = splits["idx_semantic_fit"]
     selection_indices = splits["idx_semantic_select"]
@@ -1091,7 +1121,7 @@ def run_semantic_comparison(
             },
         }
     store.write_json("manifest.json", manifest)
-    shared_cache.write_refs(store.root / "cache_refs.json")
+    shared_cache.write_refs(store.root / "cache_refs.json.gz")
     store.write_npz(
         "splits.npz",
         record_hashes=record_hashes,
@@ -1101,8 +1131,12 @@ def run_semantic_comparison(
         models[key].to_dict()
         for key in sorted(models, key=lambda item: (item[0], item[1], item[2]))
     ]
-    store.write_jsonl("semantic_rules.jsonl", model_rows)
-    store.write_jsonl("pair_results.jsonl", pair_results)
+    semantic_descriptor = store.write_jsonl_gzip(
+        "semantic_rules.jsonl.gz", model_rows
+    )
+    pair_descriptor = store.write_jsonl_gzip(
+        "pair_results.jsonl.gz", pair_results
+    )
     _write_flat_pair_csv(store.root / "pair_metrics.csv", pair_results)
     if config.class_analysis.enabled:
         _write_flat_class_pair_csv(
@@ -1117,7 +1151,22 @@ def run_semantic_comparison(
         "semantic_models": model_rows,
         "pair_results": pair_results,
     }
-    store.write_json("result.json", result)
+    manifest_descriptor, semantic_descriptor, pair_descriptor = (
+        semantic_bundle_descriptors(
+            store,
+            semantic_models_descriptor=semantic_descriptor,
+            pair_results_descriptor=pair_descriptor,
+        )
+    )
+    result_index = build_semantic_result_index(
+        store=store,
+        scientific_schema_version=config.schema_version,
+        experiment_hash=experiment_hash,
+        manifest_descriptor=manifest_descriptor,
+        semantic_models_descriptor=semantic_descriptor,
+        pair_results_descriptor=pair_descriptor,
+    )
+    write_semantic_result_index(store, result_index)
     return result
 
 

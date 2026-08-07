@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import csv
 import hashlib
+import inspect
 import json
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
@@ -15,6 +15,18 @@ from semantic_artifacts import array_fingerprint, stable_hash
 from temporal_cohorts import relative_domain_map
 from temporal_config import TemporalRobustnessConfig
 from temporal_splits import ReferenceSplit, generate_valid_reference_splits
+from artifact_storage import (
+    ARTIFACT_SCHEMA_VERSION,
+    atomic_write_json,
+    atomic_write_jsonl_gzip,
+    describe_json,
+    descriptor_for_file,
+    file_sha256,
+    iter_artifact_rows,
+    jsonable,
+    read_artifact,
+    validate_descriptor,
+)
 
 
 TEMPORAL_ESTIMAND = (
@@ -89,6 +101,107 @@ def _fingerprint_population(population: TemporalPopulation) -> dict[str, Any]:
     }
 
 
+def _scientific_config(config: TemporalRobustnessConfig) -> dict[str, Any]:
+    value = config.to_dict()
+    for name in ("artifact_dir", "use_cache", "show_progress", "force"):
+        value.pop(name, None)
+    return value
+
+
+def _dependent_config_fingerprints(
+    config: TemporalRobustnessConfig,
+) -> dict[str, dict[str, Any]]:
+    result = {}
+    for name in ("comparison_config_path", "semantic_config_path"):
+        path = Path(getattr(config, name))
+        result[name] = {
+            "path": str(path),
+            "sha256": file_sha256(path) if path.is_file() else None,
+        }
+    return result
+
+
+def _temporal_source_fingerprints(adapter: TemporalExperimentAdapter) -> dict[str, str]:
+    root = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for name in (
+        "temporal_analysis.py",
+        "temporal_cav.py",
+        "temporal_cohorts.py",
+        "temporal_config.py",
+        "temporal_matching.py",
+        "temporal_metrics.py",
+        "temporal_rules.py",
+        "temporal_splits.py",
+    ):
+        digest.update(name.encode())
+        digest.update((root / name).read_bytes())
+    try:
+        adapter_source = inspect.getsource(type(adapter))
+    except (OSError, TypeError):
+        adapter_source = f"{type(adapter).__module__}.{type(adapter).__qualname__}"
+    return {
+        "scientific_modules": digest.hexdigest(),
+        "production_adapter": hashlib.sha256(adapter_source.encode()).hexdigest(),
+    }
+
+
+def _split_identity(
+    *,
+    population: TemporalPopulation,
+    reference_year: int,
+    split: ReferenceSplit,
+    role_rows: Sequence[Mapping[str, Any]],
+    config: TemporalRobustnessConfig,
+    adapter: TemporalExperimentAdapter,
+) -> dict[str, Any]:
+    return {
+        "scientific_config_fingerprint": stable_hash(_scientific_config(config)),
+        "legacy_config_fingerprint": stable_hash(config.to_dict()),
+        "population_fingerprints": _fingerprint_population(population),
+        "reference_year": int(reference_year),
+        "patient_split_seed": int(split.effective_seed),
+        "requested_patient_split_seed": int(split.requested_seed),
+        "role_fingerprint": stable_hash(role_rows),
+        "dependent_config_fingerprints": _dependent_config_fingerprints(config),
+        "source_fingerprints": _temporal_source_fingerprints(adapter),
+    }
+
+
+def _load_completed_split(root: Path, identity: Mapping[str, Any]) -> dict[str, Any] | None:
+    manifest_path = root / "manifest.json"
+    if not manifest_path.is_file():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (
+            manifest.get("artifact_schema_version") != ARTIFACT_SCHEMA_VERSION
+            or manifest.get("complete") is not True
+            or manifest.get("scientific_identity") != identity
+        ):
+            return None
+        artifacts = manifest.get("artifacts")
+        if not isinstance(artifacts, Mapping):
+            return None
+        for descriptor in artifacts.values():
+            if not isinstance(descriptor, Mapping):
+                return None
+            validate_descriptor(root, descriptor)
+        return manifest
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _write_value_artifact(root: Path, name: str, value: Any) -> dict[str, Any]:
+    if isinstance(value, list) and all(isinstance(row, Mapping) for row in value):
+        path = root / f"{name}.jsonl.gz"
+        descriptor = atomic_write_jsonl_gzip(path, value)
+        descriptor["path"] = path.name
+        return descriptor
+    path = atomic_write_json(root / f"{name}.json", value)
+    return describe_json(path, relative_to=root)
+
+
 def run_reference_experiment(
     *,
     population: TemporalPopulation,
@@ -122,9 +235,27 @@ def run_reference_experiment(
                     "outcome": int(population.outcomes[index]),
                 }
             )
-    _write_json(root / "reference_roles.json", role_rows)
-    _write_csv(root / "reference_roles.csv", role_rows)
-    _write_json(root / "temporal_domain_map.json", {str(year): domain for year, domain in domain_map.items()})
+    identity = _split_identity(
+        population=population,
+        reference_year=reference_year,
+        split=split,
+        role_rows=role_rows,
+        config=config,
+        adapter=adapter,
+    )
+    if config.use_cache and not config.force:
+        completed = _load_completed_split(root, identity)
+        if completed is not None:
+            return completed
+
+    artifact_files: dict[str, dict[str, Any]] = {
+        "reference_roles": _write_value_artifact(root, "reference_roles", role_rows),
+        "temporal_domain_map": _write_value_artifact(
+            root,
+            "temporal_domain_map",
+            {str(year): domain for year, domain in domain_map.items()},
+        ),
+    }
 
     payload = dict(
         adapter.run_reference_experiment(
@@ -146,20 +277,16 @@ def run_reference_experiment(
             if actual.shape != expected_domains.shape or not np.array_equal(actual, expected_domains):
                 raise ValueError(f"{stage} domains differ from reference-relative record domains")
 
-    artifact_files = {}
     for name, value in sorted(payload.items()):
         if name.startswith("_"):
             continue
-        path = root / f"{name}.json"
-        _write_json(path, value)
-        artifact_files[name] = path.name
-        if isinstance(value, list) and all(isinstance(row, Mapping) for row in value):
-            csv_path = root / f"{name}.csv"
-            _write_csv(csv_path, value)
+        artifact_files[name] = _write_value_artifact(root, name, value)
 
     manifest = {
         "schema_version": config.schema_version,
-        "cache_schema_version": 1,
+        "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+        "cache_schema_version": 2,
+        "complete": True,
         "reference_year": reference_year,
         "patient_split_seed": split.effective_seed,
         "requested_patient_split_seed": split.requested_seed,
@@ -172,10 +299,14 @@ def run_reference_experiment(
         "population_fingerprints": _fingerprint_population(population),
         "role_fingerprint": stable_hash(role_rows),
         "config_fingerprint": stable_hash(config.to_dict()),
+        "scientific_config_fingerprint": stable_hash(_scientific_config(config)),
+        "dependent_config_fingerprints": identity["dependent_config_fingerprints"],
+        "source_fingerprints": identity["source_fingerprints"],
+        "scientific_identity": identity,
         "cache_namespace": str(root / "cache"),
         "artifacts": artifact_files,
     }
-    _write_json(root / "manifest.json", manifest)
+    atomic_write_json(root / "manifest.json", manifest)
     return manifest
 
 
@@ -202,14 +333,65 @@ def run_temporal_robustness(
     if int(feature_year) > min(config.reference_years):
         raise ValueError("future-derived feature vocabulary rejected")
 
-    root_hash = stable_hash(config.to_dict(), _fingerprint_population(population))[:20]
+    population_fingerprints = _fingerprint_population(population)
+    dependent_fingerprints = _dependent_config_fingerprints(config)
+    source_fingerprints = _temporal_source_fingerprints(adapter)
+    root_hash = stable_hash(
+        _scientific_config(config),
+        population_fingerprints,
+        dependent_fingerprints,
+        source_fingerprints,
+    )[:20]
     root = Path(config.artifact_dir) / root_hash
+    # The pre-v2 namespace included transport toggles and no dependency/source
+    # fingerprints. Reuse it only when the exact legacy identity already exists.
+    legacy_hash = stable_hash(config.to_dict(), population_fingerprints)[:20]
+    legacy_root = Path(config.artifact_dir) / legacy_hash
+    using_legacy_root = False
+    if not root.exists() and legacy_root.is_dir():
+        root_hash = legacy_hash
+        root = legacy_root
+        using_legacy_root = True
     root.mkdir(parents=True, exist_ok=True)
+    recovery_frontier = None
+    if using_legacy_root and not config.force:
+        parent_path = root / "parent_manifest.json"
+        if parent_path.is_file():
+            try:
+                existing_parent = json.loads(parent_path.read_text(encoding="utf-8"))
+                if existing_parent.get("complete") is True:
+                    recorded_frontier = existing_parent.get(
+                        "recovery_frontier_reference_year"
+                    )
+                    if recorded_frontier is not None:
+                        recovery_frontier = int(recorded_frontier)
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                pass
+        if recovery_frontier is None:
+            completed_years = []
+            for manifest_path in root.glob("reference_*/split_*/manifest.json"):
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    if manifest.get("complete") is True:
+                        completed_years.append(int(manifest["reference_year"]))
+                except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+                    continue
+            if completed_years:
+                recovery_frontier = max(completed_years)
     successful = []
     skipped = []
     failed = []
     split_attempts = {}
     for reference_year in config.reference_years:
+        if recovery_frontier is not None and reference_year > recovery_frontier:
+            skipped.append(
+                {
+                    "reference_year": reference_year,
+                    "reason": "outside_legacy_recovery_scope",
+                    "recovery_frontier_reference_year": recovery_frontier,
+                }
+            )
+            continue
         reference_indices = np.flatnonzero(population.years == reference_year)
         if not len(reference_indices):
             skipped.append({"reference_year": reference_year, "reason": "no_reference_records"})
@@ -265,80 +447,83 @@ def run_temporal_robustness(
                     raise
     from temporal_reporting import build_parent_reports
 
+    aggregate_artifacts = _aggregate_artifacts(root, successful)
     reports = build_parent_reports(root, successful, config)
     for name, rows in reports.items():
-        _write_json(root / "aggregate" / f"{name}.json", rows)
-        _write_csv(root / "aggregate" / f"{name}.csv", rows)
-    aggregate_artifacts = _aggregate_artifacts(root, successful)
-    aggregate_artifacts.update({
-        name: str(root / "aggregate" / f"{name}.csv")
-        for name in reports
-    })
+        path = root / "aggregate" / f"{name}.jsonl.gz"
+        descriptor = atomic_write_jsonl_gzip(path, rows)
+        descriptor["path"] = str(path.relative_to(root))
+        aggregate_artifacts[name] = descriptor
     parent = {
         "schema_version": config.schema_version,
+        "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+        "complete": True,
         "runner_hash": root_hash,
         "artifact_dir": str(root),
         "estimand": TEMPORAL_ESTIMAND,
         "config": config.to_dict(),
         "feature_selection_max_year": int(feature_year),
-        "population_fingerprints": _fingerprint_population(population),
+        "population_fingerprints": population_fingerprints,
+        "scientific_config_fingerprint": stable_hash(_scientific_config(config)),
+        "dependent_config_fingerprints": dependent_fingerprints,
+        "source_fingerprints": source_fingerprints,
+        "recovery_frontier_reference_year": recovery_frontier,
         "successful_experiments": successful,
         "skipped_references": skipped,
         "failed_experiments": failed,
         "split_attempts": split_attempts,
         "aggregate_artifacts": aggregate_artifacts,
     }
-    _write_json(root / "parent_manifest.json", parent)
-    _write_json(root / "summary.json", {
+    atomic_write_json(root / "summary.json", {
         "runner_hash": root_hash,
         "artifact_dir": str(root),
         "successful_count": len(successful),
         "skipped_reference_count": len(skipped),
         "failed_count": len(failed),
     })
+    # This parent completion marker is deliberately the final publication.
+    atomic_write_json(root / "parent_manifest.json", parent)
     return parent
 
 
-def _aggregate_artifacts(root: Path, successful) -> dict[str, str]:
-    grouped: dict[str, list[dict[str, Any]]] = {}
+def _aggregate_artifacts(root: Path, successful) -> dict[str, dict[str, Any]]:
+    grouped: dict[str, list[tuple[Path, str | Mapping[str, Any]]]] = {}
     for experiment in successful:
         manifest_path = Path(experiment["manifest"])
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        for name in manifest.get("artifacts", {}):
-            csv_path = manifest_path.parent / f"{name}.csv"
-            if not csv_path.is_file():
+        for name, descriptor in manifest.get("artifacts", {}).items():
+            try:
+                first = next(iter_artifact_rows(manifest_path.parent, descriptor))
+            except (StopIteration, ValueError, OSError, TypeError):
                 continue
-            with csv_path.open(newline="", encoding="utf-8") as handle:
-                grouped.setdefault(name, []).extend(csv.DictReader(handle))
+            if not isinstance(first, Mapping):
+                continue
+            grouped.setdefault(name, []).append((manifest_path.parent, descriptor))
     output = root / "aggregate"
-    files = {}
-    for name, rows in sorted(grouped.items()):
-        path = output / f"{name}.csv"
-        _write_csv(path, rows)
-        files[name] = str(path)
+    files: dict[str, dict[str, Any]] = {}
+    for name, sources in sorted(grouped.items()):
+        def rows():
+            for directory, descriptor in sources:
+                yield from iter_artifact_rows(directory, descriptor)
+
+        path = output / f"{name}.jsonl.gz"
+        artifact = atomic_write_jsonl_gzip(path, rows())
+        artifact["path"] = str(path.relative_to(root))
+        files[name] = artifact
     return files
 
 
 def _jsonable(value):
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, Mapping):
-        return {str(key): _jsonable(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(item) for item in value]
-    return value
+    return jsonable(value)
 
 
 def _write_json(path: Path, value) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(_jsonable(value), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    atomic_write_json(path, value, compact=False)
 
 
 def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    import csv
+
     rows = list(rows)
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = sorted({str(key) for row in rows for key in row})
@@ -347,10 +532,15 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         if fieldnames:
             writer.writeheader()
             for row in rows:
-                writer.writerow({key: _jsonable(row.get(key)) for key in fieldnames})
+                writer.writerow({
+                    key: (
+                        json.dumps(_jsonable(row.get(key)), sort_keys=True, separators=(",", ":"))
+                        if isinstance(row.get(key), (Mapping, list, tuple))
+                        else _jsonable(row.get(key))
+                    )
+                    for key in fieldnames
+                })
 
 
 def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    digest.update(path.read_bytes())
-    return digest.hexdigest()
+    return file_sha256(path)

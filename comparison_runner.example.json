@@ -29,11 +29,11 @@
   },
   "matching": {
     "scope": "all",
-    "criterion": "cos_sim",
+    "criterion": "overlap",
     "max_pairs_per_run_pair": null,
     "analysis_percentiles": [70, 80, 90],
     "cosine_analysis_threshold": 0.6,
-    "overlap_analysis_threshold": 0.7,
+    "overlap_analysis_threshold": 0.75,
     "nearest_neighbor_top_k": 3,
     "alternative_score_deltas": [0.05, 0.1]
   },

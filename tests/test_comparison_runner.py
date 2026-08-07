@@ -408,8 +408,8 @@ def test_two_run_orchestration_preserves_alignment_and_selected_matches(
     )
     assert runner_manifest["accelerator"]["resolved_device"] in {"cpu", "cuda"}
     assert runner_manifest["stage_metrics"] == stage_metrics
-    assert (artifact_dir / "cache_refs.json").is_file()
-    assert runner_manifest["cache"]["refs_file"].endswith("cache_refs.json")
+    assert (artifact_dir / "cache_refs.json.gz").is_file()
+    assert runner_manifest["cache"]["refs_file"].endswith("cache_refs.json.gz")
     assert summary["cache"] == runner_manifest["cache"]
 
 
@@ -650,24 +650,24 @@ def test_adding_seed_reuses_existing_sae_models_and_activations(
             dtype=np.float32,
         )
 
+    def fake_high_activation_profiles(values, percentiles, *, apply_concepts=None):
+        applied = values if apply_concepts is None else apply_concepts
+        return {
+            percentile: {
+                "masks": applied
+                > np.percentile(values, percentile, axis=0, keepdims=True),
+                "thresholds": np.percentile(values, percentile, axis=0),
+            }
+            for percentile in percentiles
+        }
+
     monkeypatch.setitem(
         sys.modules,
         "sae_compare",
         SimpleNamespace(
             train_all_saes=fake_train_all_saes,
             encode_sae=fake_encode_sae,
-            high_activation_profiles=lambda values, percentiles: {
-                percentile: {
-                    "masks": values
-                    > np.percentile(
-                        values, percentile, axis=0, keepdims=True
-                    ),
-                    "thresholds": np.percentile(
-                        values, percentile, axis=0
-                    ),
-                }
-                for percentile in percentiles
-            },
+            high_activation_profiles=fake_high_activation_profiles,
         ),
     )
     cache_root = tmp_path / "shared-cache"

@@ -1,5 +1,6 @@
 import csv
 from dataclasses import replace
+import json
 
 import numpy as np
 
@@ -248,7 +249,19 @@ def test_end_to_end_uses_fit_only_then_shared_final_records(monkeypatch, tmp_pat
     assert "i_to_j" in threshold["transfer"]
     assert "j_to_i" in threshold["transfer"]
     assert result["pair_results"][0]["functional"]["tcav_effect_sign_agreement"] is True
-    assert (tmp_path / result["experiment_hash"] / "semantic_rules.jsonl").exists()
+    artifact_dir = tmp_path / result["experiment_hash"]
+    rules_path = artifact_dir / "semantic_rules.jsonl.gz"
+    pairs_path = artifact_dir / "pair_results.jsonl.gz"
+    assert rules_path.exists()
+    result_index = json.loads((artifact_dir / "result.json").read_text())
+    assert result_index["artifact_schema_version"] == 2
+    assert result_index["complete"] is True
+    assert "semantic_models" not in result_index
+    assert "pair_results" not in result_index
+    assert set(result_index["artifacts"]) == {
+        "manifest", "semantic_models", "pair_results"
+    }
+    deterministic_rules = rules_path.read_bytes()
     cached = semantic_experiment.run_semantic_comparison(
         X=X, outcome_for_stratification=outcome, patient_ids=patients,
         feature_names=("signal", "row_id"), activations_by_run=activations,
@@ -256,6 +269,27 @@ def test_end_to_end_uses_fit_only_then_shared_final_records(monkeypatch, tmp_pat
         config=config, clinical_groups={"signal": ("signal_group",)}, functional_by_factor=functional,
     )
     assert cached["cache_hit"] is True
+
+    rebuilt = semantic_experiment.run_semantic_comparison(
+        X=X, outcome_for_stratification=outcome, patient_ids=patients,
+        feature_names=("signal", "row_id"), activations_by_run=activations,
+        matchings=[{"sae_i_idx": 0, "sae_j_idx": 1, "original_concept": 0, "best_pair": 0, "cos_sim": 0.91, "overlap": 0.72}],
+        config=config, clinical_groups={"signal": ("signal_group",)}, functional_by_factor=functional,
+        force=True,
+    )
+    assert rebuilt["semantic_models"] == result["semantic_models"]
+    assert rebuilt["pair_results"] == result["pair_results"]
+    assert rules_path.read_bytes() == deterministic_rules
+
+    pairs_path.write_bytes(pairs_path.read_bytes()[:-8])
+    recovered = semantic_experiment.run_semantic_comparison(
+        X=X, outcome_for_stratification=outcome, patient_ids=patients,
+        feature_names=("signal", "row_id"), activations_by_run=activations,
+        matchings=[{"sae_i_idx": 0, "sae_j_idx": 1, "original_concept": 0, "best_pair": 0, "cos_sim": 0.91, "overlap": 0.72}],
+        config=config, clinical_groups={"signal": ("signal_group",)}, functional_by_factor=functional,
+    )
+    assert recovered["pair_results"] == result["pair_results"]
+    assert list(artifact_dir.glob("result.invalid-*.json"))
 
 
 def test_class_analysis_is_additive_and_uses_only_final_class_rows(

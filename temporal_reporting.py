@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Mapping, Sequence
 
 import numpy as np
+
+from artifact_storage import read_artifact
 
 from temporal_analysis import (
     fit_lead_lag_regression,
@@ -15,7 +18,6 @@ from temporal_analysis import (
 )
 from temporal_metrics import (
     bootstrap_interval,
-    hierarchical_bootstrap_interval,
     percentile_interval,
 )
 
@@ -37,13 +39,19 @@ def build_parent_reports(root: Path, successful, config) -> dict[str, list[dict]
 def _load(successful):
     tables = {}
     for entry in successful:
-        directory = Path(entry["manifest"]).parent
-        manifest = json.loads((directory / "manifest.json").read_text())
-        for name in manifest.get("artifacts", {}):
-            path = directory / f"{name}.json"
-            if not path.is_file():
-                continue
-            value = json.loads(path.read_text())
+        manifest_path = Path(entry["manifest"])
+        directory = manifest_path.parent
+        manifest = json.loads(manifest_path.read_text())
+        for name, descriptor in manifest.get("artifacts", {}).items():
+            try:
+                value = read_artifact(directory, descriptor)
+            except (OSError, ValueError, TypeError):
+                # Legacy manifests sometimes named a CSV even when the JSON
+                # table was the typed canonical copy.
+                legacy = directory / f"{name}.json"
+                if not legacy.is_file():
+                    continue
+                value = json.loads(legacy.read_text())
             if isinstance(value, list):
                 tables.setdefault(name, []).extend(value)
     return tables
@@ -97,7 +105,7 @@ def _uncertainty(performance, factors, config):
     for key, rows in _groups(factors, f_fields).items():
         for metric in ("f2", "prevalence_ratio"):
             try:
-                lower, upper = hierarchical_bootstrap_interval(
+                lower, upper = _hierarchical_bootstrap_interval(
                     rows, metric, replicates=config.bootstrap_replicates,
                     seed=config.bootstrap_seed,
                 )
@@ -111,6 +119,61 @@ def _uncertainty(performance, factors, config):
                 "exploratory": len({row.get("factor_family_uid") for row in rows}) < 10,
             })
     return output
+
+
+def _hierarchical_bootstrap_interval(
+    rows: Sequence[Mapping[str, object]],
+    value_key: str,
+    *,
+    split_key: str = "patient_split_seed",
+    member_key: str = "member_sae_seed",
+    family_key: str = "factor_family_uid",
+    replicates: int = 2000,
+    seed: int = 42,
+) -> tuple[float, float]:
+    """Result-equivalent parent bootstrap with invariant means precomputed."""
+
+    nested = {}
+    for row in rows:
+        value = row.get(value_key)
+        if value is None or not np.isfinite(value):
+            continue
+        split = row[split_key]
+        member = row[member_key]
+        family = row[family_key]
+        nested.setdefault(split, {}).setdefault(member, {}).setdefault(
+            family, []
+        ).append(float(value))
+    splits = tuple(sorted(nested, key=str))
+    if not splits:
+        return float("nan"), float("nan")
+
+    # Family and member means do not depend on a bootstrap draw. Computing
+    # them once preserves the original operation order and RNG sequence while
+    # avoiding millions of identical reductions for large parent reports.
+    member_means = []
+    for split in splits:
+        members = nested[split]
+        values = []
+        for member in sorted(members, key=str):
+            families = members[member]
+            family_values = [np.mean(items) for items in families.values()]
+            values.append(float(np.mean(family_values)))
+        member_means.append(np.asarray(values, dtype=float))
+
+    rng = np.random.default_rng(seed)
+    estimates = []
+    for _ in range(replicates):
+        sampled_splits = rng.integers(0, len(splits), len(splits))
+        split_values = []
+        for position in sampled_splits:
+            values = member_means[position]
+            sampled_members = rng.integers(0, len(values), len(values))
+            split_values.append(float(np.mean(values[sampled_members])))
+        estimates.append(float(np.mean(split_values)))
+    return tuple(
+        float(value) for value in np.percentile(estimates, [2.5, 97.5])
+    )
 
 
 def _lead_lag(performance, factors, config):
