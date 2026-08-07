@@ -7,10 +7,10 @@
   "objective": {
     "objective": "f2",
     "min_precision": 0.5,
-    "min_lift": 1.5,
+    "min_lift": 0,
     "max_rules": 5,
     "max_rule_length": 5,
-    "min_marginal_recall": 0.02,
+    "min_marginal_recall": 0.01,
     "exhaustive_candidate_limit": 20,
     "beam_width": 64
   },

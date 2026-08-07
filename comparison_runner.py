@@ -23,6 +23,12 @@ import numpy as np
 from semantic_artifacts import array_fingerprint, stable_hash
 from runtime_acceleration import StageTelemetry, accelerator_manifest
 from comparison_cache import ComparisonCache
+from artifact_storage import STORAGE_EQUIVALENT_RUNNER_FINGERPRINT
+
+
+_LEGACY_RUNNER_STORAGE_FINGERPRINT = (
+    "b9be6752cfe0f6ca4620838c7b952fdb8d42bac4e0934bb4571d429feaf1d5a6"
+)
 
 
 @dataclass(frozen=True)
@@ -1838,25 +1844,32 @@ def run_comparison(
     }
     source_hash = _runner_source_fingerprint()
     hash_config = _scientific_runner_config(config)
-    runner_hash = stable_hash(
+    runner_identity = (
         hash_config,
         dataset_hash,
         hash_semantic_dependencies,
-        source_hash,
-    )[:20]
+    )
+    runner_hash = stable_hash(*runner_identity, source_hash)[:20]
     workspace = Path(config.artifact_dir) / runner_hash
+    cache_workspaces = [workspace]
+    if source_hash == STORAGE_EQUIVALENT_RUNNER_FINGERPRINT:
+        legacy_hash = stable_hash(
+            *runner_identity, _LEGACY_RUNNER_STORAGE_FINGERPRINT
+        )[:20]
+        legacy_workspace = Path(config.artifact_dir) / legacy_hash
+        if legacy_workspace != workspace and legacy_workspace.is_dir():
+            cache_workspaces.append(legacy_workspace)
+    if config.use_cache and not force and not force_stages:
+        for candidate in cache_workspaces:
+            summary_path = candidate / "summary.json"
+            if not summary_path.exists():
+                continue
+            with summary_path.open(encoding="utf-8") as handle:
+                cached = json.load(handle)
+            cached["cache_hit"] = True
+            return cached
     workspace.mkdir(parents=True, exist_ok=True)
     summary_path = workspace / "summary.json"
-    if (
-        config.use_cache
-        and not force
-        and not force_stages
-        and summary_path.exists()
-    ):
-        with summary_path.open(encoding="utf-8") as handle:
-            cached = json.load(handle)
-        cached["cache_hit"] = True
-        return cached
 
     cache_root = (
         Path(config.cache_dir)
@@ -2022,13 +2035,14 @@ def run_comparison(
         ),
         "cache": {
             **shared_cache.summary(),
-            "refs_file": str(workspace / "cache_refs.json"),
+            "refs_file": None,
             "tabpfn_model_cache_supported": (
                 tabpfn_model_cache_supported
             ),
         },
     }
-    shared_cache.write_refs(workspace / "cache_refs.json")
+    refs_path = shared_cache.write_refs(workspace / "cache_refs.json.gz")
+    manifest["cache"]["refs_file"] = str(refs_path)
     _write_json(workspace / "runner_manifest.json", manifest)
     summary = {
         "runner_hash": runner_hash,
@@ -3000,9 +3014,10 @@ def _semantic_dependency_fingerprints(path: Path) -> dict[str, Any]:
 
 def _runner_source_fingerprint() -> str:
     root = Path(__file__).resolve().parent
+    # Transport-only modules are deliberately excluded. Their serialization or
+    # compression can change without changing the scientific experiment.
     names = (
         "comparison_runner.py",
-        "comparison_cache.py",
         "main-comparison.py",
         "runtime_acceleration.py",
         "database.py",
@@ -3012,7 +3027,6 @@ def _runner_source_fingerprint() -> str:
         "robustness_matching.py",
         "decision_tree.py",
         "tcav.py",
-        "semantic_artifacts.py",
         "semantic_experiment.py",
         "semantic_rules.py",
         "stable_rule_backend.py",

@@ -24,6 +24,11 @@ import uuid
 import numpy as np
 
 from semantic_artifacts import stable_hash
+from artifact_storage import (
+    atomic_write_json,
+    atomic_write_json_gzip,
+    read_json_file,
+)
 
 
 T = TypeVar("T")
@@ -229,7 +234,9 @@ class ComparisonCache:
                     "output_fingerprints": output_fingerprints,
                     "complete": True,
                 }
-                self._write_json(temporary / "manifest.json", manifest_value)
+                atomic_write_json_gzip(
+                    temporary / "manifest.json.gz", manifest_value
+                )
                 if entry.exists():
                     # Defensive only; lock normally makes this impossible.
                     shutil.rmtree(temporary)
@@ -270,12 +277,16 @@ class ComparisonCache:
 
     def write_refs(self, path: str | Path) -> Path:
         destination = Path(path)
+        if destination.name.endswith(".json"):
+            destination = destination.with_name(destination.name + ".gz")
+        elif not destination.name.endswith(".json.gz"):
+            raise ValueError("cache reference files must end in .json or .json.gz")
         destination.parent.mkdir(parents=True, exist_ok=True)
-        self._write_json(
+        atomic_write_json_gzip(
             destination,
             {
                 "cache_schema_version": CACHE_SCHEMA_VERSION,
-                "cache_root": str(self.root),
+                "cache_root": str(self.root.resolve()),
                 "entries": [asdict(event) for event in self.events],
             },
         )
@@ -287,12 +298,11 @@ class ComparisonCache:
     def _read_valid_manifest(
         self, entry: Path, stage: str, key: str
     ) -> dict[str, Any] | None:
-        manifest_path = entry / "manifest.json"
-        if not manifest_path.is_file():
+        manifest_path = _manifest_path(entry)
+        if manifest_path is None:
             return None
         try:
-            with manifest_path.open(encoding="utf-8") as handle:
-                manifest = json.load(handle)
+            manifest = read_json_file(manifest_path)
             if (
                 manifest.get("cache_schema_version") != CACHE_SCHEMA_VERSION
                 or manifest.get("stage") != stage
@@ -394,22 +404,12 @@ class ComparisonCache:
                 "size_bytes": path.stat().st_size,
             }
             for path in sorted(directory.rglob("*"))
-            if path.is_file() and path.name != "manifest.json"
+            if path.is_file() and path.name not in {"manifest.json", "manifest.json.gz"}
         }
 
     @staticmethod
     def _write_json(path: Path, value: Any) -> None:
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        with temporary.open("w", encoding="utf-8") as handle:
-            json.dump(
-                value,
-                handle,
-                default=_json_default,
-                sort_keys=True,
-                indent=2,
-                allow_nan=False,
-            )
-        os.replace(temporary, path)
+        atomic_write_json(path, value, compact=False)
 
 
 def _json_default(value: Any) -> Any:
@@ -439,8 +439,16 @@ def _cache_entries(root: Path):
         if not stage.is_dir() or stage.name in {".locks", "quarantine"}:
             continue
         for entry in sorted(stage.iterdir()):
-            if entry.is_dir() and (entry / "manifest.json").is_file():
+            if entry.is_dir() and _manifest_path(entry) is not None:
                 yield stage.name, entry
+
+
+def _manifest_path(entry: Path) -> Path | None:
+    for name in ("manifest.json.gz", "manifest.json"):
+        path = entry / name
+        if path.is_file():
+            return path
+    return None
 
 
 def _inspect(root: Path) -> dict[str, Any]:
@@ -452,31 +460,78 @@ def _inspect(root: Path) -> dict[str, Any]:
         stages[stage]["size_bytes"] += sum(
             path.stat().st_size for path in entry.rglob("*") if path.is_file()
         )
+    health = _reference_health(root)
     return {
         "root": str(root),
         "entries": sum(value["entries"] for value in stages.values()),
         "size_bytes": sum(value["size_bytes"] for value in stages.values()),
         "stages": dict(sorted(stages.items())),
+        "references": health,
+    }
+
+
+def _reference_search_roots(root: Path) -> tuple[Path, ...]:
+    candidates = {root.parent}
+    if root.name == "v2" or root.parent.name in {"_cache", "cache"}:
+        candidates.add(root.parent.parent)
+    return tuple(sorted(candidates, key=lambda value: str(value)))
+
+
+def _reference_health(root: Path) -> dict[str, Any]:
+    referenced: set[tuple[str, str]] = set()
+    valid_files: list[str] = []
+    ignored_files: list[str] = []
+    refs_paths: set[Path] = set()
+    for search_root in _reference_search_roots(root):
+        if not search_root.exists():
+            continue
+        refs_paths.update(search_root.rglob("cache_refs.json"))
+        refs_paths.update(search_root.rglob("cache_refs.json.gz"))
+    resolved_root = root.resolve()
+    for refs_path in sorted(refs_paths):
+        try:
+            refs = read_json_file(refs_path)
+            declared = Path(str(refs["cache_root"])).resolve()
+            if declared != resolved_root:
+                ignored_files.append(str(refs_path))
+                continue
+            for entry in refs.get("entries", []):
+                referenced.add((str(entry["stage"]), str(entry["key"])))
+            valid_files.append(str(refs_path))
+        except (OSError, ValueError, KeyError, TypeError):
+            ignored_files.append(str(refs_path))
+            continue
+    existing = {(stage, entry.name) for stage, entry in _cache_entries(root)}
+    missing = referenced - existing
+    unreferenced = existing - referenced
+    return {
+        "valid_reference_file_count": len(valid_files),
+        "valid_reference_files": valid_files,
+        "ignored_reference_file_count": len(ignored_files),
+        "referenced_key_count": len(referenced),
+        "missing_referenced_target_count": len(missing),
+        "missing_referenced_targets": [
+            {"stage": stage, "key": key} for stage, key in sorted(missing)
+        ],
+        "unreferenced_key_count": len(unreferenced),
+        "unreferenced_keys": [
+            {"stage": stage, "key": key} for stage, key in sorted(unreferenced)
+        ],
     }
 
 
 def _referenced_keys(root: Path) -> set[tuple[str, str]]:
-    referenced: set[tuple[str, str]] = set()
-    search_roots = {root.parent, root.parent.parent}
-    refs_paths = {
-        path
-        for search_root in search_roots
-        for path in search_root.glob("*/cache_refs.json")
+    health = _reference_health(root)
+    missing = {
+        (row["stage"], row["key"])
+        for row in health["missing_referenced_targets"]
     }
-    for refs_path in sorted(refs_paths):
-        try:
-            with refs_path.open(encoding="utf-8") as handle:
-                refs = json.load(handle)
-            for entry in refs.get("entries", []):
-                referenced.add((str(entry["stage"]), str(entry["key"])))
-        except (OSError, ValueError, KeyError, TypeError):
-            continue
-    return referenced
+    unreferenced = {
+        (row["stage"], row["key"])
+        for row in health["unreferenced_keys"]
+    }
+    existing = {(stage, entry.name) for stage, entry in _cache_entries(root)}
+    return (existing - unreferenced) | missing
 
 
 def _prune(
@@ -485,17 +540,44 @@ def _prune(
     unreferenced: bool,
     older_than_days: int | None,
     apply: bool,
+    stages: Sequence[str] = (),
+    unsafe_no_references: bool = False,
+    final_only: bool = False,
+    parent_manifest: str | Path | None = None,
 ) -> dict[str, Any]:
     now = datetime.now(timezone.utc)
+    health = _reference_health(root)
     referenced = _referenced_keys(root) if unreferenced else set()
+    entries = list(_cache_entries(root))
+    if (
+        apply
+        and unreferenced
+        and entries
+        and health["valid_reference_file_count"] == 0
+        and not unsafe_no_references
+    ):
+        raise RuntimeError(
+            "refusing unreferenced cache pruning: nonempty cache has no valid reference files"
+        )
+    if final_only:
+        if parent_manifest is None:
+            raise ValueError("final-only pruning requires a parent manifest")
+        _validate_completed_parent(Path(parent_manifest))
     selected: list[Path] = []
     size_bytes = 0
-    for stage, entry in _cache_entries(root):
+    selected_stages = set(stages)
+    for stage, entry in entries:
+        if selected_stages and stage not in selected_stages:
+            continue
         if unreferenced and (stage, entry.name) in referenced:
             continue
         if older_than_days is not None:
-            with (entry / "manifest.json").open(encoding="utf-8") as handle:
-                created = datetime.fromisoformat(json.load(handle)["created_at"])
+            manifest_path = _manifest_path(entry)
+            if manifest_path is None:
+                continue
+            created = datetime.fromisoformat(
+                read_json_file(manifest_path)["created_at"]
+            )
             if (now - created).days < older_than_days:
                 continue
         selected.append(entry)
@@ -510,7 +592,31 @@ def _prune(
         "dry_run": not apply,
         "entries": len(selected),
         "size_bytes": size_bytes,
+        "valid_reference_file_count": health["valid_reference_file_count"],
     }
+
+
+def _validate_completed_parent(path: Path) -> None:
+    from artifact_storage import validate_descriptor
+
+    parent = read_json_file(path)
+    if parent.get("complete") is not True:
+        raise ValueError("parent manifest is not complete")
+    for descriptor in parent.get("aggregate_artifacts", {}).values():
+        if not isinstance(descriptor, Mapping):
+            raise ValueError("parent uses an unvalidated legacy aggregate artifact")
+        validate_descriptor(path.parent, descriptor)
+    for entry in parent.get("successful_experiments", []):
+        manifest_path = Path(entry["manifest"])
+        if not manifest_path.is_absolute():
+            manifest_path = path.parent / manifest_path
+        manifest = read_json_file(manifest_path)
+        if manifest.get("complete") is not True:
+            raise ValueError(f"split manifest is not complete: {manifest_path}")
+        for descriptor in manifest.get("artifacts", {}).values():
+            if not isinstance(descriptor, Mapping):
+                raise ValueError(f"split uses an unvalidated legacy artifact: {manifest_path}")
+            validate_descriptor(manifest_path.parent, descriptor)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -522,14 +628,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     prune_parser.add_argument("--root", required=True)
     prune_parser.add_argument("--unreferenced", action="store_true")
     prune_parser.add_argument("--older-than-days", type=int)
+    prune_parser.add_argument("--stage", action="append", default=[])
+    prune_parser.add_argument("--final-only", action="store_true")
+    prune_parser.add_argument("--parent")
+    prune_parser.add_argument("--unsafe-no-references", action="store_true")
     prune_parser.add_argument("--apply", action="store_true")
     args = parser.parse_args(argv)
     root = Path(args.root)
     if args.command == "inspect":
         print(json.dumps(_inspect(root), sort_keys=True, indent=2))
         return 0
-    if not args.unreferenced and args.older_than_days is None:
-        parser.error("prune requires --unreferenced or --older-than-days")
+    if not args.unreferenced and args.older_than_days is None and not args.stage and not args.final_only:
+        parser.error("prune requires a retention policy")
     if args.older_than_days is not None and args.older_than_days < 0:
         parser.error("--older-than-days must be non-negative")
     print(
@@ -539,6 +649,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 unreferenced=args.unreferenced,
                 older_than_days=args.older_than_days,
                 apply=args.apply,
+                stages=args.stage,
+                unsafe_no_references=args.unsafe_no_references,
+                final_only=args.final_only,
+                parent_manifest=args.parent,
             ),
             sort_keys=True,
             indent=2,

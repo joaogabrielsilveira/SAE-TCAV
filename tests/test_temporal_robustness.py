@@ -1,3 +1,4 @@
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from temporal_robustness import TemporalPopulation, run_temporal_robustness
 from temporal_rules import fit_canonical_targets, select_activation_winner
 from temporal_splits import ROLE_FRACTIONS, split_reference_patients
 from temporal_cav import temporal_tcav
+from artifact_storage import read_artifact
 
 
 def test_five_way_split_is_deterministic_stratified_and_patient_disjoint():
@@ -206,8 +208,36 @@ def test_parent_runner_namespaces_manifests_and_keeps_diagonal(tmp_path):
     for row in result["successful_experiments"]:
         manifest = json.loads(Path(row["manifest"]).read_text())
         assert manifest["temporal_domain_map"][str(row["reference_year"])] == 0
-        assert Path(row["manifest"]).parent.joinpath("performance.json").is_file()
+        performance = manifest["artifacts"]["performance"]
+        assert performance["path"].endswith(".jsonl.gz")
+        assert read_artifact(Path(row["manifest"]).parent, performance)
+        assert all(
+            "row_count" in descriptor
+            for descriptor in manifest["artifacts"].values()
+        )
     assert Path(result["artifact_dir"], "parent_manifest.json").is_file()
+    assert all(
+        "row_count" in descriptor
+        for descriptor in result["aggregate_artifacts"].values()
+    )
+
+    call_count = len(adapter.calls)
+    cached = run_temporal_robustness(config, adapter=adapter)
+    assert len(adapter.calls) == call_count
+    assert cached["successful_experiments"] == result["successful_experiments"]
+
+    Path(result["successful_experiments"][0]["manifest"]).unlink()
+    resumed = run_temporal_robustness(config, adapter=adapter)
+    assert len(adapter.calls) == call_count + 1
+    assert len(resumed["successful_experiments"]) == 2
+
+    before_force = len(adapter.calls)
+    run_temporal_robustness(replace(config, force=True), adapter=adapter)
+    assert len(adapter.calls) == before_force + 2
+
+    before_no_cache = len(adapter.calls)
+    run_temporal_robustness(replace(config, use_cache=False), adapter=adapter)
+    assert len(adapter.calls) == before_no_cache + 2
 
 
 def test_threshold_scalar_migration_and_future_feature_rejection():

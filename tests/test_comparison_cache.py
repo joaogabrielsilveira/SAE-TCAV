@@ -6,6 +6,7 @@ import time
 import pytest
 
 from comparison_cache import ComparisonCache, _inspect, _prune
+from artifact_storage import atomic_write_json_gzip, read_json_file
 
 
 def _concurrent_cache_worker(root, marker):
@@ -157,10 +158,10 @@ def test_incomplete_manifest_recomputes(tmp_path):
     calls = []
     cache = ComparisonCache(tmp_path)
     first = _resolve(cache, calls)
-    manifest_path = first.artifact_path / "manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_path = first.artifact_path / "manifest.json.gz"
+    manifest = read_json_file(manifest_path)
     manifest["complete"] = False
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    atomic_write_json_gzip(manifest_path, manifest)
 
     second = _resolve(cache, calls)
 
@@ -196,10 +197,11 @@ def test_cache_refs_are_serializable(tmp_path):
     _resolve(cache, calls)
 
     refs = cache.write_refs(tmp_path / "run" / "cache_refs.json")
-    payload = json.loads(refs.read_text(encoding="utf-8"))
+    payload = read_json_file(refs)
 
     assert payload["cache_schema_version"] == 2
     assert payload["entries"][0]["stage"] == "prepared"
+    assert refs.name == "cache_refs.json.gz"
 
 
 def test_unknown_force_stage_rejected(tmp_path):
@@ -234,6 +236,54 @@ def test_inspect_and_prune_are_dry_run_by_default(tmp_path):
     )
     assert applied["dry_run"] is False
     assert not result.artifact_path.exists()
+
+
+def test_nested_references_protect_entries_and_wrong_roots_are_ignored(tmp_path):
+    root = tmp_path / "cache"
+    cache = ComparisonCache(root)
+    result = _resolve(cache, [])
+    valid_refs = cache.write_refs(
+        tmp_path / "runs" / "reference_2009" / "split_45" / "cache_refs.json"
+    )
+    wrong_refs = tmp_path / "runs" / "other" / "cache_refs.json.gz"
+    wrong_refs.parent.mkdir(parents=True)
+    atomic_write_json_gzip(
+        wrong_refs,
+        {
+            "cache_root": str((tmp_path / "different-cache").resolve()),
+            "entries": [{"stage": result.stage, "key": result.key}],
+        },
+    )
+
+    health = _inspect(root)["references"]
+    assert health["valid_reference_file_count"] == 1
+    assert health["ignored_reference_file_count"] == 1
+    assert health["referenced_key_count"] == 1
+    assert health["missing_referenced_target_count"] == 0
+    assert health["unreferenced_key_count"] == 0
+    assert _prune(root, unreferenced=True, older_than_days=None, apply=False)[
+        "entries"
+    ] == 0
+
+    valid_refs.unlink()
+    with pytest.raises(RuntimeError, match="no valid reference files"):
+        _prune(root, unreferenced=True, older_than_days=None, apply=True)
+    assert result.artifact_path.exists()
+
+
+def test_plain_and_gzip_cache_manifests_load_identically(tmp_path):
+    root = tmp_path / "cache"
+    first = _resolve(ComparisonCache(root), [])
+    compressed = first.artifact_path / "manifest.json.gz"
+    manifest = read_json_file(compressed)
+    (first.artifact_path / "manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    compressed.unlink()
+
+    second = _resolve(ComparisonCache(root), [])
+    assert second.status == "hit"
+    assert second.value == first.value
 
 
 def test_concurrent_resolvers_publish_one_entry(tmp_path):
