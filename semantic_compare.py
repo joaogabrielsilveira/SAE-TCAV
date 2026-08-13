@@ -23,16 +23,14 @@ if TYPE_CHECKING:
 class RuleSimilarityWeights:
     """Components of stable-rule similarity; defaults sum to one."""
 
-    cohort: float = 0.50
-    exact_feature: float = 0.20
-    clinical_group: float = 0.20
-    threshold_direction: float = 0.10
+    cohort: float = 0.625
+    exact_feature: float = 0.25
+    threshold_direction: float = 0.125
 
     def __post_init__(self) -> None:
         values = (
             self.cohort,
             self.exact_feature,
-            self.clinical_group,
             self.threshold_direction,
         )
         if any(value < 0.0 for value in values):
@@ -44,13 +42,24 @@ class RuleSimilarityWeights:
         return {
             "cohort": self.cohort,
             "exact_feature": self.exact_feature,
-            "clinical_group": self.clinical_group,
             "threshold_direction": self.threshold_direction,
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> "RuleSimilarityWeights":
-        return cls(**{key: float(raw) for key, raw in value.items()})
+        # Old artifacts included a clinical-group component. Discard it and
+        # renormalize the remaining scientific components when deserializing.
+        raw = {
+            key: float(item)
+            for key, item in value.items()
+            if key in {"cohort", "exact_feature", "threshold_direction"}
+        }
+        if "clinical_group" in value and raw:
+            total = sum(raw.values())
+            if total <= 0:
+                raise ValueError("non-clinical similarity weights must have positive mass")
+            raw = {key: item / total for key, item in raw.items()}
+        return cls(**raw)
 
 
 @dataclass(frozen=True)
@@ -102,23 +111,38 @@ class RuleSimilarity:
     total: float
     cohort_jaccard: float
     exact_feature_jaccard: float
-    clinical_group_jaccard: float
     threshold_direction_compatibility: float
+    # Legacy artifacts may contain this field. New comparisons leave it unset.
+    clinical_group_jaccard: float | None = None
 
     def to_dict(self) -> dict[str, float]:
-        return {
+        result = {
             "total": self.total,
             "cohort_jaccard": self.cohort_jaccard,
             "exact_feature_jaccard": self.exact_feature_jaccard,
-            "clinical_group_jaccard": self.clinical_group_jaccard,
             "threshold_direction_compatibility": (
                 self.threshold_direction_compatibility
             ),
         }
+        if self.clinical_group_jaccard is not None:
+            result["clinical_group_jaccard"] = self.clinical_group_jaccard
+        return result
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> "RuleSimilarity":
-        return cls(**{key: float(raw) for key, raw in value.items()})
+        return cls(
+            total=float(value["total"]),
+            cohort_jaccard=float(value["cohort_jaccard"]),
+            exact_feature_jaccard=float(value["exact_feature_jaccard"]),
+            threshold_direction_compatibility=float(
+                value["threshold_direction_compatibility"]
+            ),
+            clinical_group_jaccard=(
+                None
+                if "clinical_group_jaccard" not in value
+                else float(value["clinical_group_jaccard"])
+            ),
+        )
 
 
 def _set_jaccard(left: set[str], right: set[str]) -> float:
@@ -141,7 +165,7 @@ def _rule_groups(rule: Rule) -> set[str]:
 def _threshold_direction_similarity(
     left: Rule, right: Rule, tolerance: float
 ) -> float:
-    """Match direction-compatible exact or clinical-substitute conditions."""
+    """Match direction-compatible conditions on the exact same feature."""
 
     if not left.conditions and not right.conditions:
         return 1.0
@@ -151,11 +175,7 @@ def _threshold_direction_similarity(
             if left_condition.operator != right_condition.operator:
                 continue
             same_feature = left_condition.feature_name == right_condition.feature_name
-            shared_group = bool(
-                set(left_condition.clinical_groups)
-                & set(right_condition.clinical_groups)
-            )
-            if not same_feature and not shared_group:
+            if not same_feature:
                 continue
             left_threshold = left_condition.normalized_threshold
             right_threshold = right_condition.normalized_threshold
@@ -216,7 +236,6 @@ def _rule_similarity_from_masks(
 ) -> RuleSimilarity:
     cohort = cohort_jaccard(left_mask, right_mask)
     features = _set_jaccard(_rule_features(left), _rule_features(right))
-    groups = _set_jaccard(_rule_groups(left), _rule_groups(right))
     threshold = _threshold_direction_similarity(
         left, right, similarity_config.normalized_threshold_tolerance
     )
@@ -224,14 +243,12 @@ def _rule_similarity_from_masks(
     total = (
         weights.cohort * cohort
         + weights.exact_feature * features
-        + weights.clinical_group * groups
         + weights.threshold_direction * threshold
     )
     return RuleSimilarity(
         total=float(total),
         cohort_jaccard=float(cohort),
         exact_feature_jaccard=float(features),
-        clinical_group_jaccard=float(groups),
         threshold_direction_compatibility=float(threshold),
     )
 
@@ -367,7 +384,7 @@ class RuleFamily:
     )
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result = {
             "family_id": self.family_id,
             "member_rules": [rule.to_dict() for rule in self.member_rules],
             "representative_rule": self.representative_rule.to_dict(),
@@ -377,9 +394,6 @@ class RuleFamily:
             "recurrence_frequency": self.recurrence_frequency,
             "retained": self.retained,
             "feature_recurrence": dict(sorted(self.feature_recurrence.items())),
-            "clinical_group_recurrence": dict(
-                sorted(self.clinical_group_recurrence.items())
-            ),
             "threshold_variability": [
                 item.to_dict() for item in self.threshold_variability
             ],
@@ -387,6 +401,11 @@ class RuleFamily:
             "cohort_overlap_stability": self.cohort_overlap_stability,
             "occurrence_references": [list(item) for item in self.occurrences],
         }
+        if self.clinical_group_recurrence:
+            result["clinical_group_recurrence"] = dict(
+                sorted(self.clinical_group_recurrence.items())
+            )
+        return result
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> "RuleFamily":
@@ -404,7 +423,9 @@ class RuleFamily:
             },
             clinical_group_recurrence={
                 str(name): float(frequency)
-                for name, frequency in value["clinical_group_recurrence"].items()  # type: ignore[union-attr]
+                for name, frequency in value.get(
+                    "clinical_group_recurrence", {}
+                ).items()  # type: ignore[union-attr]
             },
             threshold_variability=tuple(
                 ThresholdVariability.from_dict(item)
@@ -688,14 +709,7 @@ def cluster_rule_families(
                     clinical_groups=False,
                 )
             },
-            clinical_group_recurrence={
-                item.name: item.frequency
-                for item in _recurrences(
-                    rules_and_bootstraps,
-                    total_bootstraps=denominator,
-                    clinical_groups=True,
-                )
-            },
+            clinical_group_recurrence={},
             threshold_variability=_threshold_variability(bootstrap_weighted_rules),
             cohort_stability=_distribution(cohort_overlaps, singleton_default=1.0),
             _occurrence_references=tuple(
@@ -911,7 +925,6 @@ class SemanticPairComparison:
                 for name, metric in sorted(self.symmetric_metrics.items())
             },
             "exact_feature_agreement": self.exact_feature_agreement.to_dict(),
-            "clinical_group_agreement": self.clinical_group_agreement.to_dict(),
             "selected_cohort_jaccard": self.selected_cohort_jaccard,
             "activation_target_jaccard": self.activation_target_jaccard,
             "t_mean": self.t_mean,
@@ -939,7 +952,18 @@ class SemanticPairComparison:
                 for name, metric in symmetric.items()
             },
             exact_feature_agreement=SetAgreement.from_dict(value["exact_feature_agreement"]),  # type: ignore[arg-type]
-            clinical_group_agreement=SetAgreement.from_dict(value["clinical_group_agreement"]),  # type: ignore[arg-type]
+            clinical_group_agreement=SetAgreement.from_dict(
+                value.get(
+                    "clinical_group_agreement",
+                    {
+                        "left": [],
+                        "right": [],
+                        "intersection": [],
+                        "jaccard": 1.0,
+                        "exact": True,
+                    },
+                )  # type: ignore[arg-type]
+            ),
             selected_cohort_jaccard=float(value["selected_cohort_jaccard"]),
             activation_target_jaccard=float(value["activation_target_jaccard"]),
         )
@@ -1013,18 +1037,6 @@ def compare_semantic_pair(
         for rule in right_rule_set.rules
         for condition in rule.conditions
     }
-    left_groups = {
-        group
-        for rule in left_rule_set.rules
-        for condition in rule.conditions
-        for group in condition.clinical_groups
-    }
-    right_groups = {
-        group
-        for rule in right_rule_set.rules
-        for condition in rule.conditions
-        for group in condition.clinical_groups
-    }
     return SemanticPairComparison(
         left_factor_id=str(left_factor_id),
         right_factor_id=str(right_factor_id),
@@ -1040,7 +1052,9 @@ def compare_semantic_pair(
         right_self_metrics=binary_metrics(right_truth, right_selected),
         symmetric_metrics=symmetric,
         exact_feature_agreement=_set_agreement(left_features, right_features),
-        clinical_group_agreement=_set_agreement(left_groups, right_groups),
+        # Retain an empty compatibility field for legacy callers without
+        # consulting clinical annotations in new semantic comparisons.
+        clinical_group_agreement=_set_agreement(set(), set()),
         selected_cohort_jaccard=cohort_jaccard(left_selected, right_selected),
         activation_target_jaccard=cohort_jaccard(left_truth, right_truth),
     )

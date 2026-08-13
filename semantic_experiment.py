@@ -15,6 +15,7 @@ from pathlib import Path
 import pickle
 from typing import Any, Iterable, Mapping, Sequence
 import uuid
+import warnings
 
 import numpy as np
 
@@ -40,7 +41,7 @@ from semantic_compare import (
     compare_rule_sets_symmetric,
     recurrent_representatives,
 )
-from semantic_config import SemanticExperimentConfig, load_clinical_groups
+from semantic_config import SemanticExperimentConfig
 from semantic_rules import (
     ActivationTargetSpec,
     FittedActivationTarget,
@@ -97,6 +98,7 @@ class FactorSemanticRepresentation:
     discovery_warnings: tuple[str, ...]
     n_candidate_occurrences: int
     n_recurrent_families: int
+    selection_diagnostics: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -114,12 +116,14 @@ class FactorSemanticRepresentation:
                 "search_method": self.selection.search_method,
                 "n_candidates": self.selection.n_candidates,
                 "n_evaluated_subsets": self.selection.n_evaluated_subsets,
+                "diagnostics": self.selection.diagnostics.to_dict(),
             },
             "bootstrap_diagnostics": list(self.bootstrap_diagnostics),
             "candidate_diagnostics": list(self.candidate_diagnostics),
             "discovery_warnings": list(self.discovery_warnings),
             "n_candidate_occurrences": self.n_candidate_occurrences,
             "n_recurrent_families": self.n_recurrent_families,
+            "selection_diagnostics": dict(self.selection_diagnostics),
         }
 
 
@@ -206,6 +210,8 @@ def _empty_representation(
     reason: str,
     X_selection: np.ndarray,
     y_selection: np.ndarray,
+    *,
+    fit_high_activation_count: int = 0,
 ) -> FactorSemanticRepresentation:
     selection = select_rule_set((), X_selection, y_selection, threshold_name=target.spec.name)
     return FactorSemanticRepresentation(
@@ -221,6 +227,21 @@ def _empty_representation(
         discovery_warnings=(),
         n_candidate_occurrences=0,
         n_recurrent_families=0,
+        selection_diagnostics={
+            "funnel_stage": (
+                "invalid_activation_target"
+                if reason == "no_positive_fit_activations"
+                else "insufficient_high_activation_support"
+            ),
+            "fit_high_activation_count": int(fit_high_activation_count),
+            "selection_positive_count": int(np.count_nonzero(y_selection)),
+            "raw_candidate_occurrence_count": 0,
+            "retained_candidate_occurrence_count": 0,
+            "family_count": 0,
+            "recurrent_family_count": 0,
+            "recurrent_representative_count": 0,
+            "ablation_eligible": False,
+        },
     )
 
 
@@ -313,40 +334,6 @@ def _combine_bootstrap_results(
     )
 
 
-def _annotate_occurrence_groups(
-    occurrences: Sequence[CandidateRuleOccurrence],
-    clinical_groups: Mapping[str, Sequence[str]],
-) -> tuple[CandidateRuleOccurrence, ...]:
-    annotated: list[CandidateRuleOccurrence] = []
-    for occurrence in occurrences:
-        conditions = []
-        for condition in occurrence.rule.conditions:
-            configured = clinical_groups.get(
-                condition.feature_name,
-                (f"feature:{condition.feature_name}",),
-            )
-            if isinstance(configured, str):
-                configured = (configured,)
-            conditions.append(
-                replace(
-                    condition,
-                    clinical_groups=tuple(
-                        sorted(set(str(value) for value in configured))
-                    ),
-                )
-            )
-        annotated.append(
-            replace(
-                occurrence,
-                rule=replace(
-                    occurrence.rule,
-                    conditions=tuple(conditions),
-                ),
-            )
-        )
-    return tuple(annotated)
-
-
 def _validate_family_result(value: Any) -> None:
     if not hasattr(value, "families") or not hasattr(
         value, "total_bootstraps"
@@ -376,6 +363,10 @@ def learn_factor_semantics(
 ) -> FactorSemanticRepresentation:
     """Fit one factor/threshold representation without access to final data."""
 
+    # Retained only as a source-compatible legacy argument. Clinical taxonomies
+    # are no longer part of discovery, clustering, or semantic comparison.
+    del clinical_groups
+
     run_name = str(run_id)
     spec = ActivationTargetSpec(_target_name(activation_fraction), activation_fraction)
     target = fit_activation_target(activations_fit, spec)
@@ -387,7 +378,9 @@ def learn_factor_semantics(
     fit_target = target.apply(activations_fit)
     if int(fit_target.sum()) < config.activation_targets.min_positive_samples:
         return _empty_representation(
-            run_name, factor_id, target, "insufficient_high_activation_targets", X_selection, selection_target
+            run_name, factor_id, target, "insufficient_high_activation_targets",
+            X_selection, selection_target,
+            fit_high_activation_count=int(fit_target.sum()),
         )
     seed = derive_seed(config.runtime.seed, "semantic", run_name, factor_id, spec.name)
     backend_config = _backend_config(
@@ -401,7 +394,7 @@ def learn_factor_semantics(
             fit_target,
             feature_names,
             groups=patient_groups_fit,
-            clinical_group_map=clinical_groups,
+            clinical_group_map={},
             config=backend_config,
         )
     else:
@@ -480,10 +473,10 @@ def learn_factor_semantics(
             n_samples=len(X_fit),
             n_positive=int(fit_target.sum()),
         )
+    raw_candidate_occurrence_count = len(discovery.occurrences)
     occurrences = _cap_occurrences(
         discovery.occurrences, config.discovery.max_candidates_per_bootstrap
     )
-    occurrences = _annotate_occurrence_groups(occurrences, clinical_groups)
     similarity_config = RuleSimilarityConfig(
         similarity_threshold=config.discovery.family_similarity_threshold,
         min_recurrence=config.discovery.min_family_recurrence,
@@ -508,14 +501,6 @@ def learn_factor_semantics(
                     [_occurrence_signature(value) for value in occurrences]
                 ),
                 "X_selection": array_fingerprint(np.asarray(X_selection)),
-                "clinical_groups": {
-                    str(name): (
-                        (str(values),)
-                        if isinstance(values, str)
-                        else tuple(str(value) for value in values)
-                    )
-                    for name, values in sorted(clinical_groups.items())
-                },
                 "similarity": asdict(similarity_config),
                 "total_bootstraps": config.discovery.n_bootstraps,
             },
@@ -595,6 +580,64 @@ def learn_factor_semantics(
         for family in families
     )
     reason = None if selection.feasible else selection.reason
+    rescue = selection.diagnostics.constraint_rescues
+    rescue_names = (
+        "max_rule_length",
+        "max_rules",
+        "min_marginal_recall",
+        "min_precision",
+        "min_lift",
+    )
+    if raw_candidate_occurrence_count == 0:
+        funnel_stage = "no_candidate_rule"
+    elif recurrent_count == 0:
+        funnel_stage = "no_recurrent_family"
+    elif selection.reason == "no_eligible_candidates":
+        funnel_stage = "no_eligible_rule_length"
+    elif selection.reason in {
+        "no_positive_selection_targets",
+        "insufficient_positive_selection_targets",
+    }:
+        funnel_stage = "insufficient_selection_support"
+    elif not selection.feasible:
+        funnel_stage = "no_feasible_subset"
+    else:
+        funnel_stage = "selected"
+    selection_diagnostics = {
+        "funnel_stage": funnel_stage,
+        "fit_high_activation_count": int(np.count_nonzero(fit_target)),
+        "selection_positive_count": int(np.count_nonzero(selection_target)),
+        "raw_candidate_occurrence_count": raw_candidate_occurrence_count,
+        "retained_candidate_occurrence_count": len(occurrences),
+        "family_count": len(families),
+        "recurrent_family_count": int(recurrent_count),
+        "recurrent_representative_count": len(recurrent_rules),
+        "leaves_considered": sum(
+            item.leaves_considered for item in discovery.bootstrap_diagnostics
+        ),
+        "leaves_rejected_probability": sum(
+            item.leaves_rejected_probability
+            for item in discovery.bootstrap_diagnostics
+        ),
+        "leaves_rejected_positive_support": sum(
+            item.leaves_rejected_positive_support
+            for item in discovery.bootstrap_diagnostics
+        ),
+        **selection.diagnostics.to_dict(),
+        "ablation_eligible": bool(rescue.applicable),
+        **{
+            f"rescued_without_{name}": rescue.is_rescued(name)
+            for name in rescue_names
+        },
+        **{
+            f"ablation_{name}_applicable": rescue.is_applicable(name)
+            for name in rescue_names
+        },
+        **{
+            f"ablation_{name}_evaluated_subsets": rescue.evaluated_count(name)
+            for name in rescue_names
+        },
+    }
     return FactorSemanticRepresentation(
         run_id=run_name,
         factor_id=factor_id,
@@ -612,6 +655,11 @@ def learn_factor_semantics(
                 "oob_sample_count": item.oob_sample_count,
                 "positive_fit_count": item.positive_fit_count,
                 "candidates_extracted": item.candidates_extracted,
+                "leaves_considered": item.leaves_considered,
+                "leaves_rejected_probability": item.leaves_rejected_probability,
+                "leaves_rejected_positive_support": (
+                    item.leaves_rejected_positive_support
+                ),
             }
             for item in discovery.bootstrap_diagnostics
         ),
@@ -640,6 +688,7 @@ def learn_factor_semantics(
         discovery_warnings=discovery.warnings,
         n_candidate_occurrences=len(occurrences),
         n_recurrent_families=int(recurrent_count),
+        selection_diagnostics=selection_diagnostics,
     )
 
 
@@ -744,15 +793,6 @@ def _rule_set_features(model: FactorSemanticRepresentation) -> set[str]:
     }
 
 
-def _rule_set_groups(model: FactorSemanticRepresentation) -> set[str]:
-    return {
-        group
-        for rule in model.selection.rule_set.rules
-        for condition in rule.conditions
-        for group in condition.clinical_groups
-    }
-
-
 def _transfer_row(transfer: SemanticPairComparison) -> dict[str, Any]:
     """Preserve the existing flattened compatibility view of pair transfer."""
 
@@ -765,8 +805,6 @@ def _transfer_row(transfer: SemanticPairComparison) -> dict[str, Any]:
         "target_cohort_jaccard": transfer.target_cohort_jaccard,
         "exact_feature_jaccard": transfer.exact_feature_agreement.jaccard,
         "exact_feature_equal": transfer.exact_feature_equal,
-        "clinical_group_jaccard": transfer.clinical_group_agreement.jaccard,
-        "clinical_group_equal": transfer.clinical_group_equal,
     }
 
 
@@ -833,7 +871,13 @@ def run_semantic_comparison(
         if matrix.ndim != 2 or len(matrix) != len(X):
             raise ValueError(f"Activations for run {run_id!r} are not aligned with X")
 
-    group_map = dict(clinical_groups or {})
+    if clinical_groups:
+        warnings.warn(
+            "clinical_groups is deprecated and ignored; semantic comparison "
+            "now uses exact features only",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     if predefined_splits is None:
         splits = semantic_test_subsplits(
             y_stratify, patients, rng_seed=config.runtime.seed
@@ -883,7 +927,6 @@ def run_semantic_comparison(
         array_fingerprint(patients),
         activation_fingerprints,
         split_fingerprint,
-        group_map,
         _stringify_mapping_keys(functional_by_factor),
         pairs,
         names,
@@ -954,7 +997,7 @@ def run_semantic_comparison(
             X_selection=X[selection_indices],
             activations_selection=activations[selection_indices, factor_id],
             feature_names=names,
-            clinical_groups=group_map,
+            clinical_groups={},
             config=config,
             shared_cache=shared_cache,
         )
@@ -1050,8 +1093,6 @@ def run_semantic_comparison(
                 "transfer_f2_mean_range": max(f2_values) - min(f2_values) if f2_values else 0.0,
                 "factor_i_feature_jaccard_min": _set_stability(models_i, _rule_set_features),
                 "factor_j_feature_jaccard_min": _set_stability(models_j, _rule_set_features),
-                "factor_i_clinical_group_jaccard_min": _set_stability(models_i, _rule_set_groups),
-                "factor_j_clinical_group_jaccard_min": _set_stability(models_j, _rule_set_groups),
             },
         }
         if config.class_analysis.enabled:
@@ -1078,13 +1119,6 @@ def run_semantic_comparison(
         "patient_group_fingerprint": array_fingerprint(patients),
         "activation_fingerprints": activation_fingerprints,
         "split_fingerprint": split_fingerprint,
-        "clinical_groups_hash": stable_hash(group_map),
-        "clinical_group_mapping": {
-            "mapped_features": sum(name in group_map for name in names),
-            "total_features": len(names),
-            "coverage": (sum(name in group_map for name in names) / len(names)) if names else 1.0,
-            "unmapped_features": [name for name in names if name not in group_map],
-        },
         "n_records": len(X),
         "n_pairs": len(pairs),
         "stage_cache": {
@@ -1192,7 +1226,6 @@ def _write_flat_pair_csv(path: Path, pairs: Sequence[Mapping[str, Any]]) -> None
                 "target_cohort_jaccard": transfer["target_cohort_jaccard"],
                 "selected_cohort_jaccard": transfer["selected_cohort_jaccard"],
                 "exact_feature_jaccard": transfer["exact_feature_jaccard"],
-                "clinical_group_jaccard": transfer["clinical_group_jaccard"],
             })
     if not rows:
         path.write_text("", encoding="utf-8")
@@ -1248,7 +1281,6 @@ def _write_flat_class_pair_csv(
                     "target_cohort_jaccard": transfer["target_cohort_jaccard"],
                     "selected_cohort_jaccard": transfer["selected_cohort_jaccard"],
                     "exact_feature_jaccard": transfer["exact_feature_jaccard"],
-                    "clinical_group_jaccard": transfer["clinical_group_jaccard"],
                 })
     if not rows:
         path.write_text("", encoding="utf-8")
@@ -1302,10 +1334,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             config,
             runtime=replace(config.runtime, show_progress=False),
         )
-    clinical_path = config.clinical_groups_path
-    if clinical_path is not None and not Path(clinical_path).is_absolute():
-        clinical_path = str(config_path.parent / clinical_path)
-    clinical_groups = load_clinical_groups(clinical_path)
     X, outcome, patients, names, activations, record_keys = _load_bundle(args.bundle)
     with Path(args.matches).open(encoding="utf-8") as handle:
         matches = json.load(handle)
@@ -1319,7 +1347,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         activations_by_run=activations,
         matchings=matches,
         config=config,
-        clinical_groups=clinical_groups,
         record_keys=record_keys,
         force=args.force,
     )

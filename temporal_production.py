@@ -206,6 +206,13 @@ class ProductionTemporalAdapter:
         rules, semantic_models = _normalize_rules(
             semantic["semantic_models"], views["family_members"], config
         )
+        semantic_selection_diagnostics = _semantic_selection_diagnostic_rows(
+            semantic_models,
+            views["family_members"],
+            reference_year=int(reference_year),
+            patient_split_seed=int(split.effective_seed),
+            config=config,
+        )
         rules.extend(_high_precision_rules(
             sae_data.activations, prepared, splits, union_matches,
             views["family_members"], runner_config, config,
@@ -252,6 +259,7 @@ class ProductionTemporalAdapter:
             ),
             "post_hoc_future_sensitivity": [],
             "rules": rules,
+            "semantic_selection_diagnostics": semantic_selection_diagnostics,
             "factor_year_metrics": factor_year,
             "cavs": cavs,
             "tcav": tcav_rows,
@@ -353,7 +361,6 @@ def _run_semantic(prepared, activations, matches, functional, splits, config, wo
         activation_targets=replace(
             semantic.activation_targets,
             positive_fractions=config.activation_positive_fractions,
-            min_positive_samples=config.support.target_high_records_per_role,
         ),
         runtime=replace(
             semantic.runtime,
@@ -530,6 +537,66 @@ def _normalize_rules(models, family_members, config):
         run = int(model["run_id"])
         model["normalized"] = lookup[(seed_by_run[run], int(model["factor_id"]), model["target"]["positive_fraction"])]
     return output, models
+
+
+def _semantic_selection_diagnostic_rows(
+    models,
+    family_members,
+    *,
+    reference_year,
+    patient_split_seed,
+    config,
+):
+    """Flatten one diagnostic row for every semantic factor-target attempt."""
+
+    identity = {}
+    for member in family_members:
+        identity.setdefault(
+            (int(member["member_sae_seed"]), int(member["member_factor_id"])),
+            member["factor_family_uid"],
+        )
+    seed_by_run = {index: seed for index, seed in enumerate(config.sae_seeds)}
+    rescue_names = (
+        "max_rule_length",
+        "max_rules",
+        "min_marginal_recall",
+        "min_precision",
+        "min_lift",
+    )
+    rows = []
+    for model in models:
+        run = int(model["run_id"])
+        factor = int(model["factor_id"])
+        member_seed = int(seed_by_run[run])
+        diagnostics = dict(model.get("selection_diagnostics", {}))
+        selection = model.get("selection", {})
+        selection_details = selection.get("diagnostics", {})
+        for name in (
+            "n_input_candidates",
+            "n_eligible_candidates",
+            "n_excluded_by_rule_length",
+            "n_positive_selection_targets",
+        ):
+            diagnostics.setdefault(name, int(selection_details.get(name, 0)))
+        for name in rescue_names:
+            diagnostics.setdefault(f"rescued_without_{name}", False)
+            diagnostics.setdefault(f"ablation_{name}_applicable", False)
+            diagnostics.setdefault(f"ablation_{name}_evaluated_subsets", 0)
+        diagnostics.setdefault("ablation_eligible", False)
+        diagnostics.setdefault("funnel_stage", "unknown")
+        rows.append({
+            "reference_year": int(reference_year),
+            "patient_split_seed": int(patient_split_seed),
+            "factor_family_uid": identity.get((member_seed, factor)),
+            "member_sae_seed": member_seed,
+            "member_factor_id": factor,
+            "activation_target": model["target"]["positive_fraction"],
+            "target_name": model["target"]["name"],
+            "valid": bool(model.get("valid", False)),
+            "failure_reason": model.get("reason"),
+            **diagnostics,
+        })
+    return rows
 
 
 def _high_precision_rules(activations, prepared, splits, matches, family_members, runner_config, config):

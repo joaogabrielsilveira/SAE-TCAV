@@ -17,6 +17,16 @@ def _rule(rule_id, feature, operator, threshold):
     return Rule(rule_id, (Condition(feature, f"x{feature}", operator, threshold),))
 
 
+def _conjunctive_rule(rule_id, conditions):
+    return Rule(
+        rule_id,
+        tuple(
+            Condition(feature, f"x{feature}", operator, threshold)
+            for feature, operator, threshold in conditions
+        ),
+    )
+
+
 def test_or_metrics_use_union_not_mean_of_rule_metrics():
     X = np.array([[0, 0], [1, 0], [0, 1], [1, 1], [2, 2]], dtype=float)
     y = np.array([0, 1, 1, 1, 0], dtype=bool)
@@ -76,3 +86,158 @@ def test_binary_metrics_handles_empty_and_rare_targets():
     assert rare.recall == 1.0
     assert rare.precision == 0.5
     assert rare.lift == 2.0
+
+
+def test_selection_diagnostics_record_candidate_and_support_funnel_counts():
+    X = np.array([[0, 0], [1, 1], [2, 2]], dtype=float)
+    short = _rule("short", 0, ">", 0.5)
+    long = _conjunctive_rule("long", [(0, ">", 0.5), (1, ">", 0.5)])
+    result = select_rule_set(
+        [short, long],
+        X,
+        np.array([0, 1, 1]),
+        RuleSetSelectionConfig(
+            min_precision=0.0,
+            min_lift=0.0,
+            max_rule_length=1,
+            min_marginal_recall=0.0,
+        ),
+    )
+    assert result.feasible
+    assert result.diagnostics.n_input_candidates == 2
+    assert result.diagnostics.n_eligible_candidates == result.n_candidates == 1
+    assert result.diagnostics.n_excluded_by_rule_length == 1
+    assert result.diagnostics.n_positive_selection_targets == 2
+    assert result.diagnostics.constraint_rescues.applicable == ()
+
+
+def test_rule_length_failure_has_an_exclusive_reason_and_overlapping_rescue_flag():
+    X = np.array([[0, 0], [1, 1], [2, 2]], dtype=float)
+    candidate = _conjunctive_rule(
+        "long", [(0, ">", 0.5), (1, ">", 0.5)]
+    )
+    result = select_rule_set(
+        [candidate],
+        X,
+        np.array([0, 1, 1]),
+        RuleSetSelectionConfig(
+            min_precision=0.0,
+            min_lift=0.0,
+            max_rule_length=1,
+            min_marginal_recall=0.0,
+        ),
+    )
+    rescues = result.diagnostics.constraint_rescues
+    assert result.reason == "no_eligible_candidates"
+    assert rescues.is_applicable("max_rule_length")
+    assert rescues.is_rescued("max_rule_length")
+    assert rescues.evaluated_count("max_rule_length") == 1
+
+
+def test_each_final_constraint_reports_leave_one_out_rescue():
+    # Both rules reuse the same false positives, so neither meets precision
+    # alone while their union does. This isolates max_rules and marginal recall.
+    X = np.array(
+        [[1, 0], [0, 1], [1, 1], [1, 1]],
+        dtype=float,
+    )
+    y = np.array([1, 1, 0, 0], dtype=bool)
+    candidates = [_rule("left", 0, ">", 0.5), _rule("right", 1, ">", 0.5)]
+    max_rules = select_rule_set(
+        candidates,
+        X,
+        y,
+        RuleSetSelectionConfig(
+            min_precision=0.5,
+            min_lift=0.0,
+            max_rules=1,
+            min_marginal_recall=0.0,
+        ),
+    )
+    assert not max_rules.feasible
+    assert max_rules.diagnostics.constraint_rescues.is_rescued("max_rules")
+
+    marginal = select_rule_set(
+        candidates,
+        X,
+        y,
+        RuleSetSelectionConfig(
+            min_precision=0.5,
+            min_lift=0.0,
+            max_rules=2,
+            min_marginal_recall=0.75,
+        ),
+    )
+    assert not marginal.feasible
+    assert marginal.diagnostics.constraint_rescues.is_rescued(
+        "min_marginal_recall"
+    )
+
+    one_rule = [_rule("half", 0, ">", 0.5)]
+    precision = select_rule_set(
+        one_rule,
+        np.array([[1], [0], [1], [0]], dtype=float),
+        np.array([1, 1, 0, 0]),
+        RuleSetSelectionConfig(
+            min_precision=0.75,
+            min_lift=0.0,
+            min_marginal_recall=0.0,
+        ),
+    )
+    assert precision.diagnostics.constraint_rescues.is_rescued("min_precision")
+
+    lift = select_rule_set(
+        one_rule,
+        np.array([[1], [0], [1], [0]], dtype=float),
+        np.array([1, 1, 0, 0]),
+        RuleSetSelectionConfig(
+            min_precision=0.0,
+            min_lift=1.5,
+            min_marginal_recall=0.0,
+        ),
+    )
+    assert lift.diagnostics.constraint_rescues.is_rescued("min_lift")
+
+
+def test_rescue_diagnostics_do_not_change_a_feasible_baseline_selection():
+    X = np.arange(10, dtype=float).reshape(-1, 1)
+    y = np.array([0, 0, 0, 0, 1, 1, 1, 1, 1, 1], dtype=bool)
+    candidates = [_rule("narrow", 0, ">", 6.5), _rule("broad", 0, ">", 3.5)]
+    result = select_rule_set(
+        candidates,
+        X,
+        y,
+        RuleSetSelectionConfig(
+            min_precision=0.5,
+            min_lift=1.0,
+            max_rules=1,
+            min_marginal_recall=0.0,
+        ),
+    )
+    assert result.rule_set.rules[0].rule_id == "broad"
+    assert result.diagnostics.constraint_rescues.applicable == ()
+
+
+def test_leave_one_out_rescue_flags_can_overlap_for_one_failed_selection():
+    X = np.array([[1, 1], [1, 0], [0, 0]], dtype=float)
+    y = np.array([1, 0, 0], dtype=bool)
+    candidates = [
+        _rule("short-imprecise", 0, ">", 0.5),
+        _conjunctive_rule(
+            "long-precise", [(0, ">", 0.5), (1, ">", 0.5)]
+        ),
+    ]
+    result = select_rule_set(
+        candidates,
+        X,
+        y,
+        RuleSetSelectionConfig(
+            min_precision=0.75,
+            min_lift=0.0,
+            max_rule_length=1,
+            min_marginal_recall=0.0,
+        ),
+    )
+    rescues = result.diagnostics.constraint_rescues
+    assert result.reason == "no_subset_satisfies_constraints"
+    assert set(rescues.rescued) == {"max_rule_length", "min_precision"}

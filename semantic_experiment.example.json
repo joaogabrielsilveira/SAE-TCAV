@@ -1,29 +1,29 @@
 {
   "schema_version": "1.0",
   "activation_targets": {
-    "positive_fractions": [0.1, 0.2, 0.3, 0.4, 0.5],
-    "min_positive_samples": 20
+    "positive_fractions": [0.1, 0.3, 0.5],
+    "min_positive_samples": 2
   },
   "objective": {
     "objective": "f2",
     "min_precision": 0.5,
     "min_lift": 0,
     "max_rules": 5,
-    "max_rule_length": 5,
+    "max_rule_length": 10,
     "min_marginal_recall": 0.01,
     "exhaustive_candidate_limit": 20,
     "beam_width": 64
   },
   "discovery": {
     "backend": "randomized_tree",
-    "n_bootstraps": 30,
-    "trees_per_bootstrap": 100,
-    "max_depth": 3,
+    "n_bootstraps": 15,
+    "trees_per_bootstrap": 50,
+    "max_depth": 15,
     "min_samples_leaf": 0.01,
-    "max_features": "sqrt",
+    "max_features": null,
     "splitter": "random",
     "positive_leaf_probability": 0.5,
-    "min_positive_leaf_samples": 2,
+    "min_positive_leaf_samples": 0,
     "max_candidates_per_bootstrap": 20,
     "min_family_recurrence": 0.5,
     "family_similarity_threshold": 0.7
@@ -37,6 +37,5 @@
   },
   "class_analysis": {
     "enabled": true
-  },
-  "clinical_groups_path": "clinical_groups.example.json"
+  }
 }
