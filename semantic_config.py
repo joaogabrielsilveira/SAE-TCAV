@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path
+import warnings
 from typing import Any, Mapping
 
 
@@ -18,7 +19,7 @@ class ActivationTargetConfig:
     """Positive-activation fractions represented by each binary target."""
 
     positive_fractions: tuple[float, ...] = (0.1, 0.2, 0.3, 0.4, 0.5)
-    min_positive_samples: int = 20
+    min_positive_samples: int = 2
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "positive_fractions", tuple(self.positive_fractions))
@@ -34,7 +35,7 @@ class RuleObjectiveConfig:
     min_precision: float = 0.50
     min_lift: float = 1.50
     max_rules: int = 5
-    max_rule_length: int = 5
+    max_rule_length: int = 10
     min_marginal_recall: float = 0.02
     exhaustive_candidate_limit: int = 20
     beam_width: int = 64
@@ -53,12 +54,12 @@ class DiscoveryConfig:
     backend: str = "randomized_tree"
     n_bootstraps: int = 30
     trees_per_bootstrap: int = 100
-    max_depth: int = 3
+    max_depth: int = 15
     min_samples_leaf: float = 0.01
-    max_features: str | int | float | None = "sqrt"
+    max_features: str | int | float | None = None
     splitter: str = "random"
     positive_leaf_probability: float = 0.50
-    min_positive_leaf_samples: int = 2
+    min_positive_leaf_samples: int = 0
     max_candidates_per_bootstrap: int = 20
     min_family_recurrence: float = 0.50
     family_similarity_threshold: float = 0.70
@@ -78,6 +79,8 @@ class DiscoveryConfig:
             raise ValueError("splitter must be 'best' or 'random'")
         if not 0 <= self.positive_leaf_probability <= 1:
             raise ValueError("positive_leaf_probability must be in [0, 1]")
+        if self.min_positive_leaf_samples < 0:
+            raise ValueError("min_positive_leaf_samples must be non-negative")
 
 
 @dataclass(frozen=True)
@@ -128,7 +131,11 @@ class SemanticExperimentConfig:
     clinical_groups_path: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        result = asdict(self)
+        # Compatibility-only input: it must not affect scientific identity or
+        # appear as an active dependency in new manifests.
+        result.pop("clinical_groups_path", None)
+        return result
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "SemanticExperimentConfig":
@@ -144,6 +151,14 @@ class SemanticExperimentConfig:
         unknown = set(raw) - known
         if unknown:
             raise ValueError(f"Unknown semantic config fields: {sorted(unknown)}")
+        clinical_groups_path = raw.get("clinical_groups_path")
+        if clinical_groups_path is not None:
+            warnings.warn(
+                "clinical_groups_path is deprecated and ignored; semantic rule "
+                "comparison now uses exact features only",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         return cls(
             schema_version=str(raw.get("schema_version", "1.0")),
             activation_targets=ActivationTargetConfig(**raw.get("activation_targets", {})),
@@ -151,7 +166,7 @@ class SemanticExperimentConfig:
             discovery=DiscoveryConfig(**raw.get("discovery", {})),
             runtime=RuntimeConfig(**raw.get("runtime", {})),
             class_analysis=ClassAnalysisConfig.from_dict(raw.get("class_analysis", {})),
-            clinical_groups_path=raw.get("clinical_groups_path"),
+            clinical_groups_path=clinical_groups_path,
         )
 
     @classmethod
@@ -161,7 +176,11 @@ class SemanticExperimentConfig:
 
 
 def load_clinical_groups(path: str | Path | None) -> dict[str, tuple[str, ...]]:
-    """Load feature-to-group mapping; unmapped features remain singleton groups."""
+    """Legacy mapping loader retained for callers reading old experiments.
+
+    New semantic and temporal pipelines do not call this function or use its
+    result in discovery, clustering, comparison, or scientific identity.
+    """
 
     if path is None:
         return {}

@@ -36,13 +36,13 @@ class StableRuleBackendConfig:
 
     n_bootstraps: int = 30
     trees_per_bootstrap: int = 50
-    max_depth: int = 3
+    max_depth: int = 15
     min_samples_leaf: int | float = 0.01
-    max_features: MaxFeatures = "sqrt"
+    max_features: MaxFeatures = None
     splitter: Literal["best", "random"] = "random"
     class_weight: Literal["balanced"] | dict[int, float] | None = "balanced"
     positive_leaf_probability: float = 0.5
-    min_positive_leaf_samples: int = 2
+    min_positive_leaf_samples: int = 0
     bootstrap_unit: BootstrapUnit = "auto"
     random_state: int = 42
     show_progress: bool = False
@@ -61,8 +61,8 @@ class StableRuleBackendConfig:
             raise ValueError("float min_samples_leaf must be in (0, 0.5]")
         if not 0 <= self.positive_leaf_probability <= 1:
             raise ValueError("positive_leaf_probability must be in [0, 1]")
-        if self.min_positive_leaf_samples < 1:
-            raise ValueError("min_positive_leaf_samples must be >= 1")
+        if self.min_positive_leaf_samples < 0:
+            raise ValueError("min_positive_leaf_samples must be >= 0")
         if not isinstance(self.show_progress, bool):
             raise ValueError("show_progress must be a boolean")
 
@@ -100,6 +100,9 @@ class BootstrapDiagnostic:
     oob_sample_count: int
     positive_fit_count: int
     candidates_extracted: int
+    leaves_considered: int = 0
+    leaves_rejected_probability: int = 0
+    leaves_rejected_positive_support: int = 0
 
 
 @dataclass(frozen=True)
@@ -161,9 +164,9 @@ class RandomizedTreeRuleBackend:
         X_array, y_array, names, group_array, unit = _validate_inputs(
             X, y, feature_names, groups, self.config.bootstrap_unit
         )
-        condition_groups = {
-            name: _clinical_groups_for(name, clinical_group_map or {}) for name in names
-        }
+        # ``clinical_group_map`` is retained as an ignored compatibility
+        # argument. New rules deliberately carry no external taxonomy.
+        condition_groups = {name: () for name in names}
         n_samples = X_array.shape[0]
         n_positive = int(y_array.sum())
         warnings: list[str] = []
@@ -225,6 +228,9 @@ class RandomizedTreeRuleBackend:
             X_fit = X_array[fit_indices]
             y_fit = y_array[fit_indices]
             bootstrap_occurrence_count = 0
+            leaves_considered = 0
+            leaves_rejected_probability = 0
+            leaves_rejected_positive_support = 0
 
             # A rare target can disappear from a row bootstrap.  Record it and
             # continue; treating it as a failed rule would bias recurrence.
@@ -255,7 +261,7 @@ class RandomizedTreeRuleBackend:
                     random_state=tree_seed,
                 )
                 classifier.fit(X_fit, y_fit)
-                extracted = _extract_positive_leaf_rules(
+                extracted, leaf_diagnostics = _extract_positive_leaf_rules(
                     classifier,
                     X_fit=X_fit,
                     y_fit=y_fit,
@@ -265,6 +271,13 @@ class RandomizedTreeRuleBackend:
                     minimum_probability=self.config.positive_leaf_probability,
                     minimum_positive_samples=self.config.min_positive_leaf_samples,
                 )
+                leaves_considered += leaf_diagnostics["leaves_considered"]
+                leaves_rejected_probability += leaf_diagnostics[
+                    "leaves_rejected_probability"
+                ]
+                leaves_rejected_positive_support += leaf_diagnostics[
+                    "leaves_rejected_positive_support"
+                ]
                 for leaf_id, rule in extracted:
                     fit_mask = rule.mask(X_fit)
                     oob_mask = rule.mask(X_array[oob_indices])
@@ -303,6 +316,11 @@ class RandomizedTreeRuleBackend:
                     oob_sample_count=len(oob_indices),
                     positive_fit_count=int(y_fit.sum()),
                     candidates_extracted=bootstrap_occurrence_count,
+                    leaves_considered=leaves_considered,
+                    leaves_rejected_probability=leaves_rejected_probability,
+                    leaves_rejected_positive_support=(
+                        leaves_rejected_positive_support
+                    ),
                 )
             )
 
@@ -432,16 +450,26 @@ def _extract_positive_leaf_rules(
     sorted_reference_features: tuple[NDArray[np.float64], ...],
     minimum_probability: float,
     minimum_positive_samples: int,
-) -> list[tuple[int, Rule]]:
+) -> tuple[list[tuple[int, Rule]], dict[str, int]]:
     tree = classifier.tree_
     positive_class_positions = np.flatnonzero(classifier.classes_ == 1)
     if len(positive_class_positions) != 1:
-        return []
+        return [], {
+            "leaves_considered": 0,
+            "leaves_rejected_probability": 0,
+            "leaves_rejected_positive_support": 0,
+        }
     positive_position = int(positive_class_positions[0])
     extracted: list[tuple[int, Rule]] = []
     fit_leaf_ids = classifier.apply(X_fit)
+    leaves_considered = 0
+    leaves_rejected_probability = 0
+    leaves_rejected_positive_support = 0
 
     def visit(node_id: int, path: list[tuple[int, str, float]]) -> None:
+        nonlocal leaves_considered
+        nonlocal leaves_rejected_probability
+        nonlocal leaves_rejected_positive_support
         feature_index = int(tree.feature[node_id])
         if feature_index >= 0:
             threshold = float(tree.threshold[node_id])
@@ -455,17 +483,20 @@ def _extract_positive_leaf_rules(
             )
             return
 
+        leaves_considered += 1
         class_counts = np.asarray(tree.value[node_id]).reshape(-1)
         total_weight = float(class_counts.sum())
         positive_probability = (
             float(class_counts[positive_position] / total_weight) if total_weight else 0.0
         )
         if positive_probability < minimum_probability:
+            leaves_rejected_probability += 1
             return
         positive_leaf_samples = int(
             np.logical_and(fit_leaf_ids == node_id, y_fit == 1).sum()
         )
         if positive_leaf_samples < minimum_positive_samples:
+            leaves_rejected_positive_support += 1
             return
         conditions = _canonical_conditions(
             path,
@@ -486,7 +517,11 @@ def _extract_positive_leaf_rules(
             )
 
     visit(0, [])
-    return extracted
+    return extracted, {
+        "leaves_considered": leaves_considered,
+        "leaves_rejected_probability": leaves_rejected_probability,
+        "leaves_rejected_positive_support": leaves_rejected_positive_support,
+    }
 
 
 def _canonical_conditions(

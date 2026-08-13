@@ -248,7 +248,19 @@ def test_end_to_end_uses_fit_only_then_shared_final_records(monkeypatch, tmp_pat
     assert threshold["cutoff_i"] != threshold["cutoff_j"]
     assert "i_to_j" in threshold["transfer"]
     assert "j_to_i" in threshold["transfer"]
+    assert "clinical_group_jaccard" not in threshold["transfer"]
     assert result["pair_results"][0]["functional"]["tcav_effect_sign_agreement"] is True
+    model = result["semantic_models"][0]
+    assert "diagnostics" in model["selection"]
+    assert model["selection_diagnostics"]["funnel_stage"] in {
+        "selected",
+        "no_candidate_rule",
+        "no_recurrent_family",
+        "no_eligible_rule_length",
+        "insufficient_selection_support",
+        "no_feasible_subset",
+    }
+    assert "leaves_considered" in model["selection_diagnostics"]
     artifact_dir = tmp_path / result["experiment_hash"]
     rules_path = artifact_dir / "semantic_rules.jsonl.gz"
     pairs_path = artifact_dir / "pair_results.jsonl.gz"
@@ -481,11 +493,13 @@ def test_objective_change_reuses_bootstraps_and_families(tmp_path):
         for event in taxonomy_cache.events
         if event.stage == "semantic_bootstrap"
     )
+    # Clinical taxonomy is a deprecated, ignored compatibility input, so it
+    # cannot invalidate discovery or family clustering caches.
     assert next(
         event
         for event in taxonomy_cache.events
         if event.stage == "semantic_families"
-    ).status == "miss"
+    ).status == "hit"
 
 
 def test_disabling_class_analysis_preserves_pooled_output_and_omits_additions(

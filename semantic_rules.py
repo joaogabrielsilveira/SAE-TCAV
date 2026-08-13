@@ -8,7 +8,7 @@ separate selection partition.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from itertools import combinations
 from typing import Iterable, Literal, Mapping, Sequence
 
@@ -424,6 +424,57 @@ class RuleSetSelectionConfig:
 
 
 @dataclass(frozen=True)
+class ConstraintRescueDiagnostics:
+    """Leave-one-constraint-out feasibility checks for a failed selection.
+
+    ``applicable`` distinguishes a constraint which could have excluded a
+    model from one which was already inactive for this candidate pool.
+    ``rescued`` entries are intentionally non-exclusive: several constraints
+    can independently rescue the same failed factor-target selection.
+    """
+
+    applicable: tuple[str, ...] = ()
+    rescued: tuple[str, ...] = ()
+    evaluated_subsets: tuple[tuple[str, int], ...] = ()
+
+    def is_applicable(self, constraint: str) -> bool:
+        return constraint in self.applicable
+
+    def is_rescued(self, constraint: str) -> bool:
+        return constraint in self.rescued
+
+    def evaluated_count(self, constraint: str) -> int:
+        return dict(self.evaluated_subsets).get(constraint, 0)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "applicable": list(self.applicable),
+            "rescued": list(self.rescued),
+            "evaluated_subsets": dict(self.evaluated_subsets),
+        }
+
+
+@dataclass(frozen=True)
+class RuleSetSelectionDiagnostics:
+    """Candidate/support funnel counts and overlapping constraint rescues."""
+
+    n_input_candidates: int
+    n_eligible_candidates: int
+    n_excluded_by_rule_length: int
+    n_positive_selection_targets: int
+    constraint_rescues: ConstraintRescueDiagnostics = ConstraintRescueDiagnostics()
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "n_input_candidates": self.n_input_candidates,
+            "n_eligible_candidates": self.n_eligible_candidates,
+            "n_excluded_by_rule_length": self.n_excluded_by_rule_length,
+            "n_positive_selection_targets": self.n_positive_selection_targets,
+            "constraint_rescues": self.constraint_rescues.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
 class RuleSetSelection:
     """Result of constrained rule-set selection."""
 
@@ -434,6 +485,7 @@ class RuleSetSelection:
     search_method: Literal["exhaustive", "beam", "none"]
     n_candidates: int
     n_evaluated_subsets: int
+    diagnostics: RuleSetSelectionDiagnostics = RuleSetSelectionDiagnostics(0, 0, 0, 0)
 
 
 def _objective_key(
@@ -497,6 +549,145 @@ def _has_valid_addition_order(
     return visit(indices, np.zeros(truth.shape[0], dtype=bool), False)
 
 
+def _search_rule_subsets(
+    eligible: Sequence[Rule],
+    masks: Sequence[np.ndarray],
+    truth: np.ndarray,
+    config: RuleSetSelectionConfig,
+    *,
+    stop_on_feasible: bool = False,
+) -> tuple[
+    tuple[tuple[int, ...], BinaryMetrics] | None,
+    int,
+    Literal["exhaustive", "beam"],
+]:
+    """Run the deterministic baseline search or a feasibility-only variant."""
+
+    max_size = min(config.max_rules, len(eligible))
+    exhaustive = len(eligible) <= config.exhaustive_max_candidates
+    search_method: Literal["exhaustive", "beam"] = (
+        "exhaustive" if exhaustive else "beam"
+    )
+    best: tuple[tuple[int, ...], BinaryMetrics] | None = None
+    evaluated = 0
+
+    def evaluate(indices: tuple[int, ...]) -> BinaryMetrics | None:
+        nonlocal evaluated
+        if not _has_valid_addition_order(
+            indices, masks, truth, config.min_marginal_recall
+        ):
+            return None
+        union = np.zeros(truth.shape[0], dtype=bool)
+        for index in indices:
+            union |= masks[index]
+        evaluated += 1
+        return binary_metrics(truth, union)
+
+    def consider(indices: tuple[int, ...], metrics: BinaryMetrics) -> bool:
+        nonlocal best
+        if metrics.precision + 1e-15 < config.min_precision:
+            return False
+        if metrics.lift + 1e-15 < config.min_lift:
+            return False
+        if best is None or _objective_key(
+            indices, metrics, eligible, config.objective
+        ) > _objective_key(best[0], best[1], eligible, config.objective):
+            best = (indices, metrics)
+        return True
+
+    if exhaustive:
+        for size in range(1, max_size + 1):
+            for indices in combinations(range(len(eligible)), size):
+                metrics = evaluate(indices)
+                if (
+                    metrics is not None
+                    and consider(indices, metrics)
+                    and stop_on_feasible
+                ):
+                    return best, evaluated, search_method
+    else:
+        frontier: list[tuple[int, ...]] = [()]
+        for _size in range(1, max_size + 1):
+            expanded: set[tuple[int, ...]] = set()
+            for state in frontier:
+                start = state[-1] + 1 if state else 0
+                for index in range(start, len(eligible)):
+                    expanded.add(state + (index,))
+            scored: list[tuple[tuple[object, ...], tuple[int, ...]]] = []
+            for indices in sorted(expanded):
+                metrics = evaluate(indices)
+                if metrics is None:
+                    continue
+                if consider(indices, metrics) and stop_on_feasible:
+                    return best, evaluated, search_method
+                scored.append(
+                    (
+                        _objective_key(indices, metrics, eligible, config.objective),
+                        indices,
+                    )
+                )
+            scored.sort(reverse=True)
+            frontier = [indices for _, indices in scored[: config.beam_width]]
+            if not frontier:
+                break
+    return best, evaluated, search_method
+
+
+def _constraint_rescue_diagnostics(
+    candidates: Sequence[Rule],
+    array: np.ndarray,
+    truth: np.ndarray,
+    config: RuleSetSelectionConfig,
+) -> ConstraintRescueDiagnostics:
+    """Check whether removing each active final constraint restores feasibility."""
+
+    checks: list[tuple[str, RuleSetSelectionConfig]] = []
+    max_length = max(
+        (rule.length for rule in candidates), default=config.max_rule_length
+    )
+    if max_length > config.max_rule_length:
+        checks.append(("max_rule_length", replace(config, max_rule_length=max_length)))
+    eligible_count = sum(rule.length <= config.max_rule_length for rule in candidates)
+    if eligible_count > config.max_rules:
+        checks.append(("max_rules", replace(config, max_rules=eligible_count)))
+    if config.min_marginal_recall > 0.0:
+        checks.append(
+            ("min_marginal_recall", replace(config, min_marginal_recall=0.0))
+        )
+    if config.min_precision > 0.0:
+        checks.append(("min_precision", replace(config, min_precision=0.0)))
+    if config.min_lift > 0.0:
+        checks.append(("min_lift", replace(config, min_lift=0.0)))
+
+    rescued: list[str] = []
+    evaluated_counts: list[tuple[str, int]] = []
+    for name, diagnostic_config in checks:
+        diagnostic_eligible = sorted(
+            (
+                rule
+                for rule in candidates
+                if rule.length <= diagnostic_config.max_rule_length
+            ),
+            key=lambda rule: rule.rule_id,
+        )
+        diagnostic_masks = [rule.mask(array) for rule in diagnostic_eligible]
+        best, evaluated, _ = _search_rule_subsets(
+            diagnostic_eligible,
+            diagnostic_masks,
+            truth,
+            diagnostic_config,
+            stop_on_feasible=True,
+        )
+        evaluated_counts.append((name, evaluated))
+        if best is not None:
+            rescued.append(name)
+    return ConstraintRescueDiagnostics(
+        applicable=tuple(name for name, _ in checks),
+        rescued=tuple(rescued),
+        evaluated_subsets=tuple(evaluated_counts),
+    )
+
+
 def select_rule_set(
     candidates: Iterable[Rule],
     X_selection: np.ndarray,
@@ -520,8 +711,13 @@ def select_rule_set(
     if array.shape[0] != truth.shape[0]:
         raise ValueError("X_selection and y_selection must contain equal rows")
 
+    all_candidates = tuple(candidates)
     eligible = sorted(
-        (rule for rule in candidates if rule.length <= selection_config.max_rule_length),
+        (
+            rule
+            for rule in all_candidates
+            if rule.length <= selection_config.max_rule_length
+        ),
         key=lambda rule: rule.rule_id,
     )
     ids = [rule.rule_id for rule in eligible]
@@ -529,7 +725,27 @@ def select_rule_set(
         raise ValueError("candidate rule IDs must be unique")
     empty = RuleSet((), threshold_name=threshold_name)
     empty_metrics = evaluate_rule_set(empty, array, truth)
+    n_positive = int(np.count_nonzero(truth))
+
+    def diagnostics(
+        rescues: ConstraintRescueDiagnostics = ConstraintRescueDiagnostics(),
+    ) -> RuleSetSelectionDiagnostics:
+        return RuleSetSelectionDiagnostics(
+            n_input_candidates=len(all_candidates),
+            n_eligible_candidates=len(eligible),
+            n_excluded_by_rule_length=len(all_candidates) - len(eligible),
+            n_positive_selection_targets=n_positive,
+            constraint_rescues=rescues,
+        )
+
     if not eligible:
+        rescues = (
+            _constraint_rescue_diagnostics(
+                all_candidates, array, truth, selection_config
+            )
+            if n_positive >= selection_config.minimum_positive_samples
+            else ConstraintRescueDiagnostics()
+        )
         return RuleSetSelection(
             rule_set=empty,
             metrics=empty_metrics,
@@ -538,8 +754,8 @@ def select_rule_set(
             search_method="none",
             n_candidates=0,
             n_evaluated_subsets=0,
+            diagnostics=diagnostics(rescues),
         )
-    n_positive = int(np.count_nonzero(truth))
     if n_positive < selection_config.minimum_positive_samples:
         return RuleSetSelection(
             rule_set=empty,
@@ -553,74 +769,18 @@ def select_rule_set(
             search_method="none",
             n_candidates=len(eligible),
             n_evaluated_subsets=0,
+            diagnostics=diagnostics(),
         )
 
     masks = [rule.mask(array) for rule in eligible]
-    max_size = min(selection_config.max_rules, len(eligible))
-    exhaustive = len(eligible) <= selection_config.exhaustive_max_candidates
-    search_method: Literal["exhaustive", "beam"] = (
-        "exhaustive" if exhaustive else "beam"
+    best, evaluated, search_method = _search_rule_subsets(
+        eligible, masks, truth, selection_config
     )
-    best: tuple[tuple[int, ...], BinaryMetrics] | None = None
-    evaluated = 0
-
-    def evaluate(indices: tuple[int, ...]) -> BinaryMetrics | None:
-        nonlocal evaluated
-        if not _has_valid_addition_order(
-            indices, masks, truth, selection_config.min_marginal_recall
-        ):
-            return None
-        union = np.zeros(truth.shape[0], dtype=bool)
-        for index in indices:
-            union |= masks[index]
-        evaluated += 1
-        return binary_metrics(truth, union)
-
-    def consider(indices: tuple[int, ...], metrics: BinaryMetrics) -> None:
-        nonlocal best
-        if metrics.precision + 1e-15 < selection_config.min_precision:
-            return
-        if metrics.lift + 1e-15 < selection_config.min_lift:
-            return
-        if best is None or _objective_key(
-            indices, metrics, eligible, selection_config.objective
-        ) > _objective_key(best[0], best[1], eligible, selection_config.objective):
-            best = (indices, metrics)
-
-    if exhaustive:
-        for size in range(1, max_size + 1):
-            for indices in combinations(range(len(eligible)), size):
-                metrics = evaluate(indices)
-                if metrics is not None:
-                    consider(indices, metrics)
-    else:
-        frontier: list[tuple[int, ...]] = [()]
-        for _size in range(1, max_size + 1):
-            expanded: set[tuple[int, ...]] = set()
-            for state in frontier:
-                start = state[-1] + 1 if state else 0
-                for index in range(start, len(eligible)):
-                    expanded.add(state + (index,))
-            scored: list[tuple[tuple[object, ...], tuple[int, ...]]] = []
-            for indices in sorted(expanded):
-                metrics = evaluate(indices)
-                if metrics is None:
-                    continue
-                consider(indices, metrics)
-                scored.append(
-                    (
-                        _objective_key(
-                            indices, metrics, eligible, selection_config.objective
-                        ),
-                        indices,
-                    )
-                )
-            scored.sort(reverse=True)
-            frontier = [indices for _, indices in scored[: selection_config.beam_width]]
-            if not frontier:
-                break
 
     if best is None:
+        rescues = _constraint_rescue_diagnostics(
+            all_candidates, array, truth, selection_config
+        )
         return RuleSetSelection(
             rule_set=empty,
             metrics=empty_metrics,
@@ -629,6 +789,7 @@ def select_rule_set(
             search_method=search_method,
             n_candidates=len(eligible),
             n_evaluated_subsets=evaluated,
+            diagnostics=diagnostics(rescues),
         )
 
     chosen_indices, chosen_metrics = best
@@ -644,6 +805,7 @@ def select_rule_set(
         search_method=search_method,
         n_candidates=len(eligible),
         n_evaluated_subsets=evaluated,
+        diagnostics=diagnostics(),
     )
 
 

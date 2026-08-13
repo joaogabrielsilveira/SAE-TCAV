@@ -1767,10 +1767,7 @@ class DefaultComparisonAdapter:
         *,
         force: bool,
     ) -> dict[str, Any]:
-        from semantic_config import (
-            SemanticExperimentConfig,
-            load_clinical_groups,
-        )
+        from semantic_config import SemanticExperimentConfig
         from semantic_experiment import run_semantic_comparison
 
         semantic_path = Path(config.semantic_config_path)
@@ -1785,11 +1782,6 @@ class DefaultComparisonAdapter:
                 show_progress=config.show_progress,
             ),
         )
-        clinical_path = semantic.clinical_groups_path
-        if clinical_path is not None:
-            clinical_path = str(_resolve_path(
-                semantic_path.parent, clinical_path))
-        clinical_groups = load_clinical_groups(clinical_path)
         return run_semantic_comparison(
             X=prepared.X_test,
             outcome_for_stratification=prepared.y_test,
@@ -1798,7 +1790,7 @@ class DefaultComparisonAdapter:
             activations_by_run=sae_data.activations,
             matchings=matches,
             config=semantic,
-            clinical_groups=clinical_groups,
+            clinical_groups={},
             functional_by_factor=functional,
             record_keys=prepared.record_keys,
             force=force,
@@ -1836,11 +1828,6 @@ def run_comparison(
         "scientific_config_hash": semantic_dependencies[
             "scientific_config_hash"
         ],
-        "clinical_groups_sha256": (
-            None
-            if semantic_dependencies["clinical_groups"] is None
-            else semantic_dependencies["clinical_groups"]["sha256"]
-        ),
     }
     source_hash = _runner_source_fingerprint()
     hash_config = _scientific_runner_config(config)
@@ -2978,7 +2965,7 @@ def _file_fingerprint(path: Path) -> str:
 
 
 def _semantic_dependency_fingerprints(path: Path) -> dict[str, Any]:
-    """Fingerprint semantic config and its external clinical taxonomy."""
+    """Fingerprint semantic scientific configuration."""
 
     with path.open(encoding="utf-8") as handle:
         raw = json.load(handle)
@@ -2989,26 +2976,16 @@ def _semantic_dependency_fingerprints(path: Path) -> dict[str, Any]:
         "config_path": str(path.resolve()),
         "config_sha256": _file_fingerprint(path),
         "scientific_config_hash": None,
-        "clinical_groups": None,
     }
     scientific_raw = json.loads(json.dumps(raw))
     runtime = scientific_raw.get("runtime")
     if isinstance(runtime, dict):
         for name in ("artifact_dir", "cache", "show_progress", "n_jobs"):
             runtime.pop(name, None)
+    # Deprecated clinical taxonomy paths are intentionally excluded from the
+    # scientific identity because they no longer affect semantic comparisons.
+    scientific_raw.pop("clinical_groups_path", None)
     fingerprints["scientific_config_hash"] = stable_hash(scientific_raw)
-    clinical_groups_path = raw.get("clinical_groups_path")
-    if clinical_groups_path is None:
-        return fingerprints
-    resolved = _resolve_path(path.parent, str(clinical_groups_path))
-    if not resolved.is_file():
-        raise FileNotFoundError(
-            f"Clinical group mapping not found: {resolved}"
-        )
-    fingerprints["clinical_groups"] = {
-        "path": str(resolved),
-        "sha256": _file_fingerprint(resolved),
-    }
     return fingerprints
 
 

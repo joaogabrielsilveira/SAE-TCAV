@@ -151,7 +151,7 @@ def test_group_bootstrap_never_splits_variable_size_groups():
         assert not (fit_counts[rows[0]] > 0 and oob_mask[rows[0]])
 
 
-def test_clinical_groups_are_copied_to_structured_conditions():
+def test_legacy_clinical_groups_argument_is_ignored():
     X = np.arange(60, dtype=float).reshape(-1, 1)
     y = (X[:, 0] >= 30).astype(int)
     result = discover_stable_rule_candidates(
@@ -164,10 +164,22 @@ def test_clinical_groups_are_copied_to_structured_conditions():
 
     assert result.occurrences
     for occurrence in result.occurrences:
-        assert occurrence.rule.conditions[0].clinical_groups == (
-            "laboratory",
-            "renal",
-        )
+        assert occurrence.rule.conditions[0].clinical_groups == ()
+
+
+def test_default_backend_uses_all_features_and_allows_zero_leaf_support():
+    config = StableRuleBackendConfig()
+
+    assert config.max_depth == 15
+    assert config.max_features is None
+    assert config.min_positive_leaf_samples == 0
+
+
+def test_negative_leaf_support_is_invalid():
+    import pytest
+
+    with pytest.raises(ValueError, match=">= 0"):
+        StableRuleBackendConfig(min_positive_leaf_samples=-1)
 
 
 def test_single_class_and_rare_targets_have_explicit_audit_results():
@@ -210,4 +222,9 @@ def test_two_class_target_with_no_extractable_rule_is_explicit():
     assert result.occurrences == ()
     assert len(result.bootstrap_diagnostics) == 5
     assert all(item.candidates_extracted == 0 for item in result.bootstrap_diagnostics)
+    assert all(item.leaves_considered > 0 for item in result.bootstrap_diagnostics)
+    assert all(
+        item.leaves_rejected_positive_support > 0
+        for item in result.bootstrap_diagnostics
+    )
     assert "no_valid_rule_candidates" in result.warnings

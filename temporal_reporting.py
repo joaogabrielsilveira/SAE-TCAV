@@ -27,12 +27,16 @@ def build_parent_reports(root: Path, successful, config) -> dict[str, list[dict]
     performance = tables.get("performance", [])
     factors = tables.get("factor_year_metrics", [])
     tcav = tables.get("tcav", [])
+    semantic_selection = tables.get("semantic_selection_diagnostics", [])
     return {
         "distance_summaries": _distance(performance, factors, tcav),
         "uncertainty": _uncertainty(performance, factors, config),
         "lead_lag": _lead_lag(performance, factors, config),
         "change_points": _change_points(performance, factors),
         "triangular_matrices": _matrices(performance, factors, tcav),
+        "semantic_selection_summary": _semantic_selection_summary(
+            semantic_selection
+        ),
     }
 
 
@@ -62,6 +66,113 @@ def _groups(rows, fields):
     for row in rows:
         result.setdefault(tuple(row.get(field) for field in fields), []).append(row)
     return result
+
+
+def _semantic_factor_key(row):
+    return (
+        row.get("reference_year"),
+        row.get("patient_split_seed"),
+        row.get("member_sae_seed"),
+        row.get("member_factor_id"),
+    )
+
+
+def _semantic_family_key(row):
+    family = row.get("factor_family_uid")
+    return str(family) if family is not None else _semantic_factor_key(row)
+
+
+def _semantic_selection_summary(rows):
+    """Summarize exclusive funnel losses and overlapping ablation rescues."""
+
+    if not rows:
+        return []
+    scopes = (
+        ("overall", ()),
+        ("activation_target", ("activation_target",)),
+        ("reference_year", ("reference_year",)),
+        (
+            "reference_year_activation_target",
+            ("reference_year", "activation_target"),
+        ),
+    )
+    output = []
+    for scope, fields in scopes:
+        grouped = _groups(rows, fields) if fields else {(): list(rows)}
+        for key, values in grouped.items():
+            dimensions = dict(zip(fields, key))
+            total_factors = {_semantic_factor_key(row) for row in values}
+            total_families = {_semantic_family_key(row) for row in values}
+            stages = sorted({str(row.get("funnel_stage")) for row in values})
+            for stage in stages:
+                selected = [
+                    row for row in values if str(row.get("funnel_stage")) == stage
+                ]
+                selected_factors = {_semantic_factor_key(row) for row in selected}
+                selected_families = {_semantic_family_key(row) for row in selected}
+                output.append({
+                    "summary_kind": "exclusive_funnel",
+                    "summary_scope": scope,
+                    **dimensions,
+                    "criterion": stage,
+                    "factor_target_count": len(selected),
+                    "distinct_factor_count": len(selected_factors),
+                    "distinct_family_count": len(selected_families),
+                    "denominator_factor_target_count": len(values),
+                    "denominator_distinct_factor_count": len(total_factors),
+                    "denominator_distinct_family_count": len(total_families),
+                    "factor_target_rate": len(selected) / len(values),
+                    "distinct_factor_rate": (
+                        len(selected_factors) / len(total_factors)
+                        if total_factors else np.nan
+                    ),
+                    "distinct_family_rate": (
+                        len(selected_families) / len(total_families)
+                        if total_families else np.nan
+                    ),
+                })
+
+            rescue_fields = sorted({
+                str(name)
+                for row in values
+                for name in row
+                if str(name).startswith("rescued_without_")
+            })
+            eligible = [
+                row for row in values
+                if row.get("ablation_eligible", False)
+                or row.get("funnel_stage") == "no_feasible_subset"
+            ]
+            eligible_factors = {_semantic_factor_key(row) for row in eligible}
+            eligible_families = {_semantic_family_key(row) for row in eligible}
+            for field in rescue_fields:
+                rescued = [row for row in eligible if bool(row.get(field, False))]
+                rescued_factors = {_semantic_factor_key(row) for row in rescued}
+                rescued_families = {_semantic_family_key(row) for row in rescued}
+                output.append({
+                    "summary_kind": "overlapping_ablation_rescue",
+                    "summary_scope": scope,
+                    **dimensions,
+                    "criterion": field.removeprefix("rescued_without_"),
+                    "factor_target_count": len(rescued),
+                    "distinct_factor_count": len(rescued_factors),
+                    "distinct_family_count": len(rescued_families),
+                    "denominator_factor_target_count": len(eligible),
+                    "denominator_distinct_factor_count": len(eligible_factors),
+                    "denominator_distinct_family_count": len(eligible_families),
+                    "factor_target_rate": (
+                        len(rescued) / len(eligible) if eligible else np.nan
+                    ),
+                    "distinct_factor_rate": (
+                        len(rescued_factors) / len(eligible_factors)
+                        if eligible_factors else np.nan
+                    ),
+                    "distinct_family_rate": (
+                        len(rescued_families) / len(eligible_families)
+                        if eligible_families else np.nan
+                    ),
+                })
+    return output
 
 
 def _distance(performance, factors, tcav):

@@ -2,6 +2,8 @@ import numpy as np
 import pytest
 
 from semantic_compare import (
+    RuleSimilarity,
+    RuleSimilarityWeights,
     cluster_rule_families,
     compare_rule_sets_by_class,
     compare_rule_sets_symmetric,
@@ -60,7 +62,7 @@ def _occurrence(rule, *, bootstrap_id, tree_id=0, leaf_id=1):
     )
 
 
-def test_rule_equivalence_uses_cohorts_groups_thresholds_and_direction():
+def test_rule_equivalence_uses_cohorts_exact_features_thresholds_and_direction():
     signal = np.linspace(0.0, 1.0, 101)
     # Columns deliberately encode correlated clinical substitutes.
     X = np.column_stack((signal, signal))
@@ -81,9 +83,9 @@ def test_rule_equivalence_uses_cohorts_groups_thresholds_and_direction():
 
     assert nearby.total >= 0.70
     assert nearby.cohort_jaccard > 0.9
-    assert substitute.total >= 0.70
+    assert substitute.total == pytest.approx(0.625)
     assert substitute.exact_feature_jaccard == 0.0
-    assert substitute.clinical_group_jaccard == 1.0
+    assert substitute.clinical_group_jaccard is None
     assert opposite.total < 0.70
     assert opposite.threshold_direction_compatibility == 0.0
 
@@ -97,7 +99,39 @@ def test_rule_equivalence_uses_cohorts_groups_thresholds_and_direction():
         X,
         total_bootstraps=4,
     )
-    assert sorted(len(family.occurrences) for family in families) == [1, 3]
+    assert sorted(len(family.occurrences) for family in families) == [1, 1, 2]
+
+
+def test_similarity_weights_use_three_components_and_read_legacy_weights():
+    weights = RuleSimilarityWeights()
+    assert weights.to_dict() == {
+        "cohort": 0.625,
+        "exact_feature": 0.25,
+        "threshold_direction": 0.125,
+    }
+    legacy = RuleSimilarityWeights.from_dict(
+        {
+            "cohort": 0.5,
+            "exact_feature": 0.2,
+            "clinical_group": 0.2,
+            "threshold_direction": 0.1,
+        }
+    )
+    assert legacy.cohort == pytest.approx(weights.cohort)
+    assert legacy.exact_feature == pytest.approx(weights.exact_feature)
+    assert legacy.threshold_direction == pytest.approx(
+        weights.threshold_direction
+    )
+
+
+def test_similarity_serialization_omits_new_clinical_score_but_reads_legacy():
+    current = RuleSimilarity(0.8, 0.9, 1.0, 0.6)
+    assert "clinical_group_jaccard" not in current.to_dict()
+
+    restored = RuleSimilarity.from_dict(
+        {**current.to_dict(), "clinical_group_jaccard": 0.75}
+    )
+    assert restored.clinical_group_jaccard == 0.75
 
 
 def test_recurrence_counts_bootstraps_not_tree_occurrences():
@@ -118,18 +152,17 @@ def test_recurrence_counts_bootstraps_not_tree_occurrences():
 
     families = cluster_rule_families(occurrences, X, total_bootstraps=4)
 
-    assert len(families) == 1
-    family = families[0]
-    assert len(family.occurrences) == 3
-    assert family.recurrence_count == 2
-    assert family.recurrence_frequency == 0.5
-    assert family.feature_recurrence == {"creatinine": 0.25, "egfr": 0.25}
-    assert family.clinical_group_recurrence == {"renal": 0.5}
+    assert len(families) == 2
+    family = next(item for item in families if len(item.occurrences) == 2)
+    assert family.recurrence_count == 1
+    assert family.recurrence_frequency == 0.25
+    assert family.feature_recurrence == {"creatinine": 0.25}
+    assert family.clinical_group_recurrence == {}
     assert family.cohort_overlap_stability > 0.9
-    assert recurrent_representatives(families, 0.5) == (
-        family.representative_rule,
-    )
-    assert recurrent_representatives(families, 0.5001) == ()
+    assert set(recurrent_representatives(families, 0.25)) == {
+        item.representative_rule for item in families
+    }
+    assert recurrent_representatives(families, 0.2501) == ()
 
 
 def test_symmetric_transfer_retains_directional_asymmetry():

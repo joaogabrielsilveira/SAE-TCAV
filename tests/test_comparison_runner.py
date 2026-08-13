@@ -22,6 +22,7 @@ from comparison_runner import (
     _PreparedData,
     _SAEData,
     _runtime_estimate,
+    _semantic_dependency_fingerprints,
     run_comparison,
 )
 from sae import SAE
@@ -577,6 +578,28 @@ def test_run_comparison_reports_missing_required_files(
 
     with pytest.raises(FileNotFoundError, match=message):
         run_comparison(config, adapter=_FailingAdapter())
+
+
+def test_clinical_groups_do_not_affect_semantic_scientific_fingerprint(tmp_path):
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    first.write_text(
+        json.dumps({"clinical_groups_path": "missing-a.json"}),
+        encoding="utf-8",
+    )
+    second.write_text(
+        json.dumps({"clinical_groups_path": "missing-b.json"}),
+        encoding="utf-8",
+    )
+
+    first_fingerprint = _semantic_dependency_fingerprints(first)
+    second_fingerprint = _semantic_dependency_fingerprints(second)
+
+    assert "clinical_groups" not in first_fingerprint
+    assert (
+        first_fingerprint["scientific_config_hash"]
+        == second_fingerprint["scientific_config_hash"]
+    )
 
 
 def test_main_comparison_help_does_not_load_pipeline(monkeypatch, capsys):
