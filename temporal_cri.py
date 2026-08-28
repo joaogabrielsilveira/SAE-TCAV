@@ -2,7 +2,7 @@
 
 Consumes completed unified enrichment.  This module is deliberately downstream
 of enrichment: CRI changes never invalidate temporal experiments, TCAV work, or
-the selected performance fallback artifact.
+the primary original-system performance artifact.
 """
 from __future__ import annotations
 
@@ -304,13 +304,13 @@ def build_prediction_rows(system: Sequence[Mapping[str, Any]], performance: Sequ
     for key, timeline in by_trajectory.items():
         ref, split, cohort, target = key
         for distance, cri in timeline.items():
-            now = perf.get((ref, split, cohort, distance)); previous = perf.get((ref, split, cohort, distance - 1)); future = perf.get((ref, split, cohort, distance + 1)); next_cri = timeline.get(distance + 1)
-            if not now or not previous or not future or not next_cri: continue
+            now = perf.get((ref, split, cohort, distance)); previous = perf.get((ref, split, cohort, distance - 1)); future = perf.get((ref, split, cohort, distance + 1)); previous_cri = timeline.get(distance - 1)
+            if not now or not previous or not future: continue
             if not _finite(now.get("death_f1")) or not _finite(previous.get("death_f1")) or not _finite(future.get("death_f1")): continue
             output.append({"reference_year": ref, "patient_split_seed": split, "cohort_view": cohort, "activation_target": target,
                            "temporal_distance": distance, "test_year": now.get("test_year"), "target": future["death_f1"],
                            "f1_d": now["death_f1"], "delta_f1_d": float(now["death_f1"] - previous["death_f1"]),
-                           "cri_d": cri.get("median_cri"), "delta_cri_d": None if not _finite(cri.get("median_cri")) or not _finite(previous.get("median_cri")) else float(cri["median_cri"] - previous["median_cri"]),
+                           "cri_d": cri.get("median_cri"), "delta_cri_d": None if not _finite(cri.get("median_cri")) or previous_cri is None or not _finite(previous_cri.get("median_cri")) else float(cri["median_cri"] - previous_cri["median_cri"]),
                            "coverage": cri.get("coverage"), "selected_variant": now.get("selected_variant")})
     return output
 
@@ -475,9 +475,14 @@ def build_cri_analysis(
     members = compute_member_utilities(factor_rows, universe, taus, unified_config, config)
     families = aggregate_family_scores(universe, members)
     system = summarize_system_scores(families, config)
-    prediction_rows = build_prediction_rows(system, source.get("selected_performance", []))
+    primary_performance = source.get(
+        "primary_performance", source.get("selected_performance", [])
+    )
+    prediction_rows = build_prediction_rows(system, primary_performance)
     predictions, folds, metrics = evaluate_loyo(prediction_rows)
-    learned_predictions, learned_audits = evaluate_learned_weights(families, source.get("selected_performance", []), config)
+    learned_predictions, learned_audits = evaluate_learned_weights(
+        families, primary_performance, config
+    )
     learned_metrics = summarize_oof_predictions(learned_predictions)
     products = {
         "cri_family_universe": universe, "cri_tau_calibration": taus,

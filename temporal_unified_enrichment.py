@@ -529,18 +529,10 @@ def performance_variant_rows(
         for row in parent_tables.get("performance", [])
         if row.get("cohort_view") in analysis_config.cohorts
     ]
-    # Determine the trigger without fitting the balanced model unnecessarily.
-    probe = list(original)
-    for cohort in analysis_config.cohorts:
-        probe.append({
-            "variant": "balanced_context", "cohort_view": cohort,
-            "temporal_distance": 0, "macro_f1": 0.0, "death_f1": 0.0,
-        })
-    try:
-        _, audit = choose_f1_variant(probe)
-    except ValueError:
-        audit = []
-    triggered = any(row["fallback_triggered"] for row in audit)
+    # Determine whether to run the separate sensitivity experiment without
+    # fitting the balanced model unnecessarily.
+    _, audit = choose_f1_variant(original)
+    triggered = any(row["sensitivity_triggered"] for row in audit)
     if not triggered:
         return original
 
@@ -715,8 +707,8 @@ def build_unified_enrichment(
     performance_variants = performance_variant_rows(
         tables, split_roots, population, parent_config, config
     )
-    selected_performance, fallback_audit = choose_f1_variant(performance_variants)
-    for row in fallback_audit:
+    primary_performance, sensitivity_audit = choose_f1_variant(performance_variants)
+    for row in sensitivity_audit:
         balanced = [
             item for item in performance_variants
             if item.get("variant") == "balanced_context"
@@ -735,15 +727,19 @@ def build_unified_enrichment(
     )
     status = _status_composition(magnitude)
     deltas = _all_deltas(
-        selected_performance, magnitude, tcav_valid_headline, status, config
+        primary_performance, magnitude, tcav_valid_headline, status, config
     )
     evidence = delta_evidence(deltas)
     products = {
         "activation_support": support,
         "headline_factor_metrics": magnitude,
         "performance_variants": performance_variants,
-        "selected_performance": selected_performance,
-        "f1_fallback_audit": fallback_audit,
+        "primary_performance": primary_performance,
+        # Backward-compatible aliases; both now contain/audit the original
+        # primary system rather than a cohort-wide model substitution.
+        "selected_performance": primary_performance,
+        "f1_fallback_audit": sensitivity_audit,
+        "balanced_context_sensitivity_audit": sensitivity_audit,
         "tcav_repetitions": tcav_repetitions,
         "tcav_significance": tcav_headline,
         "family_ladder": ladder,
