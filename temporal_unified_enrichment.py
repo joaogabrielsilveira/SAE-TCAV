@@ -679,7 +679,11 @@ def build_unified_enrichment(
     parent_config = parent["config"]
     temporal_config = TemporalRobustnessConfig.from_dict(parent_config)
     adapter = ProductionTemporalAdapter()
-    population = adapter.load_population(temporal_config)
+    population = adapter.load_retained_population(
+        temporal_config,
+        parent_root.parent,
+        parent["population_fingerprints"],
+    )
     population.validate()
     split_roots = [Path(row["manifest"]).parent for row in parent["successful_experiments"]]
     tables = load_parent_tables(parent_root, parent)

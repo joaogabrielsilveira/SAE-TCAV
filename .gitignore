@@ -7,3 +7,5 @@
 /TCAV/
 /graphs/
 *.pyc
+*.log
+/cold-*/*

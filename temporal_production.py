@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+import pickle
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -35,8 +36,8 @@ class ProductionTemporalAdapter:
         self._source_prepared = None
         self._base_config = None
 
-    def load_population(self, config) -> TemporalPopulation:
-        from comparison_runner import ComparisonRunnerConfig, DefaultComparisonAdapter
+    def _configure(self, config):
+        from comparison_runner import ComparisonRunnerConfig
 
         base = ComparisonRunnerConfig.from_json(config.comparison_config_path)
         base = replace(
@@ -48,18 +49,14 @@ class ProductionTemporalAdapter:
             show_progress=config.show_progress,
             accelerator=replace(base.accelerator, device=config.device),
         )
-        cache = ComparisonCache(
-            Path(config.artifact_dir) / "_population_cache",
-            enabled=config.use_cache,
-            forced_stages=("prepared",) if config.force else (),
-        )
-        workspace = Path(config.artifact_dir) / "_population"
-        workspace.mkdir(parents=True, exist_ok=True)
-        prepared = DefaultComparisonAdapter(cache).prepare(
-            base, workspace, force=config.force
-        )
-        self._source_prepared = prepared
         self._base_config = base
+        return base
+
+    def _population_from_prepared(self, prepared) -> TemporalPopulation:
+        from comparison_runner import _validate_prepared
+
+        _validate_prepared(prepared)
+        self._source_prepared = prepared
         patients = prepared.patient_ids.astype(str)
         years = prepared.years_test.astype(int)
         first = {
@@ -75,6 +72,48 @@ class ProductionTemporalAdapter:
             first_eligible_year=first,
             record_keys=np.asarray(prepared.record_keys).astype(str),
             feature_selection_max_year=int(np.max(prepared.years_train)),
+        )
+
+    def load_population(self, config) -> TemporalPopulation:
+        from comparison_runner import DefaultComparisonAdapter
+
+        base = self._configure(config)
+        cache = ComparisonCache(
+            Path(config.artifact_dir) / "_population_cache",
+            enabled=config.use_cache,
+            forced_stages=("prepared",) if config.force else (),
+        )
+        workspace = Path(config.artifact_dir) / "_population"
+        workspace.mkdir(parents=True, exist_ok=True)
+        prepared = DefaultComparisonAdapter(cache).prepare(
+            base, workspace, force=config.force
+        )
+        return self._population_from_prepared(prepared)
+
+    def load_retained_population(self, config, artifact_root, expected_fingerprints):
+        """Load the exact prepared population retained with an immutable parent."""
+        from temporal_robustness import _fingerprint_population
+
+        root = Path(artifact_root)
+        candidates = [root / "_population" / "prepared.pkl"]
+        candidates.extend(sorted(
+            (root / "_population_cache" / "prepared").glob("*/prepared.pkl")
+        ))
+        mismatches = []
+        for path in candidates:
+            if not path.is_file():
+                continue
+            with path.open("rb") as handle:
+                prepared = pickle.load(handle)
+            population = self._population_from_prepared(prepared)
+            actual = _fingerprint_population(population)
+            if actual == expected_fingerprints:
+                self._configure(config)
+                return population
+            mismatches.append(str(path))
+        raise RuntimeError(
+            "no retained prepared population matches the temporal parent fingerprints; "
+            f"checked {len(mismatches)} candidate(s) under {root}"
         )
 
     def run_reference_experiment(
