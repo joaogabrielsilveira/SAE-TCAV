@@ -4,7 +4,8 @@ import pytest
 
 from temporal_cri import (
     CRIAnalysisConfig, _preservation, _ratio_utility, aggregate_family_scores,
-    build_family_universe, compute_member_utilities, evaluate_loyo, summarize_system_scores,
+    build_family_universe, build_prediction_rows, compute_member_utilities, evaluate_loyo,
+    summarize_system_scores,
 )
 from temporal_unified_analysis import UnifiedAnalysisConfig
 
@@ -75,6 +76,43 @@ def test_family_one_vote_not_one_vote_per_member():
     ]
     result = summarize_system_scores(families, config)[0]
     assert result["median_cri"] == pytest.approx(.5)
+
+
+def test_prediction_rows_compute_cri_delta_from_prior_cri_row():
+    system = [
+        {"reference_year": 2007, "patient_split_seed": 42, "cohort_view": "all_comer",
+         "activation_target": .5, "temporal_distance": distance, "median_cri": cri,
+         "coverage": 1.}
+        for distance, cri in ((0, .9), (1, .7), (2, .6))
+    ]
+    performance = [
+        {"reference_year": 2007, "patient_split_seed": 42, "cohort_view": "all_comer",
+         "temporal_distance": distance, "test_year": 2007 + distance, "death_f1": f1}
+        for distance, f1 in ((0, .8), (1, .75), (2, .7))
+    ]
+
+    rows = build_prediction_rows(system, performance)
+
+    distance_one = next(row for row in rows if row["temporal_distance"] == 1)
+    assert distance_one["delta_cri_d"] == pytest.approx(-.2)
+
+
+def test_prediction_rows_do_not_require_unused_future_cri():
+    system = [
+        {"reference_year": 2007, "patient_split_seed": 42, "cohort_view": "all_comer",
+         "activation_target": .5, "temporal_distance": distance, "median_cri": cri,
+         "coverage": 1.}
+        for distance, cri in ((0, .9), (1, .7))
+    ]
+    performance = [
+        {"reference_year": 2007, "patient_split_seed": 42, "cohort_view": "all_comer",
+         "temporal_distance": distance, "test_year": 2007 + distance, "death_f1": f1}
+        for distance, f1 in ((0, .8), (1, .75), (2, .7))
+    ]
+
+    rows = build_prediction_rows(system, performance)
+
+    assert [row["temporal_distance"] for row in rows] == [1]
 
 
 def test_loyo_never_leaks_held_reference_rows_into_training_fold():

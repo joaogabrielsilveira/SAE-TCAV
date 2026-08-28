@@ -338,7 +338,13 @@ def select_headline_factor_rows(
 def choose_f1_variant(
     performance_rows: Sequence[Mapping[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Apply the two-consecutive-zero trigger to a whole cohort."""
+    """Keep original-system F1 primary and audit balanced sensitivity triggers.
+
+    Two consecutive aggregate zero death-F1 distances still trigger generation
+    of the balanced-context experiment.  They never replace the original
+    system's rows: concept and performance measures in the primary analysis
+    must describe the same fitted system.
+    """
 
     original = [row for row in performance_rows if row.get("variant") == "original"]
     balanced = [row for row in performance_rows if row.get("variant") == "balanced_context"]
@@ -362,18 +368,29 @@ def choose_f1_variant(
     selected = []
     audit = []
     for cohort in COHORTS:
-        use_balanced = bool(triggers[cohort])
-        source = balanced if use_balanced else original
-        cohort_rows = [dict(row) for row in source if row.get("cohort_view") == cohort]
-        if use_balanced and not cohort_rows:
-            raise ValueError(f"balanced performance is required but absent for {cohort}")
+        sensitivity_triggered = bool(triggers[cohort])
+        cohort_rows = [
+            dict(row) for row in original if row.get("cohort_view") == cohort
+        ]
         for row in cohort_rows:
             row["selected_variant"] = row.pop("variant")
             selected.append(row)
+        balanced_row_count = sum(
+            row.get("cohort_view") == cohort for row in balanced
+        )
         audit.append({
             "cohort_view": cohort,
-            "fallback_triggered": use_balanced,
-            "selected_variant": "balanced_context" if use_balanced else "original",
+            # Kept for backward-compatible audit readers. A primary fallback is
+            # now forbidden; the trigger controls only the sensitivity fit.
+            "fallback_triggered": False,
+            "sensitivity_triggered": sensitivity_triggered,
+            "selected_variant": "original",
+            "primary_variant": "original",
+            "sensitivity_variant": (
+                "balanced_context" if sensitivity_triggered else None
+            ),
+            "balanced_sensitivity_available": bool(balanced_row_count),
+            "balanced_sensitivity_row_count": balanced_row_count,
             "trigger_distance_pairs": [list(pair) for pair in triggers[cohort]],
             "selected_row_count": len(cohort_rows),
         })
