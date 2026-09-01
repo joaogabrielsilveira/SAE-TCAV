@@ -1,0 +1,32 @@
+{
+  "schema_version": "1.0",
+  "dataset_path": "tidy_event_data.feather",
+  "artifact_dir": "stats/temporal_performance_windows",
+  "comparison_config_path": "comparison_runner.example.json",
+  "parent_manifest": null,
+  "device": "auto",
+  "reference_years": [2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015],
+  "patient_split_seeds": [42, 43, 44],
+  "windows": [
+    "legacy_reference_only",
+    "reference_only_common",
+    "last_2",
+    "last_3",
+    "last_5",
+    "all_history"
+  ],
+  "first_history_year": 2007,
+  "final_evaluation_year": 2015,
+  "maximum_split_attempts": 100,
+  "minimum_class_count": 1,
+  "bootstrap_replicates": 1000,
+  "bootstrap_seed": 42,
+  "batch_size": 4096,
+  "cpu_workers": 4,
+  "max_pending_bootstrap_jobs": 8,
+  "allow_tf32": true,
+  "pin_memory": true,
+  "use_cache": true,
+  "show_progress": true,
+  "force": false
+}
