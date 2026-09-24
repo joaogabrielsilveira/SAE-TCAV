@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -8,8 +9,17 @@ from temporal_performance_windows import (
     ProbabilityResult,
     WindowExperimentConfig,
     _auroc,
+    _binary_scores,
+    _configure_cuda_allocator,
+    _cuda_oom_backoff_batch_size,
+    _is_cuda_out_of_memory,
+    _macro_f1,
+    _trajectory_rows,
     argmax_binary_labels,
+    build_diagnostic_rows,
+    build_prediction_indices,
     build_training_indices,
+    compare_legacy_parent_row,
     death_probabilities,
     effective_window_years,
     exposure_cohort_masks,
@@ -87,6 +97,51 @@ def test_training_uses_prior_rows_but_excludes_current_validation_and_evaluation
     assert np.max(population.years[train]) == 2008
 
 
+def test_legacy_prediction_protocol_preserves_parent_query_order():
+    population = _population()
+    validation = np.asarray([20, 23])
+    evaluation = np.asarray([25, 41, 58])
+    legacy = build_prediction_indices(
+        population,
+        2008,
+        validation,
+        evaluation,
+        exact_parent_protocol=True,
+    )
+    common = build_prediction_indices(
+        population,
+        2008,
+        validation,
+        evaluation,
+        exact_parent_protocol=False,
+    )
+    assert legacy.tolist() == list(range(20, 60))
+    assert common.tolist() == [20, 23, 25, 41, 58]
+
+
+def test_cuda_oom_detection_and_allocator_configuration(monkeypatch):
+    error = RuntimeError("CUDA out of memory")
+    assert _is_cuda_out_of_memory(error) is True
+    assert _is_cuda_out_of_memory(RuntimeError("host out of memory")) is False
+    assert _cuda_oom_backoff_batch_size(
+        error,
+        8192,
+        cuda_requested=True,
+        exact_parent_protocol=False,
+    ) == 4096
+    # Exact legacy predictions retain the parent's fixed batch boundaries.
+    assert _cuda_oom_backoff_batch_size(
+        error,
+        1024,
+        cuda_requested=True,
+        exact_parent_protocol=True,
+    ) is None
+    config = WindowExperimentConfig(cuda_allocator_config="max_split_size_mb:64")
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    _configure_cuda_allocator(config)
+    assert os.environ["PYTORCH_CUDA_ALLOC_CONF"] == "max_split_size_mb:64"
+
+
 def test_threshold_ties_use_precision_then_higher_threshold():
     selected = select_frozen_threshold([1, 0, 1, 0], [0.9, 0.8, 0.7, 0.1])
     assert selected["threshold"] == pytest.approx(0.7)
@@ -119,7 +174,20 @@ def test_class_order_and_argmax_half_tie_match_existing_behavior():
         classes=np.asarray([1, 0]),
     )
     assert death_probabilities(result).tolist() == [0.4, 0.5, 0.2]
-    assert argmax_binary_labels(result).tolist() == [1, 0, 1]
+    assert argmax_binary_labels(result).tolist() == [0, 1, 0]
+
+
+def test_argmax_preserves_native_probability_precision_near_half():
+    below = np.nextafter(0.5, 0.0)
+    above = np.nextafter(0.5, 1.0)
+    result = ProbabilityResult(
+        probabilities=np.asarray([[below, above]], dtype=np.float64),
+        classes=np.asarray([0, 1]),
+    )
+    assert np.asarray(result.probabilities, dtype=np.float32)[0, 0] == np.asarray(
+        result.probabilities, dtype=np.float32
+    )[0, 1]
+    assert argmax_binary_labels(result).tolist() == [1]
 
 
 def test_metrics_handle_calibration_degeneracy_and_label_oracle():
@@ -128,6 +196,130 @@ def test_metrics_handle_calibration_degeneracy_and_label_oracle():
     assert values["calibration_failure_reason"] == "constant_probability"
     assert values["death_f1_oracle"] >= values["death_f1_at_0_5"]
     assert "oracle_minus_frozen_f1" in values
+
+
+def test_insufficient_support_nulls_scores_and_is_excluded_from_trajectories():
+    invalid = metric_bundle(
+        [0, 0, 0, 1],
+        [0.1, 0.2, 0.3, 0.9],
+        0.5,
+        minimum_deaths=2,
+        minimum_survivors=2,
+    )
+    assert invalid["valid"] is False
+    assert invalid["death_f1_at_0_5"] is None
+    assert invalid["death_average_precision"] is None
+    assert invalid["observed_death_prevalence"] == pytest.approx(0.25)
+    rows = [{
+        "reference_year": 2007,
+        "patient_split_seed": 42,
+        "window": "all_history",
+        "test_year": 2007,
+        "temporal_distance": 0,
+        "cohort": "all_comer",
+        **invalid,
+    }]
+    assert _trajectory_rows(rows, WindowExperimentConfig()) == []
+
+
+def test_diagnostics_use_change_from_distance_zero_without_fixed_score_cutoffs():
+    baseline = {
+        "reference_year": 2007, "patient_split_seed": 42, "window": "all_history",
+        "test_year": 2007, "temporal_distance": 0, "cohort": "all_comer", "valid": True,
+        "death_f1_at_0_5": 0.4, "death_f1_at_frozen_threshold": 0.5,
+        "death_average_precision": 0.6, "death_f1_oracle": 0.55,
+        "brier_score": 0.1, "observed_death_prevalence": 0.1,
+        "predicted_positive_rate_at_0_5": 0.1,
+        "predicted_positive_rate_at_frozen_threshold": 0.12,
+        "calibration_intercept": 0.0, "calibration_slope": 1.0,
+    }
+    future = {
+        **baseline, "test_year": 2008, "temporal_distance": 1,
+        "death_f1_at_0_5": 0.2, "death_average_precision": 0.62,
+        "death_f1_oracle": 0.57,
+    }
+    rows = build_diagnostic_rows([baseline, future])
+    assert rows[0]["classification"] == "reference_baseline"
+    assert rows[1]["classification"] == "default_threshold_or_scaling_failure_pattern"
+    assert rows[1]["delta_death_f1_at_0_5"] == pytest.approx(-0.2)
+    assert "requires_cluster_interval_confirmation" in rows[1]["inferential_status"]
+
+
+def test_legacy_parity_compares_parent_retained_metrics():
+    actual = {
+        "reference_year": 2007, "patient_split_seed": 42, "test_year": 2008,
+        "temporal_distance": 1, "record_count": 100, "death_count": 10,
+        "survivor_count": 90, "death_f1_at_0_5": 0.25,
+        "macro_f1_at_0_5": 0.55, "observed_death_prevalence": 0.1,
+    }
+    expected = {
+        "sample_count": 100, "death_count": 10, "survivor_count": 90,
+        "death_f1": 0.25, "macro_f1": 0.55, "prevalence": 0.1,
+    }
+    assert compare_legacy_parent_row(actual, expected)["parity"] is True
+    expected["death_f1"] = 0.20
+    mismatch = compare_legacy_parent_row(actual, expected)
+    assert mismatch["parity"] is False
+    assert mismatch["death_f1_at_0_5_difference"] == pytest.approx(0.05)
+    assert mismatch["accepted"] is False
+
+
+def test_legacy_parity_accepts_only_reproducible_exact_half_tie_without_changing_metrics():
+    truth = np.asarray([1, 1, 1, 0, 0, 0, 0, 0])
+    hard = np.asarray([1, 1, 1, 1, 1, 1, 0, 0])
+    probability = np.asarray([0.8, 0.7, 0.6, 0.9, 0.8, 0.7, 0.5, 0.1])
+    actual = {
+        "reference_year": 2009, "patient_split_seed": 44, "test_year": 2010,
+        "temporal_distance": 1, "record_count": 8, "death_count": 3,
+        "survivor_count": 5, "death_f1_at_0_5": _binary_scores(truth, hard)["f1"],
+        "macro_f1_at_0_5": _macro_f1(truth, hard),
+        "observed_death_prevalence": 3 / 8,
+    }
+    parent_labels = hard.copy()
+    parent_labels[6] = 1
+    expected = {
+        "sample_count": 8, "death_count": 3, "survivor_count": 5,
+        "death_f1": _binary_scores(truth, parent_labels)["f1"],
+        "macro_f1": _macro_f1(truth, parent_labels), "prevalence": 3 / 8,
+    }
+    reconciled = compare_legacy_parent_row(
+        actual,
+        expected,
+        y_true=truth,
+        death_probability=probability,
+        hard_labels_at_half=hard,
+    )
+    assert reconciled["parity"] is False
+    assert reconciled["accepted"] is True
+    assert reconciled["acceptance_reason"] == "parent_aggregates_reproduced_by_exact_0_5_tie_assignment"
+    assert reconciled["exact_half_probability_count"] == 1
+    assert reconciled["half_tie_reconciliation_solution_count"] == 1
+    assert reconciled["half_tie_minimum_label_changes"] == 1
+    assert actual["death_f1_at_0_5"] == _binary_scores(truth, hard)["f1"]
+
+
+def test_legacy_parity_does_not_reconcile_near_half_probability():
+    truth = np.asarray([1, 0])
+    hard = np.asarray([1, 0])
+    actual = {
+        "reference_year": 2009, "patient_split_seed": 44, "test_year": 2010,
+        "temporal_distance": 1, "record_count": 2, "death_count": 1,
+        "survivor_count": 1, "death_f1_at_0_5": 1.0,
+        "macro_f1_at_0_5": 1.0, "observed_death_prevalence": 0.5,
+    }
+    expected = {
+        "sample_count": 2, "death_count": 1, "survivor_count": 1,
+        "death_f1": 2 / 3, "macro_f1": 1 / 3, "prevalence": 0.5,
+    }
+    result = compare_legacy_parent_row(
+        actual,
+        expected,
+        y_true=truth,
+        death_probability=np.asarray([0.8, np.nextafter(0.5, 1.0)]),
+        hard_labels_at_half=hard,
+    )
+    assert result["accepted"] is False
+    assert result["exact_half_probability_count"] == 0
 
 
 def test_rank_auroc_preserves_half_credit_for_ties():
@@ -175,7 +367,7 @@ def test_resumable_runner_writes_checksummed_isolated_artifacts(tmp_path: Path):
         artifact_dir=str(tmp_path),
         reference_years=(2007,),
         patient_split_seeds=(42,),
-        windows=("legacy_reference_only", "reference_only_common", "last_2", "all_history"),
+        windows=("reference_only_common", "last_2", "all_history"),
         final_evaluation_year=2007,
         bootstrap_replicates=5,
         show_progress=False,
@@ -183,10 +375,10 @@ def test_resumable_runner_writes_checksummed_isolated_artifacts(tmp_path: Path):
     result = run_window_experiment(config, adapter=adapter, fail_fast=True)
     assert result["complete"] is True
     # Common aliases share one fitted probability cache.
-    assert adapter.calls == 2
+    assert adapter.calls == 1
     resumed = run_window_experiment(config, adapter=adapter, fail_fast=True)
     assert resumed["complete"] is True
-    assert adapter.calls == 2
+    assert adapter.calls == 1
     loaded = load_window_experiment(result["manifest_path"])
     assert loaded["artifacts"]["yearly_metrics"]
     assert Path(tmp_path, "latest_manifest.json").is_file()
@@ -194,5 +386,12 @@ def test_resumable_runner_writes_checksummed_isolated_artifacts(tmp_path: Path):
     assert set(manifest["artifacts"]) >= {
         "population_exclusions", "role_exposure_audit", "thresholds",
         "record_probabilities", "yearly_metrics", "paired_window_contrasts",
-        "diagnostic_classifications",
+        "diagnostic_classifications", "legacy_parent_metric_parity",
     }
+    assert manifest["source_fingerprints"]["tabpfn_model.py"]
+    assert "numerical_environment" in manifest
+    log_path = Path(result["artifact_dir"], manifest["persistent_log"])
+    assert any(
+        phase in log_path.read_text()
+        for phase in ("phase=job_complete", "phase=job_resume")
+    )
