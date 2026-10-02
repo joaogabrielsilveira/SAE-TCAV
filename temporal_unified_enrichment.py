@@ -232,6 +232,7 @@ def activation_magnitude_rows(
     population,
     parent_config: Mapping[str, Any],
     analysis_config: UnifiedAnalysisConfig,
+    *, evaluation_indices=None, roles_override=None, masks_override=None,
 ) -> list[dict[str, Any]]:
     from semantic_rules import binary_metrics
     from temporal_config import TemporalRetentionConfig
@@ -240,9 +241,9 @@ def activation_magnitude_rows(
     reference_year = int(split_root.parent.name.removeprefix("reference_"))
     split_seed = int(split_root.name.removeprefix("split_"))
     sae_seeds = tuple(int(value) for value in parent_config["sae_seeds"])
-    evaluation = np.flatnonzero(population.years >= reference_year)
-    global_roles = _roles(split_root)
-    masks = _cohort_masks_for_split(population, reference_year, global_roles, evaluation)
+    evaluation = np.flatnonzero(population.years >= reference_year) if evaluation_indices is None else np.asarray(evaluation_indices)
+    global_roles = _roles(split_root) if roles_override is None else roles_override
+    masks = _cohort_masks_for_split(population, reference_year, global_roles, evaluation) if masks_override is None else masks_override
     runs = _activation_runs(split_root, sae_seeds)
     recurrence = _split_table(split_root, "matching_recurrence")
     rules = [
@@ -368,6 +369,7 @@ def tcav_repetition_rows(
     population,
     parent_config: Mapping[str, Any],
     analysis_config: UnifiedAnalysisConfig,
+    *, evaluation_indices=None, roles_override=None, masks_override=None,
 ) -> list[dict[str, Any]]:
     from temporal_cav import rule_cohort_mask, temporal_tcav, train_temporal_cav
 
@@ -381,11 +383,11 @@ def tcav_repetition_rows(
     reference_year = int(split_root.parent.name.removeprefix("reference_"))
     split_seed = int(split_root.name.removeprefix("split_"))
     sae_seeds = tuple(int(value) for value in parent_config["sae_seeds"])
-    evaluation = np.flatnonzero(population.years >= reference_year)
-    global_roles = _roles(split_root)
+    evaluation = np.flatnonzero(population.years >= reference_year) if evaluation_indices is None else np.asarray(evaluation_indices)
+    global_roles = _roles(split_root) if roles_override is None else roles_override
     local = _local_roles(global_roles, evaluation)
     selection = local["rule_selection_cav"]
-    masks = _cohort_masks_for_split(population, reference_year, global_roles, evaluation)
+    masks = _cohort_masks_for_split(population, reference_year, global_roles, evaluation) if masks_override is None else masks_override
     runs = _activation_runs(split_root, sae_seeds)
     recurrence = _split_table(split_root, "matching_recurrence")
     consensus = {

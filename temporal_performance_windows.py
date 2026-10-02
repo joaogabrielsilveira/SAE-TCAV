@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import Future, ProcessPoolExecutor
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 import gc
@@ -324,6 +325,11 @@ class ProductionWindowAdapter:
         seed: int,
         config: WindowExperimentConfig,
         require_parent_fit: bool = False,
+        retain_fitted_state: bool = False,
+        fitted_state: Mapping[str, Any] | None = None,
+        gpu_memory_safe: bool = False,
+        checkpoint_workspace: Path | None = None,
+        checkpoint_identity: str | None = None,
     ) -> ProbabilityResult:
         import torch
         from tabpfn_model import TabPFNEvalConfig, fit_dr_tabpfn, make_dist_tensor
@@ -352,7 +358,7 @@ class ProductionWindowAdapter:
                 torch.set_float32_matmul_precision(matmul_precision)
             torch.cuda.reset_peak_memory_stats()
 
-        fit = self._load_parent_fit(population, train_indices, seed) if require_parent_fit else None
+        fit = fitted_state if fitted_state is not None else (self._load_parent_fit(population, train_indices, seed) if require_parent_fit else None)
         if require_parent_fit and fit is None:
             raise RuntimeError("validated parent TabPFN fit is unavailable for legacy arm")
         if fit is None:
@@ -374,6 +380,23 @@ class ProductionWindowAdapter:
         else:
             fit_origin = "validated_parent_cache"
         model = fit["model"]
+        batch_store = None
+        if gpu_memory_safe:
+            from temporal_gpu_execution import configure_gpu_model, BatchStore, array_identity, log_batch
+            configure_gpu_model(model)
+        if checkpoint_workspace is not None:
+            from temporal_window_concepts import save_binary_checkpoint
+            from artifact_storage import file_sha256
+            from temporal_gpu_execution import BatchStore, array_identity, log_batch
+            fit_path = Path(checkpoint_workspace)/'fitted_state.pkl'
+            if fitted_state is None:
+                save_binary_checkpoint(fit_path, fit, checkpoint_identity)
+                logging.getLogger(__name__).info('Saved fitted model before prediction: %s', fit_path)
+            fit_sha = file_sha256(fit_path)
+            model._temporal_batch_root = str(Path(checkpoint_workspace)/'batches')
+            model._temporal_fit_identity = fit_sha
+            batch_store = BatchStore(Path(model._temporal_batch_root)/'predictions',
+                fit_sha + ':' + array_identity(predict_indices, prediction_domain_ids, population.X[predict_indices]))
         model_device = torch.device(fit["model_add_x_device"])
         chunks = []
         prediction_values = np.ascontiguousarray(
@@ -389,9 +412,18 @@ class ProductionWindowAdapter:
         inference_started = time.perf_counter()
         start = 0
         while start < len(predict_indices):
+            saved = batch_store.load(start) if batch_store else None
+            if saved is not None:
+                chunks.append(saved)
+                log_batch('Predictions', start, start+len(saved), len(predict_indices), inference_started, True)
+                start += len(saved)
+                continue
+            logging.getLogger(__name__).info('Predicting rows %d-%d/%d on %s', start,
+                min(start+active_batch_size, len(predict_indices)), len(predict_indices), config.device)
             end = min(start + active_batch_size, len(predict_indices))
             values = prediction_values[start:end]
             domain = host_values = device_values = output = None
+            retry_batch = False
             try:
                 domain = make_dist_tensor(
                     prediction_domain_ids[start:end],
@@ -399,7 +431,10 @@ class ProductionWindowAdapter:
                     fit["example_add_shape"],
                 )
                 if model_device.type == "cpu":
-                    output = model.predict_proba(values, additional_x={"dist_shift_domain": domain})
+                    # The additional-input device does not identify the model's
+                    # compute device: this branch can still run CUDA inference.
+                    with (nullcontext() if require_parent_fit else torch.no_grad()):
+                        output = model.predict_proba(values, additional_x={"dist_shift_domain": domain})
                 else:
                     host_values = (
                         pinned_prediction_values[start:end]
@@ -410,7 +445,7 @@ class ProductionWindowAdapter:
                         model_device,
                         non_blocking=config.pin_memory,
                     )
-                    with torch.inference_mode():
+                    with torch.no_grad():
                         output = model.predict_proba(
                             device_values,
                             additional_x={"dist_shift_domain": domain},
@@ -424,12 +459,22 @@ class ProductionWindowAdapter:
                     cuda_requested=cuda_requested,
                     exact_parent_protocol=require_parent_fit,
                 )
+                logging.getLogger(__name__).warning(
+                    "CUDA prediction OOM: batch=%d next_batch=%s allocated_mib=%.1f reserved_mib=%.1f",
+                    active_batch_size, reduced_batch_size,
+                    torch.cuda.memory_allocated()/2**20 if cuda_requested else 0.,
+                    torch.cuda.memory_reserved()/2**20 if cuda_requested else 0.)
                 if reduced_batch_size is None:
                     raise
+                error.__traceback__ = None
                 active_batch_size = reduced_batch_size
                 smallest_batch_size = min(smallest_batch_size, active_batch_size)
                 batch_backoff_count += 1
                 domain = host_values = device_values = output = None
+                retry_batch = True
+            # Leave the exception scope before collection: its traceback can
+            # otherwise keep the failed transformer's intermediate tensors alive.
+            if retry_batch:
                 _release_cuda_memory()
                 continue
             if isinstance(output, torch.Tensor):
@@ -439,6 +484,9 @@ class ProductionWindowAdapter:
             # forced float32 cast can collapse a marginal class preference to
             # an exact 0.5 tie and change the hard label.
             chunks.append(np.asarray(output))
+            if batch_store:
+                batch_store.save(start, output)
+                log_batch('Predictions', start, end, len(predict_indices), inference_started)
             start = end
         if cuda_requested:
             torch.cuda.synchronize()
@@ -470,7 +518,9 @@ class ProductionWindowAdapter:
                 "pin_memory": config.pin_memory if cuda_requested else None,
             },
         )
-        # Drop the fit and model before returning the CPU-only result.  The next
+        if retain_fitted_state:
+            self.fitted_state = fit
+        # Drop the local fit and model before returning the CPU-only result.  The next
         # job also performs a defensive collection before its fit.
         fit = model = pinned_prediction_values = None
         if cuda_requested:

@@ -32,6 +32,7 @@ class EmbeddingExtractConfig:
     use_cache: bool = True
     show_progress: bool = False
     progress_desc: str = "Extracting embeddings"
+    strict_domains: bool = False
 
 TRAINING_EMBEDDING_FILE = get_env_path('models/tabpfn/dr_tabpfn_train_emb.npy')
 TEST_EMBEDDING_FILE = get_env_path('models/tabpfn/dr_tabpfn_test_emb.npy')
@@ -279,11 +280,15 @@ def batch_get_embeddings(model: TabPFNClassifier, X_all: np.ndarray, dist_full: 
                          device: torch.device | str = 'cpu',
                          example_add_shape: Optional[Tuple[int, ...]] = None,
                          show_progress: bool = False,
-                         progress_desc: str = "Extracting embeddings") -> tuple[np.ndarray, list]:
+                         progress_desc: str = "Extracting embeddings",
+                         strict_domains: bool = False) -> tuple[np.ndarray, list]:
     out_list = []
     tensors_list = []
 
     n = X_all.shape[0]
+    from temporal_gpu_execution import model_batch_store, log_batch
+    store = model_batch_store(model, 'embeddings', X_all, dist_full) if strict_domains else None
+    started = time.monotonic()
 
     batch_starts = range(0, n, batch_size)
     for start in progress_iter(
@@ -295,6 +300,14 @@ def batch_get_embeddings(model: TabPFNClassifier, X_all: np.ndarray, dist_full: 
         leave=False,
     ):
         end = min(start + batch_size, n)
+        saved = store.load(start) if store else None
+        if saved is not None:
+            if len(saved) != end-start:
+                raise ValueError('Embedding checkpoint batch size mismatch')
+            out_list.append(saved)
+            tensors_list.append(torch.tensor(saved).requires_grad_(True))
+            log_batch(progress_desc, start, end, n, started, True)
+            continue
         xb = X_all[start:end].astype(np.float32)
         dist_b = dist_full[start:end].astype(np.int64)
 
@@ -305,13 +318,16 @@ def batch_get_embeddings(model: TabPFNClassifier, X_all: np.ndarray, dist_full: 
         )
         
         try:
-            emb_b = model.get_embeddings(xb, additional_x={'dist_shift_domain': dist_t})
-        except Exception as e:
+            with torch.no_grad():
+                emb_b = model.get_embeddings(xb, additional_x={'dist_shift_domain': dist_t})
+        except Exception:
+            if strict_domains:
+                raise
             emb_b = model.get_embeddings(xb)
 
         if isinstance(emb_b, torch.Tensor):
             emb_b_np = emb_b.detach().cpu().numpy()
-            emb_t = emb_b.detach().clone().requires_grad_(True)
+            emb_t = emb_b.detach().cpu().clone().requires_grad_(True) if store else emb_b.detach().clone().requires_grad_(True)
 
         else:
             emb_b_np = np.asarray(emb_b)
@@ -319,6 +335,9 @@ def batch_get_embeddings(model: TabPFNClassifier, X_all: np.ndarray, dist_full: 
 
         out_list.append(np.asarray(emb_b_np))
         tensors_list.append(emb_t)
+        if store:
+            store.save(start, emb_b_np)
+            log_batch(progress_desc, start, end, n, started)
 
     return np.vstack(out_list), tensors_list
 
@@ -362,6 +381,7 @@ def extract_embeddings_robust(model: TabPFNClassifier, X: np.ndarray, years: np.
         example_add_shape=example_add_shape,
         show_progress=cfg.show_progress,
         progress_desc=cfg.progress_desc,
+        strict_domains=cfg.strict_domains,
     )
 
     return np.asarray(emb)
