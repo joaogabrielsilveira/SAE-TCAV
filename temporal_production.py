@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+import logging
 import pickle
 from pathlib import Path
 from typing import Any, Mapping
@@ -127,6 +128,12 @@ class ProductionTemporalAdapter:
         domain_map,
         config,
         workspace,
+        fitted_state=None,
+        fitted_identity=None,
+        training_indices=None,
+        imported_raw=None,
+        after_embeddings=None,
+        performance_override=None,
     ) -> Mapping[str, Any]:
         if self._source_prepared is None or self._base_config is None:
             raise RuntimeError("load_population must run before reference experiments")
@@ -141,7 +148,7 @@ class ProductionTemporalAdapter:
             role: np.asarray([local[int(index)] for index in indices], dtype=int)
             for role, indices in global_roles.items()
         }
-        context = np.asarray(global_roles["tabpfn_context"], dtype=int)
+        context = np.asarray(global_roles["tabpfn_context"] if training_indices is None else training_indices, dtype=int)
         source = self._source_prepared
         prepared = _PreparedData(
             train_rows=source.test_rows.iloc[context].reset_index(drop=True),
@@ -157,6 +164,8 @@ class ProductionTemporalAdapter:
             record_keys=population.record_keys[evaluation_indices],
             domain_reference_year=int(reference_year),
         )
+        from temporal_gpu_execution import GPU_POLICY
+        injected_batch_size = GPU_POLICY['embedding_batch'] if fitted_state is not None and getattr(fitted_state['model'], '_temporal_gpu_memory_safe', False) else 256
         runner_config = replace(
             self._base_config,
             artifact_dir=str(workspace / "lower_stages"),
@@ -165,7 +174,8 @@ class ProductionTemporalAdapter:
             show_progress=config.show_progress,
             seed=split.effective_seed,
             accelerator=replace(self._base_config.accelerator, device=config.device),
-            tabpfn=replace(self._base_config.tabpfn, run_walkforward=False),
+            tabpfn=replace(self._base_config.tabpfn, run_walkforward=False,
+                           batch_size=self._base_config.tabpfn.batch_size if fitted_state is None else injected_batch_size),
             sae=replace(self._base_config.sae, seeds=config.sae_seeds),
             matching=replace(
                 self._base_config.matching,
@@ -203,7 +213,18 @@ class ProductionTemporalAdapter:
             ) if config.force else (),
         )
         lower = DefaultComparisonAdapter(cache)
-        embeddings = lower.embeddings(prepared, splits, runner_config, workspace, force=config.force)
+        embedding_options = {} if fitted_state is None else {
+            "fitted_state": fitted_state, "fitted_identity": fitted_identity,
+            "explicit_domain_map": domain_map,
+        }
+        logging.getLogger(__name__).info("Extracting embeddings from %s", fitted_identity or "reference model")
+        if imported_raw is not None:
+            embedding_options['imported_raw'] = imported_raw
+        embeddings = lower.embeddings(prepared, splits, runner_config, workspace, force=config.force, **embedding_options)
+        if after_embeddings is not None:
+            after_embeddings(embeddings, prepared)
+
+        logging.getLogger(__name__).info("Training SAEs on %d discovery records", len(splits["idx_semantic_fit"]))
         sae_data = lower.train_saes(prepared, embeddings, splits, runner_config, workspace, force=config.force)
 
         canonical_run = sae_data.runs[0]
@@ -233,15 +254,22 @@ class ProductionTemporalAdapter:
             "status": "replaced_by_temporal_rule_source_cavs",
             "significance_gating": False,
         }]
+        logging.getLogger(__name__).info("Learning and selecting semantic rules")
         semantic = _run_semantic(
             prepared, sae_data.activations, union_matches, functional,
             splits, config, workspace, cache,
         )
-        predictions = _predict(embeddings, prepared, runner_config)
-        performance = _performance_rows(
-            population, evaluation_indices, global_roles, predictions,
-            reference_year, split.effective_seed, config,
-        )
+        if performance_override is None:
+            predictions = _predict(embeddings, prepared, runner_config)
+            performance = _performance_rows(
+                population, evaluation_indices, global_roles, predictions,
+                reference_year, split.effective_seed, config,
+            )
+        else:
+            # Window orchestration already scored the exact requested cohorts
+            # from retained probabilities. Its results are the authoritative view.
+            performance = list(performance_override)
+            logging.getLogger(__name__).info('Reusing window performance; redundant concept-stage prediction SKIPPED')
         rules, semantic_models = _normalize_rules(
             semantic["semantic_models"], views["family_members"], config
         )
@@ -272,17 +300,19 @@ class ProductionTemporalAdapter:
         factor_year = _join_threshold_views(
             factor_year, views["recurrence"]
         )
+        logging.getLogger(__name__).info("Fitting CAVs and extracting gradients from the retained model")
         cavs, tcav_rows = _semantic_cavs(
             semantic_models, sae_data.activations, embeddings, prepared,
             role_local, reference_year, split.effective_seed, config, workspace,
             rules, population.first_eligible_year,
+            gradient_batch_size=512 if fitted_state is None else GPU_POLICY['gradient_batch'],
         )
         tcav_rows = _join_threshold_views(
             tcav_rows, views["recurrence"]
         )
         return {
             "stage_domains": {
-                name: prepared.years_test - reference_year
+                name: np.asarray([embeddings.year_to_domain[int(y)] for y in prepared.years_test])
                 for name in ("predictions", "embeddings", "gradients", "activations")
             },
             "performance": performance,
@@ -854,7 +884,7 @@ def _join_threshold_views(rows, recurrence):
     return output
 
 
-def _semantic_cavs(models, activations, embeddings, prepared, role_local, reference_year, split_seed, config, workspace, rules, first_year):
+def _semantic_cavs(models, activations, embeddings, prepared, role_local, reference_year, split_seed, config, workspace, rules, first_year, *, gradient_batch_size=512):
     from semantic_rules import RuleSet
     from tcav import get_model_gradients
 
@@ -926,8 +956,9 @@ def _semantic_cavs(models, activations, embeddings, prepared, role_local, refere
     gradients = get_model_gradients(
         model=embeddings.require_model(require_decoder=True), dist_vec=domains,
         X=prepared.X_test, cache_file=workspace / "semantic_gradients.pkl",
-        batch_size=512, device=config.device, show_progress=config.show_progress,
+        batch_size=gradient_batch_size, device=config.device, show_progress=config.show_progress,
         use_cache=config.use_cache and not config.force,
+        raw_embeddings=embeddings.test_raw,
     )
     rows = []
     role_sets = {

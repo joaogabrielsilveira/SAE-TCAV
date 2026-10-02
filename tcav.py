@@ -26,9 +26,16 @@ def get_model_gradients(model: TabPFNClassifier, dist_vec: np.ndarray, X: np.nda
                         batch_size: int = 128,
                         device: str = "auto",
                         show_progress: bool = False,
-                        use_cache: bool = True) -> np.ndarray:
+                        use_cache: bool = True,
+                        raw_embeddings: np.ndarray | None = None) -> np.ndarray:
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
+    if raw_embeddings is not None:
+        raw_embeddings = np.asarray(raw_embeddings)
+        if raw_embeddings.ndim != 2 or len(raw_embeddings) != len(X) or not np.isfinite(raw_embeddings).all():
+            raise ValueError('Raw embeddings must be finite, unscaled, and aligned with X')
+        import logging
+        logging.getLogger(__name__).info('TCAV: reusing %d raw embeddings; transformer extraction skipped', len(X))
     gradient_device = resolve_torch_device(device)
     gradients_file = str(cache_file) if cache_file is not None else GRADS_FILE
 
@@ -44,6 +51,12 @@ def get_model_gradients(model: TabPFNClassifier, dist_vec: np.ndarray, X: np.nda
     original_device = next(model_decode_layer.parameters()).device
     model_decode_layer.to(gradient_device)
     gradients = []
+    from temporal_gpu_execution import model_batch_store, log_batch
+    import time
+    from temporal_gpu_execution import array_identity
+    stage = 'gradients' if raw_embeddings is None else 'decoder_gradients_' + array_identity(raw_embeddings)
+    store = model_batch_store(model, stage, X, dist_vec)
+    started = time.monotonic()
     try:
         batch_starts = range(0, X.shape[0], batch_size)
         for s in progress_iter(
@@ -56,6 +69,13 @@ def get_model_gradients(model: TabPFNClassifier, dist_vec: np.ndarray, X: np.nda
         ):
             e = min(s + batch_size, X.shape[0])
 
+            saved = store.load(s) if store else None
+            if saved is not None:
+                if len(saved) != e-s:
+                    raise ValueError('Gradient checkpoint batch size mismatch')
+                gradients.append(saved)
+                log_batch('TCAV gradients', s, e, len(X), started, True)
+                continue
             x_batch = X[s:e].astype(np.float32)
             dist_batch = dist_vec[s:e]
 
@@ -63,16 +83,17 @@ def get_model_gradients(model: TabPFNClassifier, dist_vec: np.ndarray, X: np.nda
                 dist_batch, dtype=torch.long, device='cpu'
             ).reshape(-1, 1, 1)
 
-            with torch.enable_grad():
-                emb = model.get_embeddings(
-                    x_batch,
-                    additional_x={"dist_shift_domain": dist_t},
-                )
-                if emb.ndim == 3 and emb.shape[0] == 1:
-                    emb = emb[0]
-                elif emb.ndim == 3 and emb.shape[1] == 1:
-                    emb = emb.squeeze(1)
+            if raw_embeddings is None:
+                with torch.no_grad():
+                    emb = model.get_embeddings(x_batch, additional_x={"dist_shift_domain": dist_t})
+                    if emb.ndim == 3 and emb.shape[0] == 1:
+                        emb = emb[0]
+                    elif emb.ndim == 3 and emb.shape[1] == 1:
+                        emb = emb.squeeze(1)
+            else:
+                emb = torch.from_numpy(np.array(raw_embeddings[s:e], copy=True))
 
+            with torch.enable_grad():
                 emb_in = emb.clone().detach().to(
                     gradient_device, dtype=torch.float32
                 ).requires_grad_(True)
@@ -85,6 +106,9 @@ def get_model_gradients(model: TabPFNClassifier, dist_vec: np.ndarray, X: np.nda
 
                 batch_grad = vmap(grad(single_pass))(emb_in)
                 gradients.append(batch_grad.detach().cpu().numpy())
+                if store:
+                    store.save(s, gradients[-1])
+                    log_batch('TCAV gradients', s, e, len(X), started)
     finally:
         model_decode_layer.to(original_device)
 

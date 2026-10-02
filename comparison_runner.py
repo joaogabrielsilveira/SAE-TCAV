@@ -484,6 +484,10 @@ class DefaultComparisonAdapter:
         workspace: Path,
         *,
         force: bool,
+        fitted_state: Mapping[str, Any] | None = None,
+        explicit_domain_map: Mapping[int, int] | None = None,
+        fitted_identity: str | None = None,
+        imported_raw: tuple[np.ndarray, np.ndarray] | None = None,
     ) -> _EmbeddingData:
         from tabpfn_model import (
             EmbeddingExtractConfig,
@@ -513,6 +517,13 @@ class DefaultComparisonAdapter:
             else {int(year): index for index, year in enumerate(all_years)}
         )
 
+        if fitted_state is not None:
+            if explicit_domain_map is None or not fitted_identity:
+                raise ValueError("Injected fits require explicit domain IDs and fitted identity")
+            domain_map = {int(k): int(v) for k, v in explicit_domain_map.items()}
+            if not set(all_years).issubset(domain_map) or min(domain_map.values()) < 0:
+                raise ValueError("Model domain map does not cover all embedding years")
+
         numerical_environment = _numerical_environment_fingerprint(
             config.accelerator.device, "numpy", "torch", "tabpfn"
         )
@@ -526,6 +537,9 @@ class DefaultComparisonAdapter:
             "y_train": array_fingerprint(prepared.y_train),
             "years_train": array_fingerprint(prepared.years_train),
         }
+        if fitted_state is not None:
+            model_dependencies["injected_fitted_identity"] = fitted_identity
+            model_dependencies["explicit_domain_map"] = domain_map
         fit_source = _callable_source_fingerprint(
             fit_dr_tabpfn, infer_model_additional_x_info
         )
@@ -548,7 +562,7 @@ class DefaultComparisonAdapter:
             fit_source,
             numerical_environment,
         )
-        fit_holder: dict[str, Mapping[str, Any]] = {}
+        fit_holder: dict[str, Mapping[str, Any]] = {} if fitted_state is None else {"fit": fitted_state}
 
         def fit_model() -> Mapping[str, Any]:
             if "fit" in fit_holder:
@@ -594,6 +608,7 @@ class DefaultComparisonAdapter:
             fit = fit_model()
             model = fit["model"]
             extraction = EmbeddingExtractConfig()
+            extraction.strict_domains = fitted_state is not None
             extraction.batch_size = config.tabpfn.batch_size
             extraction.use_cache = False
             extraction.show_progress = config.show_progress
@@ -635,7 +650,12 @@ class DefaultComparisonAdapter:
             "years_test": array_fingerprint(prepared.years_test),
             "domain_map": domain_map,
         }
-        if self.cache is None:
+        if imported_raw is not None:
+            _validate_embedding_pair(imported_raw, prepared)
+            train_raw, test_raw = imported_raw
+            import logging
+            logging.getLogger(__name__).info('HANDOFF: training and test embedding extraction SKIPPED; validated imported arrays')
+        elif self.cache is None:
             train_raw, test_raw = compute_raw()
         else:
             raw_result = self.cache.resolve(

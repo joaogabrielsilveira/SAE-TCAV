@@ -155,7 +155,7 @@ def corrupt_utilities_device(values, config: DenoisingAutoencoderConfig, generat
 
 def fit_denoising_autoencoder(values: np.ndarray, config: DenoisingAutoencoderConfig,
                               validation_values: np.ndarray | None = None, *, progress: bool = True,
-                              search_mode: bool = False) -> dict[str, Any]:
+                              search_mode: bool = False, restore_best: bool = True) -> dict[str, Any]:
     """Fit a tiny DAE with clean grouped-validation early stopping.
 
     Values have already been transformed by a train-only preprocessor.
@@ -239,7 +239,7 @@ def fit_denoising_autoencoder(values: np.ndarray, config: DenoisingAutoencoderCo
             if validation is not None and stale_epochs >= config.early_stopping_patience:
                 if progress: LOGGER.info("DAE early stopped at epoch %d; best grouped-validation epoch=%d", epoch + 1, best_epoch)
                 break
-    if best_state is not None:
+    if best_state is not None and restore_best:
         model.load_state_dict(best_state)
     model.eval()
     with torch.no_grad():
