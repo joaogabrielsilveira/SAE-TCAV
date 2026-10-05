@@ -338,6 +338,7 @@ class _EmbeddingData:
     walkforward_metrics: list[dict[str, Any]]
     model_identity: str | None = None
     model_provider: Callable[[], Mapping[str, Any]] | None = None
+    training_provenance: dict[str, Any] | None = None
 
     def require_model(self, *, require_decoder: bool = False) -> Any:
         if self.model is None:
@@ -488,6 +489,7 @@ class DefaultComparisonAdapter:
         explicit_domain_map: Mapping[int, int] | None = None,
         fitted_identity: str | None = None,
         imported_raw: tuple[np.ndarray, np.ndarray] | None = None,
+        train_to_retained_indices: np.ndarray | None = None,
     ) -> _EmbeddingData:
         from tabpfn_model import (
             EmbeddingExtractConfig,
@@ -524,6 +526,16 @@ class DefaultComparisonAdapter:
             if not set(all_years).issubset(domain_map) or min(domain_map.values()) < 0:
                 raise ValueError("Model domain map does not cover all embedding years")
 
+        if train_to_retained_indices is not None:
+            if fitted_state is None:
+                raise ValueError("Retained-row mapping requires an injected fit")
+            train_to_retained_indices = _validate_train_to_retained_indices(
+                prepared, train_to_retained_indices
+            )
+
+        training_provenance = _training_embedding_provenance(
+            train_to_retained_indices, imported_raw
+        )
         numerical_environment = _numerical_environment_fingerprint(
             config.accelerator.device, "numpy", "torch", "tabpfn"
         )
@@ -612,20 +624,22 @@ class DefaultComparisonAdapter:
             extraction.batch_size = config.tabpfn.batch_size
             extraction.use_cache = False
             extraction.show_progress = config.show_progress
-            extraction.progress_desc = "Extracting train embeddings"
-            train_raw = flatten_embeddings(
-                extract_embeddings_robust(
-                    model=model,
-                    X=prepared.X_train,
-                    years=prepared.years_train,
-                    year_to_domain_map=domain_map,
-                    cfg=extraction,
-                    device=fit["model_add_x_device"],
-                    is_train=True,
-                    ctx_idx=None,
-                    example_add_shape=fit["example_add_shape"],
+            train_raw = None
+            if train_to_retained_indices is None:
+                extraction.progress_desc = "Extracting train embeddings"
+                train_raw = flatten_embeddings(
+                    extract_embeddings_robust(
+                        model=model,
+                        X=prepared.X_train,
+                        years=prepared.years_train,
+                        year_to_domain_map=domain_map,
+                        cfg=extraction,
+                        device=fit["model_add_x_device"],
+                        is_train=True,
+                        ctx_idx=None,
+                        example_add_shape=fit["example_add_shape"],
+                    )
                 )
-            )
             extraction.progress_desc = "Extracting test embeddings"
             test_raw = flatten_embeddings(
                 extract_embeddings_robust(
@@ -640,8 +654,17 @@ class DefaultComparisonAdapter:
                     example_add_shape=fit["example_add_shape"],
                 )
             )
+            if train_to_retained_indices is not None:
+                train_raw = np.asarray(test_raw)[train_to_retained_indices].copy()
             return np.asarray(train_raw), np.asarray(test_raw)
 
+        extraction_source = stable_hash(
+            extraction_source,
+            _callable_source_fingerprint(
+                compute_raw, _validate_train_to_retained_indices,
+                _training_embedding_provenance,
+            ),
+        )
         raw_dependencies = {
             "model": model_dependencies,
             "X_train": array_fingerprint(prepared.X_train),
@@ -649,6 +672,7 @@ class DefaultComparisonAdapter:
             "X_test": array_fingerprint(prepared.X_test),
             "years_test": array_fingerprint(prepared.years_test),
             "domain_map": domain_map,
+            "training_embeddings": training_provenance,
         }
         if imported_raw is not None:
             _validate_embedding_pair(imported_raw, prepared)
@@ -673,6 +697,7 @@ class DefaultComparisonAdapter:
                     "train_raw": array_fingerprint(value[0]),
                     "test_raw": array_fingerprint(value[1]),
                 },
+                stage_schema_version=2,
             )
             train_raw, test_raw = raw_result.value
 
@@ -759,6 +784,7 @@ class DefaultComparisonAdapter:
                     "fit_split": "idx_semantic_fit",
                     "fit_indices": array_fingerprint(fit_indices),
                     "sklearn": _package_versions("sklearn"),
+                    "training_embeddings": training_provenance,
                 },
                 source_fingerprint=scaling_source,
                 load=_load_scaled_embeddings,
@@ -777,7 +803,7 @@ class DefaultComparisonAdapter:
                         np.asarray(value[2].scale_)
                     ),
                 },
-                stage_schema_version=2,
+                stage_schema_version=3,
             )
             train_scaled, test_scaled, scaler = scaled_result.value
 
@@ -801,6 +827,7 @@ class DefaultComparisonAdapter:
             "fit_indices_fingerprint": array_fingerprint(fit_indices),
             "mean_fingerprint": array_fingerprint(np.asarray(scaler.mean_)),
             "scale_fingerprint": array_fingerprint(np.asarray(scaler.scale_)),
+            "training_embeddings": training_provenance,
         }
         _pickle_dump(workspace / "embedding_scaler.pkl", scaler)
         _write_json(
@@ -828,6 +855,7 @@ class DefaultComparisonAdapter:
             walkforward_metrics=walkforward_metrics,
             model_identity=model_identity,
             model_provider=fit_model,
+            training_provenance=training_provenance,
         )
 
     def train_saes(
@@ -2235,6 +2263,55 @@ def _validate_walkforward(value: Any) -> None:
         not isinstance(row, Mapping) for row in value
     ):
         raise ValueError("Walk-forward cache must contain metric rows")
+
+
+def _training_embedding_provenance(indices, imported_raw) -> dict[str, Any]:
+    """Distinguish preserved imports from fresh independent or derived exports."""
+    if imported_raw is not None:
+        source = getattr(imported_raw, "training_provenance", None)
+        if source is not None:
+            if source.get("origin") == "retained_rows_v1":
+                expected = _training_embedding_provenance(indices, None)
+                if indices is None or source != expected:
+                    raise ValueError("Imported training provenance disagrees with destination mapping")
+            elif source not in (
+                {"origin": "independent_queries_v1", "mapping": None},
+                {"origin": "imported_preserved_v1", "mapping": None},
+            ):
+                raise ValueError("Unsupported imported training provenance")
+            return json.loads(json.dumps(source))
+        return {"origin": "imported_preserved_v1", "mapping": None}
+    if indices is None:
+        return {"origin": "independent_queries_v1", "mapping": None}
+    return {
+        "origin": "retained_rows_v1",
+        "mapping": {
+            "indices": np.asarray(indices, dtype=np.int64).tolist(),
+            "sha256": array_fingerprint(np.asarray(indices, dtype=np.int64)),
+        },
+    }
+
+
+def _validate_train_to_retained_indices(
+    prepared: _PreparedData, indices: np.ndarray
+) -> np.ndarray:
+    """Validate a temporal identity mapping before any model inference."""
+    mapping = np.asarray(indices)
+    if (
+        mapping.ndim != 1
+        or mapping.dtype.kind not in "iu"
+        or len(mapping) != len(prepared.X_train)
+        or len(mapping) == 0
+        or np.any(mapping < 0)
+        or np.any(mapping >= len(prepared.X_test))
+        or len(np.unique(mapping)) != len(mapping)
+    ):
+        raise ValueError("Training mapping must contain unique retained row indices")
+    if not np.array_equal(prepared.X_train, prepared.X_test[mapping]):
+        raise ValueError("Training features disagree with mapped retained rows")
+    if not np.array_equal(prepared.years_train, prepared.years_test[mapping]):
+        raise ValueError("Training years disagree with mapped retained rows")
+    return mapping.astype(np.int64, copy=True)
 
 
 def _scale_embeddings_from_semantic_fit(

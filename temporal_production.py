@@ -30,6 +30,34 @@ from temporal_robustness import TemporalPopulation
 from temporal_rules import select_activation_winner
 
 
+def _train_to_retained_mapping(population, training_indices, retained_indices, domain_map):
+    """Map exact population record identities, rejecting ambiguous membership."""
+    train = np.asarray(training_indices)
+    retained = np.asarray(retained_indices)
+    for name, indices in (("training", train), ("retained", retained)):
+        if (
+            indices.ndim != 1
+            or indices.dtype.kind not in "iu"
+            or len(indices) == 0
+            or np.any(indices < 0)
+            or np.any(indices >= len(population.X))
+            or len(np.unique(indices)) != len(indices)
+        ):
+            raise ValueError(f"{name} membership must contain unique population indices")
+        keys = np.asarray(population.record_keys)[indices]
+        if len(np.unique(keys)) != len(keys):
+            raise ValueError(f"{name} membership has duplicate record identities")
+    local = {int(index): position for position, index in enumerate(retained)}
+    if not set(train.tolist()).issubset(local):
+        raise ValueError("Retained membership must contain every training record identity")
+    if domain_map is None:
+        raise ValueError("Injected temporal fits require explicit domain IDs")
+    years = set(np.asarray(population.years)[retained].tolist())
+    if not years.issubset(domain_map) or any(int(value) < 0 for value in domain_map.values()):
+        raise ValueError("Model domain map does not cover retained record years")
+    return np.asarray([local[int(index)] for index in train], dtype=np.int64)
+
+
 class ProductionTemporalAdapter:
     """Fit independent reference systems using existing production model stages."""
 
@@ -143,12 +171,18 @@ class ProductionTemporalAdapter:
         )
         from robustness_matching import analyze_run_pair
 
+        context_input = global_roles["tabpfn_context"] if training_indices is None else training_indices
+        train_to_retained_indices = None
+        if fitted_state is not None:
+            train_to_retained_indices = _train_to_retained_mapping(
+                population, context_input, evaluation_indices, domain_map
+            )
+        context = np.asarray(context_input, dtype=int)
         local = {int(global_index): position for position, global_index in enumerate(evaluation_indices)}
         role_local = {
             role: np.asarray([local[int(index)] for index in indices], dtype=int)
             for role, indices in global_roles.items()
         }
-        context = np.asarray(global_roles["tabpfn_context"] if training_indices is None else training_indices, dtype=int)
         source = self._source_prepared
         prepared = _PreparedData(
             train_rows=source.test_rows.iloc[context].reset_index(drop=True),
@@ -216,6 +250,7 @@ class ProductionTemporalAdapter:
         embedding_options = {} if fitted_state is None else {
             "fitted_state": fitted_state, "fitted_identity": fitted_identity,
             "explicit_domain_map": domain_map,
+            "train_to_retained_indices": train_to_retained_indices,
         }
         logging.getLogger(__name__).info("Extracting embeddings from %s", fitted_identity or "reference model")
         if imported_raw is not None:
