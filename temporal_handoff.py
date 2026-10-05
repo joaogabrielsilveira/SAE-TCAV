@@ -23,6 +23,7 @@ from temporal_concept_forecasting import digest
 
 LOG = logging.getLogger(__name__)
 SCHEMA = 'temporal_embedding_handoff_v1'
+DERIVED_SCHEMA = 'temporal_embedding_handoff_v2'
 RTOL, ATOL = 1e-3, 1e-4
 
 
@@ -47,11 +48,55 @@ def handoff_context(inputs, job, population, predict):
         'feature_names': list(population.feature_names)})
 
 
+class ImportedRaw(tuple):
+    """An unchanged raw pair carrying validated source provenance."""
+    def __new__(cls, train, retained, provenance):
+        value = super().__new__(cls, (train, retained))
+        value.training_provenance = json.loads(json.dumps(provenance))
+        return value
+
+
+def _handoff_training_provenance(meta):
+    from semantic_artifacts import array_fingerprint
+    legacy = {"origin": "independent_queries_v1", "mapping": None}
+    provenance = meta.get("training_provenance")
+    if meta["schema"] == SCHEMA:
+        if provenance is not None and provenance != legacy:
+            raise ValueError("Legacy schema cannot declare a derived training origin")
+        return legacy
+    if not isinstance(provenance, dict) or meta.get("training_provenance_sha256") != digest(provenance):
+        raise ValueError("Missing or mismatched training provenance hash")
+    origin, mapping = provenance.get("origin"), provenance.get("mapping")
+    if origin in ("independent_queries_v1", "imported_preserved_v1"):
+        if mapping is not None:
+            raise ValueError("Independent/imported origin must not declare a derived mapping")
+        return provenance
+    if origin != "retained_rows_v1" or not isinstance(mapping, dict):
+        raise ValueError("Unsupported training provenance origin or mapping")
+    job = meta["context"]["job"]
+    train, retained = np.asarray(job["train"]), np.asarray(job["evaluation"])
+    for indices in (train, retained):
+        if (indices.ndim != 1 or indices.dtype.kind not in "iu" or len(indices) == 0
+                or len(np.unique(indices)) != len(indices) or np.any(indices < 0)):
+            raise ValueError("Derived provenance requires unique integer record identities")
+    local = {int(index): position for position, index in enumerate(retained)}
+    if not set(train.tolist()).issubset(local):
+        raise ValueError("Derived mapping requires complete training identity containment")
+    expected = np.asarray([local[int(index)] for index in train], dtype=np.int64)
+    actual = np.asarray(mapping.get("indices"))
+    if (actual.ndim != 1 or actual.dtype.kind not in "iu"
+            or not np.array_equal(actual, expected)
+            or mapping.get("sha256") != array_fingerprint(expected)):
+        raise ValueError("Derived mapping or hash disagrees with exact record identities")
+    return provenance
+
+
 def checked_files(manifest_path):
     manifest_path = Path(manifest_path).resolve()
     data = json.loads(manifest_path.read_text())
-    if data.get('schema') != SCHEMA or data.get('complete') is not True:
+    if data.get('schema') not in (SCHEMA, DERIVED_SCHEMA) or data.get('complete') is not True:
         raise ValueError('Incomplete or unsupported handoff')
+    data["training_provenance"] = _handoff_training_provenance(data)
     root = manifest_path.parent
     for name, desc in data['files'].items():
         path = (root / desc['path']).resolve()
@@ -81,6 +126,12 @@ def load_handoff(path, expected_context=None):
         raise ValueError('Probability classes or dimensions differ')
     if arrays['train_raw'].ndim != 2 or arrays['test_raw'].shape[1:] != arrays['train_raw'].shape[1:]:
         raise ValueError('Invalid embedding dimensions')
+    provenance = meta["training_provenance"]
+    if provenance["origin"] == "retained_rows_v1":
+        indices = np.asarray(provenance["mapping"]["indices"], dtype=np.int64)
+        if not np.array_equal(arrays["train_raw"], arrays["test_raw"][indices]):
+            raise ValueError("Derived training arrays disagree with mapped retained embeddings")
+    arrays["raw_pair"] = ImportedRaw(arrays["train_raw"], arrays["test_raw"], provenance)
     with (root/meta['files']['fitted_state']['path']).open('rb') as handle:
         fit = pickle.load(handle)
     expected_domains = np.array([job['domains'][str(y)] for y in meta['training_years']])
@@ -98,9 +149,11 @@ def reuse_completed_from_transfer(output, inputs, job, workspace, identity):
     from temporal_concept_forecasting import checked_manifest, table, write_table
     for state in sorted(Path(output).glob('window_concepts_*/run_identity.json')):
         old = json.loads(state.read_text())
-        if digest(old['inputs'])[:20] != old['identity'] or digest(scientific_inputs(old['inputs'])) != digest(scientific_inputs(inputs)):
+        # Fits are identified without the aggregate selection that scopes the prior run.
+        fit_inputs = {k: v for k, v in old['inputs'].items() if k != 'selection'}
+        if digest(old['inputs'])[:20] != old['identity'] or digest(scientific_inputs(fit_inputs)) != digest(scientific_inputs(inputs)):
             continue
-        old_job = digest({'run': old['identity'], **job})[:24]
+        old_job = digest({'run': digest(fit_inputs)[:20], **job})[:24]
         complete = state.parent/'fits'/old_job/workspace.parent.name/workspace.name/'completed.json'
         if not complete.exists():
             continue
@@ -166,6 +219,15 @@ def validate_decoder(model, X, domains, raw, *, reference=None, sample_size=16):
 
 def save_handoff(workspace, context, embeddings, fit_path, result, population, provenance):
     from temporal_gpu_execution import GPU_POLICY
+    training = getattr(embeddings, "training_provenance", None)
+    header = {"schema": SCHEMA if training is None else DERIVED_SCHEMA, "context": context}
+    if training is not None:
+        header.update(training_provenance=jsonable(training), training_provenance_sha256=digest(training))
+    validated = _handoff_training_provenance(header)
+    if validated["origin"] == "retained_rows_v1":
+        indices = np.asarray(validated["mapping"]["indices"], dtype=np.int64)
+        if not np.array_equal(embeddings.train_raw, embeddings.test_raw[indices]):
+            raise ValueError("Derived training arrays disagree with mapped retained embeddings")
     root = Path(workspace)/'handoff'
     root.mkdir(parents=True, exist_ok=True)
     evaluation = np.asarray(context['job']['evaluation'])
@@ -189,7 +251,7 @@ def save_handoff(workspace, context, embeddings, fit_path, result, population, p
                                                        embeddings.test_raw, sample_size=GPU_POLICY['embedding_batch'])
     save_array('probe_outputs', outputs); save_array('probe_gradients', gradients)
     manifest = root/'manifest.json'
-    atomic_write_json(manifest, {'schema': SCHEMA, 'complete': True, 'context': context, 'files': files,
+    atomic_write_json(manifest, {**header, 'complete': True, 'context': context, 'files': files,
         'training_years': population.years[np.asarray(context['job']['train'])],
         'model_info': result.model_info, 'source_gpu_policy': dict(GPU_POLICY),
         'provenance': provenance, 'validation': validation})

@@ -15,7 +15,7 @@ from pathlib import Path
 from artifact_storage import file_sha256, atomic_write_json
 from temporal_concept_forecasting import (ForecastConfig, build_forecasting, original_inputs,
                                          checked_manifest, table, configure_logging)
-from temporal_window_concepts import run_window_concepts
+from temporal_window_concepts import run_window_concepts, select_window_jobs, STRATEGIES
 from temporal_forecasting_report import build_report
 from temporal_run_progress import progress_stage
 
@@ -26,6 +26,10 @@ def main(argv=None):
     parser.add_argument('--output', type=Path, default=Path('stats/temporal_concept_forecasting'))
     parser.add_argument('--window-output', type=Path, default=Path('stats/temporal_window_concepts'))
     parser.add_argument('--device', choices=('auto','cpu','cuda'), default='cuda')
+    parser.add_argument('--reference-years', type=int, nargs='+', default=list(range(2007, 2015)))
+    parser.add_argument('--windows', choices=STRATEGIES, nargs='+', default=['reference_only_common', 'last_3'])
+    parser.add_argument('--patient-split-seeds', type=int, nargs='+', default=[42])
+    parser.add_argument('--reuse-completed-from', type=Path, help='Read-only source root for reviewed compatible completed fits')
     parser.add_argument("--gpu-memory-safe", action="store_true", help="Bound GPU memory and stop on OOM instead of switching to CPU")
     from temporal_gpu_execution import add_gpu_arguments, apply_gpu_arguments
     from temporal_handoff import EmbeddingsReady, export_package
@@ -35,6 +39,10 @@ def main(argv=None):
     parser.add_argument('--resume-extraction', type=Path, help='run_identity.json for partial extraction; requires unchanged environment and GPU policy')
     parser.add_argument('--export-package', type=Path, help='Create portable package when stopping after embeddings')
     args = parser.parse_args(argv)
+    try:
+        jobs = select_window_jobs(args.reference_years, args.windows, args.patient_split_seeds)
+    except ValueError as error:
+        parser.error(str(error))
     if args.export_package and not args.stop_after_embeddings:
         parser.error('--export-package requires --stop-after-embeddings')
     if args.import_handoff and args.resume_extraction:
@@ -45,6 +53,8 @@ def main(argv=None):
     os.chdir(args.repo.resolve())
     handoff_options = dict(stop_after_embeddings=args.stop_after_embeddings, import_handoff=args.import_handoff,
                            resume_extraction=args.resume_extraction)
+    if args.reuse_completed_from is not None:
+        handoff_options['reuse_completed_from'] = args.reuse_completed_from
     configure_logging(args.output)
     log = logging.getLogger(__name__)
     status_path = args.output / 'execution_status.json'
@@ -61,12 +71,10 @@ def main(argv=None):
             with progress_stage("Stage A"):
                 paths = [build_forecasting(original_inputs(args.repo), args.output, config)]
             build_report(paths, args.output)
-        log.info('Stage B pilot: reference-only and largest all-history system')
-        with progress_stage("Stage B pilot"):
-            run_window_concepts(args.repo, args.window_output, pilot=True, device=args.device, gpu_memory_safe=args.gpu_memory_safe, **handoff_options)
-        log.info('Stage B: complete three-window grid (pilot checkpoints reused)')
-        with progress_stage("Stage B complete grid"):
-            windows = run_window_concepts(args.repo, args.window_output, device=args.device, gpu_memory_safe=args.gpu_memory_safe, **handoff_options)
+        log.info('Stage B: %d selected logical jobs, without an out-of-scope pilot', len(jobs))
+        with progress_stage("Stage B selected grid"):
+            windows = run_window_concepts(args.repo, args.window_output, jobs=jobs,
+                device=args.device, gpu_memory_safe=args.gpu_memory_safe, **handoff_options)
         manifest = checked_manifest(windows)
         for system in manifest['systems']:
             bundle = {n: table(windows, manifest, f'{system}_{n}') for n in ('performance','factors','tcav','universe','membership_audit')}

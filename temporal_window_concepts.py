@@ -31,6 +31,43 @@ CONCEPT_ROLES = ("sae_discovery", "rule_discovery", "rule_selection_cav")
 PROTOCOL = "expanded_patient_disjoint_concepts_v1"
 
 
+def select_window_jobs(reference_years, windows, patient_split_seeds):
+    """Validate and canonicalize supported immutable-parent logical systems."""
+    def integers(values, allowed, name):
+        values = list(values)
+        if not values or any(
+            isinstance(value, bool) or not isinstance(value, (int, np.integer))
+            or int(value) not in allowed for value in values
+        ):
+            raise ValueError(f"{name} must be a nonempty list within {sorted(allowed)}")
+        return sorted({int(value) for value in values})
+    years = integers(reference_years, set(range(2007, 2016)), "reference years")
+    seeds = integers(patient_split_seeds, {42, 43, 44}, "patient split seeds")
+    requested = list(windows)
+    if not requested or not set(requested).issubset(STRATEGIES):
+        raise ValueError(f"windows must be a nonempty selection from {STRATEGIES}")
+    ordered = [window for window in STRATEGIES if window in requested]
+    return [(year, seed, window) for year in years for seed in seeds for window in ordered]
+
+
+def canonical_window_jobs(jobs):
+    """Validate an explicit, not necessarily cartesian, selection of logical systems."""
+    if jobs is None:
+        return None
+    if isinstance(jobs, (str, bytes)) or not hasattr(jobs, "__iter__"):
+        raise ValueError("jobs must be a nonempty collection of (reference_year, seed, window) tuples")
+    requested = list(jobs)
+    if not requested:
+        raise ValueError("jobs must be a nonempty collection of (reference_year, seed, window) tuples")
+    selected = set()
+    for job in requested:
+        if not isinstance(job, (tuple, list)) or len(job) != 3 or not isinstance(job[2], str):
+            raise ValueError(f"job must be (reference_year, seed, window) with a named window, got {job!r}")
+        year, seed, window = job
+        selected.update(select_window_jobs([year], [window], [seed]))
+    return sorted(selected, key=lambda job: (job[0], job[1], STRATEGIES.index(job[2])))
+
+
 # Reviewed pre-recovery implementation: only memory execution policy changes.
 # No other historical source version is eligible for this migration.
 _REVIEWED_LEGACY_SOURCES = "e858bb196bf7a6c9739c9493bf91d040d152b2fc46ff90d1a29edd8cd4eb7ec4"
@@ -76,6 +113,78 @@ def reuse_reviewed_completed_job(output, identity_inputs, job_inputs, workspace,
             **completed, "identity": job_identity, "artifacts": artifacts,
             "reused_from": str(source.resolve()), "reused_manifest_sha256": file_sha256(source),
             "reuse_basis": "reviewed_memory_only_change_and_exact_membership_identity"})
+        LOG.info("Reused validated completed system without refitting or extracting: %s", source)
+        return True
+    return False
+
+
+# Prior-run source bundle whose completed fits may be reused. A completed result
+# is independent of the retained-row embedding path added since: only fresh jobs
+# take it, so results recorded under exactly this bundle remain scientifically
+# equivalent. Every other historical source version stays ineligible.
+_REVIEWED_COMPLETED_SOURCES = {
+    "comparison_runner.py": "a5b55e8f51db4c75b5a8f393f07a83187f1a4f398f1713c8636daa553ecd1cd2",
+    "tabpfn_model.py": "64633e937ad7a1e77953aed33f5c3fff399a3ee7d5eb52211b8b53a2ad0d640f",
+    "tcav.py": "84cfc2e65508da522e4ad7a8ebb03fa96de45862c7ff87ded43e8cb738b91cf1",
+    "temporal_cav.py": "ebac477aaf5e0c8ce50713dac3209b41e1efb39a498fb8f69ac6d331f8e4c140",
+    "temporal_concept_forecasting.py": "8063b87e64f78058d8bae6ed5f1c0bbdc1e1c4ad364015b82c59ffa2a791227f",
+    "temporal_cri.py": "c31fe79873ef4df95d11ea03746610241085c3d56eeb851f55e78f5cb811dbec",
+    "temporal_gpu_execution.py": "16201fa9b78c8956dd37e4cad8bee43a0bcb1d14d40c01624872fd3aa8802866",
+    "temporal_handoff.py": "2a3a5840fbfd02bf018e68f001b5e7fc58d337030425dbb35a2193f4baccacc3",
+    "temporal_memory_recovery.py": "a86203ce2973a766270a8243aa9a6f7bd4c4e9a181d6898962eccec583ebb9b8",
+    "temporal_performance_windows.py": "e54ed7915630a38c837edea2d7c7a1b3e18813fba6b012c9d17374de9b87e4c9",
+    "temporal_production.py": "f0ba50525f3ba413dbeabd01b79afc58dae8f5edeae6f52af9c750aa266fb713",
+    "temporal_rules.py": "4e8b96c453c0d50171f5b5e187f8961c12389a72fe0d1147379e0f4592068d24",
+    "temporal_unified_analysis.py": "4eb1b8778732477d19990b7eed8e87a04c6caf6f017eb5cf2444094ff3772edd",
+    "temporal_unified_enrichment.py": "0f6f60294e97aee05cf5267153773667d2b1fc142c04449f193e67c97d391eac",
+    "temporal_window_concepts.py": "99f4488cdc0b053c5ce268b3049ae6341ac949f3c6412119775130598811dde5",
+}
+
+
+class ReuseIntegrityError(ValueError):
+    """A prior completed fit matches this job but fails validation; never recompute silently."""
+
+
+def reuse_reviewed_completed_from_root(source_root, identity_inputs, job_inputs, workspace, job_identity):
+    """Copy a matching completed fit out of a read-only prior root; nothing is written there."""
+    def bound(inputs):
+        return digest({k: v for k, v in inputs.items() if k not in ("sources", "import_handoff_sha256", "selection")})
+    device = identity_inputs.get("environment", {}).get("resolved_device", identity_inputs["device"])
+    for state in sorted(Path(source_root).glob("window_concepts_*/run_identity.json")):
+        old = json.loads(state.read_text())
+        inputs = old["inputs"]
+        if digest(inputs)[:20] != old["identity"] or state.parent.name != f"window_concepts_{old['identity']}":
+            continue
+        if bound(inputs) != bound(identity_inputs):
+            LOG.info("Rejected prior run %s: configuration, model, environment, device or GPU policy differ", old["identity"])
+            continue
+        if inputs["sources"] not in (identity_inputs["sources"], _REVIEWED_COMPLETED_SOURCES):
+            LOG.info("Rejected prior run %s: scientific sources are not reviewed", old["identity"])
+            continue
+        # The per-fit identity excludes the aggregate selection; job identity binds exact membership.
+        fit = digest({k: v for k, v in inputs.items() if k != "selection"})[:20]
+        old_job = digest({"run": fit, **job_inputs})[:24]
+        source = state.parent / "fits" / old_job / workspace.parent.name / workspace.name / "completed.json"
+        if not source.exists():
+            continue
+        try:
+            completed = checked_manifest(source)
+            if completed.get("identity") != old_job:
+                raise ValueError("completed-system identity mismatch")
+            if completed.get("actual_device") != device:
+                LOG.info("Rejected prior fit %s: it ran on %s, not %s", old_job, completed.get("actual_device"), device)
+                continue
+            rows = {name: table(source, completed, name) for name in completed["artifacts"]}
+            artifacts = {name: write_table(workspace, name, values) for name, values in rows.items()}
+            if any(table(workspace / "completed.json", {"artifacts": artifacts}, name) != values for name, values in rows.items()):
+                raise ValueError("copied artifacts differ from the source")
+        except (ValueError, KeyError, OSError) as error:
+            raise ReuseIntegrityError(f"Matching prior completed fit {source} failed validation: {error}") from error
+        atomic_write_json(workspace / "completed.json", {
+            **completed, "identity": job_identity, "artifacts": artifacts,
+            "reused_from": str(source.resolve()), "reused_manifest_sha256": file_sha256(source),
+            "source_run_identity": old["identity"],
+            "reuse_basis": "reviewed_source_bundle_exact_scientific_inputs_and_membership"})
         LOG.info("Reused validated completed system without refitting or extracting: %s", source)
         return True
     return False
@@ -188,7 +297,8 @@ def _reproduction_audit(wp, wm, ref, seed, window, records):
             "outcome_source": "this_recreated_fit"}
 
 
-def run_window_concepts(repo, output, *, pilot=False, device="cuda", jobs=None, gpu_memory_safe=False, stop_after_embeddings=False, import_handoff=None, resume_extraction=None):
+def run_window_concepts(repo, output, *, pilot=False, device="cuda", jobs=None, gpu_memory_safe=False, stop_after_embeddings=False, import_handoff=None, resume_extraction=None, reuse_completed_from=None):
+    explicit_jobs = canonical_window_jobs(jobs)
     from temporal_handoff import (EmbeddingsReady, handoff_context, load_handoff, save_handoff,
         validate_import, checked_files, scientific_inputs)
     from comparison_runner import _tabpfn_checkpoint_fingerprint
@@ -246,16 +356,26 @@ def run_window_concepts(repo, output, *, pilot=False, device="cuda", jobs=None, 
         window_config = replace(window_config, batch_size=GPU_POLICY['prediction_batch'])
     if import_handoff is not None:
         identity_inputs['import_handoff_sha256'] = file_sha256(import_handoff)
-    identity = digest(identity_inputs)[:20]
+    all_jobs = [(ref, seed, w) for ref in range(2007, 2016) for seed in (42, 43, 44) for w in STRATEGIES]
+    selected_jobs = explicit_jobs or ([(2015, 42, "reference_only_common"), (2015, 42, "all_history")] if pilot else all_jobs)
+    selection = [list(job) for job in selected_jobs]
+    # Per-fit identities exclude the scope so equivalent fits (for example the 2007
+    # reference-only and last-3 systems) stay aliased; only the aggregate binds it.
+    fit_identity = digest(identity_inputs)[:20]
+    aggregate_inputs = identity_inputs if explicit_jobs is None else {**identity_inputs, 'selection': selection}
+    identity = digest(aggregate_inputs)[:20]
     if resume_extraction is not None:
         saved = json.loads(Path(resume_extraction).read_text())
         if saved['identity'] != digest(saved['inputs'])[:20]:
             raise ValueError('Invalid extraction run identity')
-        before = {k:v for k,v in saved['inputs'].items() if k != 'sources'}
+        if saved['inputs'].get('selection', selection) != selection:
+            raise ValueError('Partial extraction requires the identical job selection')
+        before = {k:v for k,v in saved['inputs'].items() if k not in ('sources', 'selection')}
         after = {k:v for k,v in identity_inputs.items() if k != 'sources'}
         if digest(before) != digest(after):
             raise ValueError('Partial extraction requires identical scientific inputs, environment and GPU policy')
         identity = saved['identity']
+        fit_identity = digest({k:v for k,v in saved['inputs'].items() if k != 'selection'})[:20]
         LOG.info('Explicit extraction resume: %s; source changes recorded separately', identity)
     imported_meta = checked_files(import_handoff) if import_handoff else None
     root = output / f"window_concepts_{identity}"
@@ -264,9 +384,7 @@ def run_window_concepts(repo, output, *, pilot=False, device="cuda", jobs=None, 
         'resume_extraction': str(resume_extraction) if resume_extraction else None,
         'import_handoff_sha256': file_sha256(import_handoff) if import_handoff else None})
     if not (root/'run_identity.json').exists():
-        atomic_write_json(root/'run_identity.json', {'identity':identity,'inputs':identity_inputs})
-    all_jobs = [(ref, seed, w) for ref in range(2007, 2016) for seed in (42, 43, 44) for w in STRATEGIES]
-    selected_jobs = jobs or ([(2015, 42, "reference_only_common"), (2015, 42, "all_history")] if pilot else all_jobs)
+        atomic_write_json(root/'run_identity.json', {'identity':identity,'inputs':aggregate_inputs})
     run_manifest = root / ("pilot_manifest.json" if pilot else "manifest.json")
     if run_manifest.exists():
         checked_manifest(run_manifest)
@@ -296,7 +414,7 @@ def run_window_concepts(repo, output, *, pilot=False, device="cuda", jobs=None, 
             job_inputs = {"ref": ref, "seed": seed, "years": years,
                           "train": train, "roles": roles, "evaluation": evaluation, "domains": domains}
             context = handoff_context(identity_inputs, job_inputs, population, predict)
-            job_identity = digest({"run": identity, **job_inputs})[:24]
+            job_identity = digest({"run": fit_identity, **job_inputs})[:24]
             workspace = root / "fits" / job_identity / f"reference_{ref}" / f"split_{seed}"
             workspace.mkdir(parents=True, exist_ok=True)
             complete = workspace / "completed.json"
@@ -306,6 +424,8 @@ def run_window_concepts(repo, output, *, pilot=False, device="cuda", jobs=None, 
                 # Explicit reuse of completed corresponding fits from the same transfer.
                 from temporal_handoff import reuse_completed_from_transfer
                 reuse_completed_from_transfer(output, identity_inputs, job_inputs, workspace, job_identity)
+            if not complete.exists() and reuse_completed_from is not None:
+                reuse_reviewed_completed_from_root(reuse_completed_from, identity_inputs, job_inputs, workspace, job_identity)
             if not complete.exists():
                 reuse_reviewed_completed_job(output, identity_inputs, job_inputs, workspace, job_identity, window, gpu_memory_safe)
             if complete.exists():
@@ -393,14 +513,14 @@ def run_window_concepts(repo, output, *, pilot=False, device="cuda", jobs=None, 
                         if not stop_after_embeddings:
                             return
                         manifest = save_handoff(workspace, context, embeddings, fit_path, result, population,
-                            {'source_run':identity,'source_job':job_identity,'inputs':identity_inputs,
+                            {'source_run':fit_identity,'source_job':job_identity,'inputs':identity_inputs,
                              'resumed_from': str(resume_extraction) if resume_extraction else None})
                         raise EmbeddingsReady(manifest)
                     output_data = loader.run_reference_experiment(population=population, reference_year=ref,
                         split=ReferenceSplit(seed, seed, 0, {}, {}), global_roles=roles,
                         evaluation_indices=evaluation, domain_map=domains, config=config, workspace=workspace,
                         fitted_state=fitted, fitted_identity=fitted_identity, training_indices=train,
-                        imported_raw=None if imported_arrays is None else (imported_arrays['train_raw'], imported_arrays['test_raw']),
+                        imported_raw=None if imported_arrays is None else imported_arrays['raw_pair'],
                         after_embeddings=after_embeddings, performance_override=perf)
                     expected_domains = np.array([domains[int(y)] for y in population.years[evaluation]])
                     for name, actual in output_data["stage_domains"].items():
@@ -447,8 +567,8 @@ def run_window_concepts(repo, output, *, pilot=False, device="cuda", jobs=None, 
                      time.monotonic()-job_start, time.monotonic()-started,
                      (time.monotonic()-started)/number*(len(selected_jobs)-number))
         except Exception as error:
-            if import_handoff or resume_extraction:
-                raise  # A failed handoff must not silently proceed into other expensive jobs.
+            if import_handoff or resume_extraction or isinstance(error, ReuseIntegrityError):
+                raise  # A failed handoff or damaged reuse candidate must not silently proceed into other expensive jobs.
             failure = {"reference_year": ref, "patient_split_seed": seed, "window": window,
                        "stage": stage, "error": type(error).__name__, "message": str(error)}
             failures.append(failure)
@@ -459,7 +579,7 @@ def run_window_concepts(repo, output, *, pilot=False, device="cuda", jobs=None, 
                  for w, tables in aggregated.items() for name, values in tables.items()}
     artifacts["aliases"] = write_table(root, "aliases", aliases)
     artifacts["post_death_exclusions"] = write_table(root, "post_death_exclusions", post_death_audit)
-    manifest = {"schema_version": PROTOCOL, "complete": not failures, "pilot": pilot, "systems": sorted({w for _, _, w in selected_jobs}),
+    manifest = {"schema_version": PROTOCOL, "complete": not failures, "pilot": pilot, "selection": selection, "systems": sorted({w for _, _, w in selected_jobs}),
                 "sources": {"parent": file_sha256(pp), "windows": file_sha256(wp)}, "source_code": source_hashes,
                 "artifacts": artifacts, "failures": failures, "logical_jobs": len(selected_jobs),
                 "distinct_fits": len({r["fit_identity"] for r in aliases}), "persistent_log": "progress.log"}
