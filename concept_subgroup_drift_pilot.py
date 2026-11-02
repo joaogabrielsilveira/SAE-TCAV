@@ -203,6 +203,9 @@ def _configuration_fixtures(presets, notebook):
 
 
 PROFILES = ("v0", "pilot", "analysis")
+# Absent context_window means reference_only, so R1 configuration hashes stay valid.
+CONTEXT_WINDOWS = ("reference_only", "last_3", "all_history")
+FIRST_CONTEXT_YEAR = 2007
 HASH_EXCLUDED_KEYS = ("config_hash", "profile", "device", "data_path", "cache_dir", "output_dir",
                       "disk_guard_gib", "joblib_workers", "inference_batch_rows")
 
@@ -212,12 +215,23 @@ def resolve_config(presets, profile="v0", overrides=None):
     if not isinstance(profile, str) or profile not in PROFILES:
         raise ValueError(f"Unknown profile: {profile!r}")
     overrides = {} if overrides is None else overrides
-    allowed = {"data_path", "cache_dir", "output_dir", "device", "disk_guard_gib"}
+    allowed = {"data_path", "cache_dir", "output_dir", "device", "disk_guard_gib", "context_window", "reference_start",
+               "predictor_cpu_from"}
     if not isinstance(overrides, dict) or set(overrides) - allowed:
-        raise ValueError("Only paths, device and disk guard may override presets")
+        raise ValueError("Only paths, device, disk guard, context window and reference start may override presets")
+    if overrides.get("context_window", "last_3") not in CONTEXT_WINDOWS[1:]:
+        raise ValueError(f"context_window override must be one of {CONTEXT_WINDOWS[1:]}")
+    overrides = deepcopy(overrides)
+    start = overrides.pop("reference_start", None)
     config = deepcopy(presets["shared"])
     config.update(deepcopy(presets[profile]))
     config.update(deepcopy(overrides))
+    if start is not None:
+        if start not in config["reference_year_candidates"]:
+            raise ValueError("reference_start must be one of the preset reference years")
+        config["reference_year_candidates"] = [year for year in config["reference_year_candidates"] if year >= start]
+    if "predictor_cpu_from" in config and config["predictor_cpu_from"] not in config["reference_year_candidates"]:
+        raise ValueError("predictor_cpu_from must be one of the build's reference years")
     config["profile"] = profile
     if config["device"] not in ("auto", "cpu", "cuda"):
         raise ValueError("device must be auto, cpu or cuda")
@@ -252,7 +266,8 @@ def configuration_overrides(environment):
     """Translate explicitly supported environment inputs; material knobs stay frozen."""
     mapping = {"PILOT_DATA_PATH": "data_path", "PILOT_CACHE_DIR": "cache_dir",
                "PILOT_DEVICE": "device", "PILOT_DISK_GUARD_GIB": "disk_guard_gib",
-               "RPI_OUT_DIR": "output_dir"}
+               "RPI_OUT_DIR": "output_dir", "PILOT_CONTEXT_WINDOW": "context_window",
+               "PILOT_REFERENCE_START": "reference_start", "PILOT_PREDICTOR_CPU_FROM": "predictor_cpu_from"}
     unknown = {key for key in environment if key.startswith("PILOT_")} - set(mapping) - {
         "PILOT_PROFILE", "PILOT_EXPECTED_PYTHON"}
     if unknown:
@@ -263,6 +278,12 @@ def configuration_overrides(environment):
         if not isinstance(value, str) or not value.isascii() or not value.isdecimal():
             raise ValueError("disk_guard_gib environment input must contain decimal integer digits")
         overrides["disk_guard_gib"] = int(value)
+    for key in ("reference_start", "predictor_cpu_from"):
+        if key in overrides:
+            value = overrides[key]
+            if not isinstance(value, str) or not value.isascii() or not value.isdecimal():
+                raise ValueError(f"{key} environment input must contain decimal integer digits")
+            overrides[key] = int(value)
     return overrides
 
 
@@ -1111,8 +1132,9 @@ def predictor_identity_report(classifier):
             "exporter": fields["exporter"]}
 
 
-def fit_frozen_predictor(context_frame, feature_names, device, seed=42):
-    """Fit the installed drift-resilient single-fast predictor; never fall back."""
+def fit_frozen_predictor(context_frame, feature_names, device, seed=42, domain_origin=None):
+    """Fit the installed drift-resilient single-fast predictor; never fall back.
+    Window contexts pass domain_origin (first context year); each row's domain is its year minus that origin."""
     import numpy as np
     import tabpfn
     from importlib import resources
@@ -1120,8 +1142,12 @@ def fit_frozen_predictor(context_frame, feature_names, device, seed=42):
     precision = configure_predictor_precision(device)
     if len(context_frame) == 0 or set(context_frame.y.unique()) != {0, 1}:
         raise ValueError("Reference context requires both mortality classes")
-    if len(context_frame.year.unique()) != 1:
+    years = context_frame.year.to_numpy(dtype=np.int64)
+    if domain_origin is None and len(np.unique(years)) != 1:
         raise ValueError("Frozen reference context must contain exactly one calendar year")
+    origin = int(years[0]) if domain_origin is None else int(domain_origin)
+    if years.min() < origin:
+        raise ValueError("Context rows precede the domain origin")
     checkpoint = Path(str(resources.files(tabpfn))) / "model_cache" / "tabpfn_dist_model_1.cpkt"
     if not checkpoint.is_file():
         raise FileNotFoundError("Installed drift-resilient checkpoint absent; downloads disabled")
@@ -1135,20 +1161,21 @@ def fit_frozen_predictor(context_frame, feature_names, device, seed=42):
     classifier.normalize_with_test = False
     classifier.pilot_precision_ = precision
     classifier.pilot_checkpoint_sha256_ = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
-    classifier.pilot_domain_policy_ = "calendar_year_minus_reference_year"
+    classifier.pilot_domain_policy_ = ("calendar_year_minus_reference_year" if domain_origin is None
+                                       else "calendar_year_minus_first_context_year")
     if hasattr(classifier, "show_progress"):
         classifier.show_progress = False
     X = np.ascontiguousarray(context_frame[list(feature_names)].to_numpy(dtype=np.float32))
     y = np.ascontiguousarray(context_frame.y.to_numpy(dtype=np.float32))
     with predictor_sdpa_context(device):
-        classifier.fit(X, y, additional_x={"dist_shift_domain": np.zeros(len(X), dtype=np.int64)})
+        classifier.fit(X, y, additional_x={"dist_shift_domain": np.ascontiguousarray(years - origin, dtype=np.int64)})
     if len(classifier.ensemble_configurations_) != 1 or len(classifier.cached_models_) != 1:
         raise RuntimeError("Pilot requires exactly one frozen executed configuration/model")
     if list(classifier.classes_) != [0, 1]:
         raise RuntimeError("Death class mapping differs from explicit [0, 1]")
     return {"classifier": classifier, "context_identity": predictor_context_identity(classifier),
             "context_rows": _identity_hash(list(zip(context_frame.patient_id, context_frame.year))),
-            "reference_year": int(context_frame.year.iloc[0]), "feature_names": tuple(feature_names),
+            "reference_year": int(years.max()), "domain_origin": origin, "feature_names": tuple(feature_names),
             "checkpoint_sha256": classifier.pilot_checkpoint_sha256_,
             "settings": {"model_type": "single_fast", "fit_at_predict_time": False,
                          "sklearn_compatible_precision": False, "fp16_inference": False,
@@ -1319,7 +1346,8 @@ def capture_frozen_predictions(system, frame, device):
             raise ValueError("Prediction calendar years must be finite integers")
         if (years < system["reference_year"]).any():
             raise ValueError("Prediction before the reference year is unsupported")
-        domains = np.ascontiguousarray(relative_domains(system["reference_year"], years), dtype=np.int64)
+        origin = system.get("domain_origin", system["reference_year"])
+        domains = np.ascontiguousarray(relative_domains(origin, years), dtype=np.int64)
         from tabpfn_model import infer_model_additional_x_info, make_dist_tensor
         additional_device, fitted_domain_shape = infer_model_additional_x_info(classifier)
         if fitted_domain_shape is None or tuple(fitted_domain_shape[1:]) != (1, 1):
@@ -1705,15 +1733,21 @@ def _prediction_frame(population, rows, columns):
 
 
 def predictor_unit(population, r, roles, config, device, *, fit=None, capture=None):
-    """P(r): one context fit, gates, then one batched pass over every row of years r..last."""
+    """P(r): one context fit, gates, then one batched pass over every row of years r..last.
+    Builds may set predictor_cpu_from: those predictor units run on CPU with joblib_workers threads."""
+    import torch
+    threads = torch.get_num_threads()
+    if config.get("predictor_cpu_from") is not None and int(r) >= config["predictor_cpu_from"]:
+        device = "cpu"
+        torch.set_num_threads(int(config["joblib_workers"]))
     try:
         return _predictor_unit(population, int(r), roles, config, device,
                                fit_frozen_predictor if fit is None else fit,
                                capture_frozen_predictions if capture is None else capture)
     finally:
+        torch.set_num_threads(threads)
         if device == "cuda":
             import gc
-            import torch
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -1727,13 +1761,27 @@ def _predictor_unit(population, r, roles, config, device, fit, capture):
         raise ValueError("Roles belong to a different reference year")
     year = population["year"]
     columns = _feature_columns(population["X"].shape[1])
-    context_rows = np.flatnonzero((year == r) & (roles["row_role"] == "tabpfn_context") & ~roles["is_entrant"])
-    if not len(context_rows):
+    window = config.get("context_window", "reference_only")
+    if window not in CONTEXT_WINDOWS:
+        raise ValueError(f"Unknown context window: {window!r}")
+    current = (year == r) & (roles["row_role"] == "tabpfn_context") & ~roles["is_entrant"]
+    if not current.any():
         raise ValueError(f"No tabpfn_context rows in reference year {r}")
+    # Earlier window years add every row up to the patient's first observed death.
+    first = {"reference_only": r, "last_3": max(FIRST_CONTEXT_YEAR, r - 2), "all_history": FIRST_CONTEXT_YEAR}[window]
+    prior = (year >= first) & (year < r) & ~population["post_death"]
+    context_rows = np.flatnonzero(current | prior)
+    if (year[context_rows] > r).any() or (year[context_rows] < FIRST_CONTEXT_YEAR).any():
+        raise AssertionError("Context window holds rows outside the allowed years")
+    if ((year[context_rows] == r) & (roles["row_role"][context_rows] != "tabpfn_context")).any():
+        raise AssertionError("Year-r rows outside tabpfn_context entered the predictor context")
+    if (population["post_death"][context_rows] & (year[context_rows] < r)).any():
+        raise AssertionError("Post-death earlier-year row entered the predictor context")
     context = _prediction_frame(population, context_rows, columns)
     context["y"] = population["y"][context_rows]
     try:
-        system = fit(context, columns, device, seed=int(config["split_seed"]))
+        system = fit(context, columns, device, seed=int(config["split_seed"]),
+                     **({} if window == "reference_only" else {"domain_origin": first}))
     except torch.cuda.OutOfMemoryError:
         raise
     except RuntimeError as error:
@@ -1839,7 +1887,8 @@ def _predictor_unit(population, r, roles, config, device, fit, capture):
             "continuation_replay": replay, "gradient_stability_max_abs_error": gradient_stability,
             "gradient_objective": "final_mortality_probability_class_1_wrt_raw_embeddings",
             "_rows": int(len(rows)), "reference_year": int(r), "last_year": int(year.max()),
-            "rows_per_year": counts, "context_rows": int(len(context_rows)),
+            "rows_per_year": counts, "context_rows": int(len(context_rows)), "context_window": window,
+            "context_years": sorted(int(value) for value in np.unique(year[context_rows])),
             "context_patients": int(len(np.unique(population["patient_id"][context_rows]))),
             "context_deaths": int(population["y"][context_rows].sum()),
             "embedding_dim": int(embeddings.shape[1]), "feature_count": int(population["X"].shape[1]),
@@ -2310,6 +2359,62 @@ def _predictor_unit_checks(population, presets, all_roles, work):
         np.testing.assert_allclose(small["probabilities"], outputs[2007]["probabilities"], rtol=1e-4, atol=1e-5)
         np.testing.assert_allclose(small["embeddings"], outputs[2007]["embeddings"], rtol=1e-4, atol=1e-5)
         np.testing.assert_allclose(small["gradients"], outputs[2007]["gradients"], rtol=1e-3, atol=1e-5)
+
+        class WindowStop(Exception):
+            pass
+
+        frames = []
+
+        def window_fit(frame, names, device, seed=42, **options):
+            assert options == {"domain_origin": 2007}, options
+            frames.append(frame)
+            raise WindowStop
+
+        try:
+            predictor_unit(population, 2009, all_roles[2009], dict(config, context_window="all_history"), "cpu", fit=window_fit)
+        except WindowStop:
+            pass
+        frame, = frames
+        current = (year == 2009) & (all_roles[2009]["row_role"] == "tabpfn_context") & ~all_roles[2009]["is_entrant"]
+        expected = current | ((year < 2009) & ~population["post_death"])
+        assert population["post_death"][year < 2009].any(), "Fixture needs an earlier post-death row"
+        assert sorted(zip(frame.patient_id, frame.year.tolist())) == sorted(zip(population["patient_id"][expected], year[expected].tolist()))
+        windowed = fit_frozen_predictor(frame, _feature_columns(population["X"].shape[1]), "cpu", seed=42, domain_origin=2007)
+        assert (windowed["reference_year"], windowed["domain_origin"]) == (2009, 2007)
+        assert windowed["settings"]["domain_policy"] == "calendar_year_minus_first_context_year"
+        later = _prediction_frame(population, np.flatnonzero(year == 2009)[:4], _feature_columns(population["X"].shape[1]))
+        predicted = capture_frozen_predictions(windowed, later, "cpu")["probabilities"]
+        assert np.isfinite(predicted.detach().cpu().numpy() if hasattr(predicted, "detach") else np.asarray(predicted)).all()
+        for overrides in ({"context_window": "reference_only"}, {"context_window": "last_5"}):
+            try:
+                resolve_config(presets, "pilot", overrides)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"Invalid context window accepted: {overrides}")
+        assert resolve_config(presets, "pilot", {"context_window": "last_3"})["config_hash"] != resolve_config(presets, "pilot")["config_hash"]
+        devices = []
+
+        def device_fit(frame, names, device, seed=42, **options):
+            devices.append(device)
+            raise WindowStop
+
+        try:
+            predictor_unit(population, 2009, all_roles[2009], dict(config, predictor_cpu_from=2009), "cuda", fit=device_fit)
+        except WindowStop:
+            pass
+        assert devices == ["cpu"], devices
+        routed = resolve_config(presets, "pilot", configuration_overrides({"PILOT_PREDICTOR_CPU_FROM": "2012"}))
+        assert routed["predictor_cpu_from"] == 2012 and routed["config_hash"] != resolve_config(presets, "pilot")["config_hash"]
+        late = resolve_config(presets, "pilot", configuration_overrides({"PILOT_REFERENCE_START": "2014"}))
+        assert late["reference_year_candidates"] == [2014, 2015] and late["t0_only_reference_years"] == [2015]
+        for environment in ({"PILOT_REFERENCE_START": "2006"}, {"PILOT_REFERENCE_START": "x"}):
+            try:
+                resolve_config(presets, "pilot", configuration_overrides(environment))
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"Invalid reference start accepted: {environment}")
         entered = []
 
         def exhausted_capture(system, frame, device):
@@ -2719,9 +2824,17 @@ def encode_reference_dictionary(dictionary, embeddings, device, batch_size=256):
     if _identity_hash((scaler.mean_, scaler.scale_)) != dictionary["scaler_identity"]:
         raise RuntimeError("Frozen reference scaler changed")
     if _sae_state_identity(dictionary["run"]["model"]) != dictionary["sae_identity"]:
-        raise RuntimeError("Frozen reference SAE changed")
+        raise RuntimeError("Frozen reference SAE changed: " + _sae_state_difference(dictionary["run"]["model"]))
     return encode_sae(dictionary["run"], np.asarray(scaler.transform(embeddings), dtype=np.float32),
                       device=device, batch_size=batch_size)
+
+
+def _sae_state_difference(model):
+    """Device and per-tensor summary for an identity failure; R1 saw this only late in a long CUDA process."""
+    import numpy as np
+    state = {name: value.detach().cpu().numpy() for name, value in model.state_dict().items()}
+    parts = [f"{name} finite={bool(np.isfinite(array).all())} dtype={array.dtype}" for name, array in state.items()]
+    return f"device={next(model.parameters()).device}; " + "; ".join(parts)
 
 
 def _sae_state_identity(model):
