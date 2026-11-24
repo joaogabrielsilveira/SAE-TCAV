@@ -4,8 +4,16 @@
 /stats/
 /data/
 /__pycache__/
+**/__pycache__/
 /TCAV/
 /graphs/
+/paper/
+/paper_review_20261121/
+/analysis_outputs/
+/.playwright-mcp/
+/handoffs/
 *.pyc
 *.log
+*.md
+*.tex
 /cold-*/*
